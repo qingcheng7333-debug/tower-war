@@ -1,0 +1,10 @@
+# Local exports may contain API keys and personal presets.
+個人データ.js
+個人データ.*.js
+
+# Local/editor and backup files must never enter the release repository.
+*.bak
+*.backup
+*.swp
+.DS_Store
+Thumbs.db
