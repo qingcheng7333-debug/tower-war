@@ -436,6 +436,18 @@ function setNetworkEnabled(v) { NET_ENABLED = !!v; }
 function isOnlineMode() { return NET_ENABLED && game.gameMode === 'online'; }
 function canAdvanceTick() { return true; }
 
+/** 🔗 当前玩家的阵营：Host=蓝方(player)，Client=红方(ai)；未联机时返回 null */
+function myOnlineTeam() {
+    if (!NET_ROLE || !isOnlineMode()) return null;
+    return NET_ROLE === 'host' ? 'player' : 'ai';
+}
+
+/** 🔗 对手的阵营：与 myOnlineTeam 相反；未联机时返回 null */
+function oppOnlineTeam() {
+    if (!NET_ROLE || !isOnlineMode()) return null;
+    return NET_ROLE === 'host' ? 'ai' : 'player';
+}
+
 function onNetPeerLost(reason) {
     if (NET_STATE === 'idle') return;
     console.warn('[NET] VibeHub 对端离开：', reason);
