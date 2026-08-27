@@ -19,10 +19,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Agent: replace this block after detecting the repository's package manager and build script.
-      - name: Build static site
+      - name: Validate static site
+        shell: bash
         run: |
-          true
+          set -euo pipefail
+          test -f index.html
+          test -f css/style.css
+          test -f js/vibehubAdapter.js
+          test -f js/network.js
+          while IFS= read -r -d '' file; do
+            node --check "$file"
+          done < <(find js -type f -name '*.js' -print0)
 
       - name: Install verified VibeHub CLI
         if: github.event_name == 'push'
