@@ -21,6 +21,9 @@ let NET_OPP_DECK = [];
 let NET_SEED = 0;
 let NET_MODE = 'deck';          // 'classic' 全卡 / 'deck' 卡组
 let NET_RECONNECTING = false;
+let NET_HELLO_TIMER = null;      // Client 端 HELLO 重发定时器
+const NET_HELLO_INTERVAL_MS = 1500;   // 重发间隔
+const NET_HELLO_MAX_RETRY = 20;       // 最大重发次数（约 30s）
 
 // ---- 回调注入（main.js 绑定；未绑定时安全跳过）----
 let NET_CB_ON_LOBBY = null;
@@ -93,6 +96,7 @@ function resetSessionState() {
     NET_OPP_DECK = [];
     NET_PENDING_EXEC = [];
     NET_REMOTE_SEQ = new Set();
+    stopHelloRetry();
 }
 
 /** 创建 VibeHub 房间（Host）。 */
@@ -146,7 +150,11 @@ async function netJoinRoom(roomId, name, deck, cbs) {
     NET_MY_DECK = Array.isArray(deck) ? [...deck] : [];
     try {
         await openVibeRoom(rid);
+        // 注意：room.join() resolve 时 WebRTC DataChannel 往往尚未建立，
+        // 此时 sendNet 会被 SDK 静默丢弃，因此不能只发一次 HELLO。
+        // 先发一次，再靠 peer 'join' 事件（通道打开时触发）与重发定时器兜底。
         sendNet({ type: 'HELLO', name: NET_MY_NAME, deck: NET_MY_DECK });
+        startHelloRetry();
         fireLobbyUpdate();
         return true;
     } catch (error) {
@@ -181,6 +189,35 @@ function sendNet(message, peerId) {
     }
 }
 
+/** 启动 HELLO 重发定时器：JOIN_ACK 到达前每 1.5s 补发一次，超时报连接失败。 */
+function startHelloRetry() {
+    stopHelloRetry();
+    let tries = 0;
+    NET_HELLO_TIMER = setInterval(() => {
+        if (NET_ROLE !== 'client' || NET_STATE !== 'joined') {
+            stopHelloRetry();
+            return;
+        }
+        tries++;
+        if (tries > NET_HELLO_MAX_RETRY) {
+            stopHelloRetry();
+            console.warn('[NET] HELLO 重发超时，连接失败');
+            const cb = NET_CB_ON_DISCONNECT;
+            cleanupNetSession(false);
+            if (cb) cb('连接超时，未能与房主建立数据通道');
+            return;
+        }
+        sendNet({ type: 'HELLO', name: NET_MY_NAME, deck: NET_MY_DECK });
+    }, NET_HELLO_INTERVAL_MS);
+}
+
+function stopHelloRetry() {
+    if (NET_HELLO_TIMER !== null) {
+        clearInterval(NET_HELLO_TIMER);
+        NET_HELLO_TIMER = null;
+    }
+}
+
 function onNetMessage(data, fromPeerId) {
     if (!data || typeof data !== 'object' || typeof data.type !== 'string') return;
     switch (data.type) {
@@ -198,6 +235,10 @@ function onNetPeerEvent(event) {
     if (!event || typeof event.type !== 'string') return;
     if (event.type === 'join') {
         NET_RECONNECTING = false;
+        // Client 端：对端通道刚打开，此刻发送必达 → 立即补发一次 HELLO
+        if (NET_ROLE === 'client' && NET_STATE === 'joined') {
+            sendNet({ type: 'HELLO', name: NET_MY_NAME, deck: NET_MY_DECK });
+        }
         fireLobbyUpdate();
     } else if (event.type === 'connecting' || event.type === 'reconnecting') {
         NET_RECONNECTING = true;
@@ -232,6 +273,7 @@ function onNetHello(data) {
 
 function onNetJoinAck(data) {
     if (NET_ROLE !== 'client') return;
+    stopHelloRetry();          // 握手成功，停止 HELLO 重发
     NET_OPP_NAME = data.name || '对手';
     NET_OPP_DECK = Array.isArray(data.oppDeck) ? data.oppDeck : [];
     if (Array.isArray(data.myDeck)) NET_MY_DECK = [...data.myDeck];
