@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>嘗試ゲーム · 双人塔防</title>
+        <link rel="stylesheet" href="css/style.css?v=20260827c1">
+</head>
+<body>
+<!-- ===== 主页 ===== -->
+<div id="homePage">
+    <div class="home-left">
+        <h1>⚔️ 嘗試ゲーム</h1>
+        <div class="menu-row">
+            <div class="menu-column">
+                <div class="menu-column-title">🎮 单人模式</div>
+                <button class="menu-btn" id="deckBattleBtn">🤖 经典人机（卡组）</button>
+                <button class="menu-btn" id="startGameBtn">🤖 经典人机（全卡）</button>
+                <button class="menu-btn" id="localMultiBtn">🎮 经典双人（本机）</button>
+                <button class="menu-btn" id="aiApiBtn">🤖 经典AI（LLM驱动）</button>
+            </div>
+            <div class="menu-column">
+                <div class="menu-column-title">✨ 创意模式</div>
+                <button class="menu-btn" id="bigMapBtn" disabled>🗺️ 大地图人机（全卡）</button>
+                <button class="menu-btn" id="siegeBtn" disabled>💣 攻城人机（全卡）</button>
+                <div class="menu-column-title menu-title-gap">🔗 联机模式</div>
+                <button class="menu-btn" id="multiplayerBtn">🔗 双人联机（全卡）</button>
+                <button class="menu-btn" id="multiplayerDeckBtn">🔗 双人联机（卡组）</button>
+            </div>
+        </div>
+    </div>
+    <div class="home-right">
+        <div class="config-section">
+            <div class="config-divider">🌐 VibeHub</div>
+            <div class="vibehub-account" id="vibehubAccountArea">
+                <span id="vibehubAccountStatus">本地模式</span>
+                <button class="config-btn vibehub-account-btn" id="vibehubLoginBtn" style="display:none;">登录 VibeHub</button>
+                <button class="config-btn vibehub-account-btn" id="vibehubLogoutBtn" style="display:none;">退出登录</button>
+            </div>
+            <div class="config-divider">⚙️ 配置</div>
+            <div class="config-row">
+                <button class="config-btn" id="deckManageBtn">📋 卡组管理</button>
+                <button class="config-btn" id="aiConfigBtn">🤖 AI配置</button>
+                <button class="config-btn" id="modeSelectBtn" title="选择对局模式（人机选择，暂未开放）">🎮 人机选择</button>
+                <button class="config-btn" id="exportDataBtn" title="把当前预设/卡组/设置打包为「個人データ.js」文件（含 API Key！分享前请勿发送该文件）">💾 导出数据文件</button>
+                <button class="config-btn" id="importDataBtn" title="选择导出的「個人データ.js」文件，把预设/卡组/设置导入本浏览器（覆盖当前本地数据）">📥 导入数据文件</button>
+            </div>
+            <div class="config-divider">⚙️ 设置</div>
+            <div class="settings-row">
+                <label class="settings-label" for="fpsLimitSelect">帧率</label>
+                <select id="fpsLimitSelect" class="config-btn fps-select">
+                    <option value="0">不限制</option>
+                    <option value="60">60 FPS</option>
+                    <option value="30">30 FPS</option>
+                </select>
+            </div>
+            <div class="settings-row">
+                <label class="settings-label" for="langSelect">语言</label>
+                <select id="langSelect" class="config-btn fps-select">
+                    <option value="zh-CN">中文（简体）</option>
+                </select>
+            </div>
+            <div class="config-divider">ℹ️ 关于</div>
+            <div class="config-row">
+                <button class="config-btn" id="aboutUsBtn">ℹ️ 关于我们</button>
+                <button class="config-btn" id="checkUpdateBtn">🔄 检查更新</button>
+            </div>
+        </div>
+    </div>
+    <!-- 主页右下角常驻看板娘（jk鸭子坐）：只在主页显示，进游戏随 homePage 自动隐藏 -->
+    <img class="home-mascot" src="整活/jk鸭子坐.png" alt="看板娘">
+</div>
+<!-- ===== 游戏页面 ===== -->
+<div id="gamePage">
+    <div class="top-bar">
+        <button class="back-btn" id="backToHomeBtn">🏠 主页</button>
+        <span style="color:#facc15; font-weight:bold;">⚔️ 嘗試ゲーム</span>
+        <span style="color:#aaa;">本地AI对战</span>
+    </div>
+    <div class="game-container">
+        <!-- 上方玩家（红方）UI -->
+        <div class="elixir-bar top-elixir" id="topElixirBar" style="display:none;">
+            <span>🔴 红方 圣水 <span id="topPlayerElixirDisplay">5.0</span></span>
+        </div>
+        <div class="card-panel" id="topCardPanel" style="display:none;"></div>
+        <canvas id="gameCanvas" width="1600" height="700"></canvas>
+        <!-- 下方玩家（蓝方）UI -->
+        <div class="elixir-bar">
+            <span>⚡ 圣水 <span id="playerElixirDisplay">5.0</span></span>
+            <span class="elixir-number" id="rightElixirLabel">AI 圣水 <span id="aiElixirDisplay">5.0</span></span>
+        </div>
+        <div class="card-panel" id="cardPanel"></div>
+        <div id="bastionAlert" class="bastion-alert" style="display:none;">危険！</div>
+    </div>
+</div>
+<!-- ===== 人机选择弹窗（AI行为组）===== -->
+<div id="aiGroupModal" class="modal-overlay" style="display:none;">
+    <div class="modal-content modal-preset">
+        <div class="modal-title">🎮 人机选择</div>
+        <div id="aiGroupList" class="preset-list"></div>
+        <div class="modal-actions">
+            <button id="createAiGroupBtn" class="menu-btn" style="padding:8px 20px; font-size:14px; width:auto;">➕ 新建组</button>
+            <button id="refreshAiGroupBtn" class="menu-btn" style="padding:8px 20px; font-size:14px; width:auto;">🔄 刷新</button>
+            <button id="closeAiGroupModalBtn" class="menu-btn" style="padding:8px 20px; font-size:14px; width:auto; background:#555;">✖ 关闭</button>
+        </div>
+        <div style="margin-top:12px; font-size:12px; color:#888; text-align:center; line-height:1.7;">
+            💡 「新建组」下载模板文件 <b>aixx.js</b>，自己编写后放入 <b>js/</b> 目录；「🔄 刷新」重新扫描识别，缺失/未识别的选项会自动从列表移除
+        </div>
+    </div>
+</div>
+<!-- ===== AI 对战 - 配置选择弹窗 ===== -->
+<div id="aiPresetModal" class="modal-overlay" style="display:none;">
+    <div class="modal-content modal-preset">
+        <div class="modal-title">🤖 AI 配置管理</div>
+        <div id="presetList" class="preset-list"></div>
+        <div class="modal-actions">
+            <button id="addPresetBtn" class="menu-btn" style="padding:8px 20px; font-size:14px; width:auto;">➕ 添加配置</button>
+            <button id="closePresetModalBtn" class="menu-btn" style="padding:8px 20px; font-size:14px; width:auto; background:#555;">✖ 关闭</button>
+        </div>
+    </div>
+</div>
+<!-- ===== AI 对战 - 编辑/添加配置弹窗 ===== -->
+<div id="aiEditModal" class="modal-overlay" style="display:none;">
+    <div class="modal-content modal-edit">
+        <div class="modal-title" id="editModalTitle">📝 编辑配置</div>
+        <div class="edit-form">
+            <label>配置名称</label>
+            <input type="text" id="editName" placeholder="例如：硅基流动、OpenAI……">
+            <label>API Key（sk-xxx）</label>
+            <input type="password" id="editApiKey" placeholder="sk-">
+            <label>接口地址</label>
+            <input type="text" id="editBaseUrl" placeholder="https://api.openai.com/v1">
+            <label>代理地址（可选）</label>
+            <input type="text" id="editProxyUrl" placeholder="Cloudflare Worker 地址">
+            <label>模型名称</label>
+            <input type="text" id="editModel" placeholder="gpt-4o-mini">
+        </div>
+        <div class="modal-actions">
+            <button id="savePresetBtn" class="menu-btn" style="padding:8px 20px; font-size:14px; width:auto;">💾 保存</button>
+            <button id="testPresetBtn" class="menu-btn" style="padding:8px 20px; font-size:14px; width:auto; background:#4a6a8a;">🧪 测试连接</button>
+            <button id="cancelEditBtn" class="menu-btn" style="padding:8px 20px; font-size:14px; width:auto; background:#555;">✖ 取消</button>
+        </div>
+        <div id="editTestResult" style="margin-top:8px; font-size:13px; min-height:20px; text-align:center;"></div>
+    </div>
+</div>
+<!-- ===== 卡组管理弹窗 ===== -->
+<div id="deckModal" class="modal-overlay" style="display:none;">
+    <div class="modal-content modal-deck">
+        <div class="modal-title">📋 卡组管理</div>
+        <div id="deckList" class="deck-list"></div>
+        <div class="modal-actions">
+            <button id="addDeckBtn" class="menu-btn" style="padding:8px 20px; font-size:14px; width:auto;">➕ 新建卡组</button>
+            <button id="closeDeckModalBtn" class="menu-btn" style="padding:8px 20px; font-size:14px; width:auto; background:#555;">✖ 关闭</button>
+        </div>
+    </div>
+</div>
+<!-- ===== 卡组编辑弹窗 ===== -->
+<div id="deckEditModal" class="modal-overlay" style="display:none;">
+    <div class="modal-content modal-deck-edit">
+        <div class="modal-title" id="deckEditTitle">📝 编辑卡组</div>
+        <div class="edit-form">
+            <label>卡组名称</label>
+            <input type="text" id="deckEditName" placeholder="例如：快攻流、防御塔阵……">
+        </div>
+        <div style="margin-top:14px; display:flex; justify-content:space-between; align-items:center;">
+            <label style="color:#bbb; font-size:13px; font-weight:bold;">选择卡牌（点击选择/取消）</label>
+            <span id="deckSelectedCount" style="color:#facc15; font-weight:bold; font-size:14px;">0 / 15</span>
+        </div>
+        <div id="cardSelectGrid" class="card-select-grid"></div>
+        <div class="modal-actions">
+            <button id="saveDeckBtn" class="menu-btn" style="padding:8px 20px; font-size:14px; width:auto;">💾 保存卡组</button>
+            <button id="cancelDeckEditBtn" class="menu-btn" style="padding:8px 20px; font-size:14px; width:auto; background:#555;">✖ 取消</button>
+        </div>
+    </div>
+</div>
+<!-- ===== 导出确认子界面（防止误触）===== -->
+<div class="ex-modal-overlay" id="exportConfirmModal" style="display:none;">
+    <div class="ex-modal-box">
+        <div class="ex-modal-title">💾 导出数据文件</div>
+        <div class="ex-modal-body">
+            <p>将把以下数据打包为 <b>「個人データ.js」</b> 文件：</p>
+            <ul class="ex-modal-list">
+                <li>🤖 AI 预设（含 API Key）</li>
+                <li>📋 卡组</li>
+                <li>⚙️ 游戏设置</li>
+            </ul>
+            <div class="ex-modal-usage">
+                <b>📖 使用方法（什么时候需要导出？）</b><br>
+                日常游玩数据<b>自动保存在本浏览器</b>，无需任何操作。<br>
+                只有<b>换电脑 / 换浏览器</b>时才需要：<br>
+                ① 本机点「💾 导出」拿到文件<br>
+                ② 新设备点「📥 导入数据文件」选择它 → 刷新即可
+            </div>
+            <div class="ex-modal-warn">
+                ⚠️ <b>风险提示（务必阅读）</b><br>
+                ・ 本文件包含你的 <b>API Key 密钥</b>！<br>
+                ・ <b>分享游戏给他人前，务必先删除根目录的「個人データ.js」</b><br>
+                ・ 否则对方打开文件即可看到你的密钥！
+            </div>
+        </div>
+        <div class="ex-modal-actions">
+            <button class="ex-modal-btn ex-modal-cancel" id="exportCancelBtn">✖ 取消</button>
+            <button class="ex-modal-btn ex-modal-confirm" id="exportConfirmBtn">✅ 确认导出</button>
+        </div>
+    </div>
+</div>
+<!-- ===== 联机大厅弹窗（双人联机·卡组）===== -->
+<div id="onlineModal" class="modal-overlay" style="display:none;">
+    <div class="modal-content modal-online">
+        <div class="modal-title">🔗 双人联机（卡组）</div>
+        <div id="onlineStatusText" class="online-status">等待连接…</div>
+
+        <!-- ① 身份设置区 -->
+        <div class="online-section">
+            <div class="online-row">
+                <label class="online-label">🎭 昵称</label>
+                <input type="text" id="onlineNameInput" class="online-input" maxlength="12" placeholder="输入你的昵称">
+            </div>
+            <div class="online-row">
+                <label class="online-label">📋 卡组</label>
+                <span id="onlineDeckName" class="online-deck-name">未选择</span>
+            </div>
+        </div>
+
+        <!-- ② 创建 / 加入 -->
+        <div class="online-section">
+            <div class="online-row">
+                <button id="createRoomBtn" class="menu-btn online-btn">🏠 创建房间</button>
+                <div class="online-join-row">
+                    <input type="text" id="joinRoomInput" class="online-input online-input-room" maxlength="6" placeholder="6位房间号">
+                    <button id="joinRoomBtn" class="menu-btn online-btn">🚪 加入房间</button>
+                    <button id="listRoomsBtn" class="online-small-btn">🔎 查找公开房间</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="onlineRoomList" class="online-room-list" style="display:none;"></div>
+
+        <!-- ③ 房间信息区（创建/加入成功后显示）-->
+        <div id="onlineRoomArea" class="online-section" style="display:none;">
+            <div class="online-row">
+                <label class="online-label">🆔 房间号</label>
+                <span id="roomIdDisplay" class="online-room-id">------</span>
+                <button id="copyRoomIdBtn" class="online-small-btn">📋 复制</button>
+            </div>
+            <div id="onlineLobbyStatus" class="online-lobby">
+                <div class="online-player-row"><span id="onlineSelfName">🟦 你</span><span id="onlineSelfStatus" class="online-ready-state">未准备</span></div>
+                <div class="online-player-row"><span id="onlineOppName">🟥 对手</span><span id="onlineOppStatus" class="online-ready-state">等待加入…</span></div>
+            </div>
+            <div class="online-row online-lobby-actions">
+                <button id="onlineReadyBtn" class="menu-btn online-btn">✅ 准备</button>
+                <button id="onlineStartBtn" class="menu-btn online-btn online-start-btn" style="display:none;">⚔️ 开始对决</button>
+                <button id="onlineLeaveBtn" class="menu-btn online-btn online-leave-btn">🚪 离开房间</button>
+            </div>
+        </div>
+
+        <div class="modal-actions">
+            <button id="closeOnlineModalBtn" class="menu-btn" style="padding:8px 20px; font-size:14px; width:auto; background:#555;">✖ 关闭</button>
+        </div>
+    </div>
+</div>
+<!-- ===== 整活霸屏：JK 引导娘（全屏变暗 + 角色霸屏 + 对话框，点击任意处退出）===== -->
+<div id="aboutOverlay" style="display:none;">
+    <img class="about-overlay-char" src="整活/jk左.png" alt="JK 引导娘">
+    <div class="about-overlay-dialog">
+        <div class="about-dialog-text">真麻煩呢…</div>
+        <div class="about-dialog-next">繼續》</div>
+    </div>
+    <div id="aboutOptions" class="about-options"></div>
+</div>
+<!-- ===== JS 按依赖顺序加载 ===== -->
+<script src="https://vibe.lumigrav.space/sdk/v3/vibehub.js"></script>
+<script src="js/vibehubAdapter.js?v=20260827c1"></script>
+<script src="js/config.js?v=20260826c2"></script>
+<script src="個人データ.js?v=20260817c3"></script>
+<script src="js/gameState.js?v=20260826c1"></script>
+<script src="js/network.js?v=20260827c2"></script>
+<script src="js/utils.js?v=20260817c3"></script>
+<script src="js/entities.js?v=20260826c1"></script>
+<script src="js/ai配置/ai测试组.js?v=20260826c4"></script>
+<script src="js/ai配置/ai哥布林组.js?v=20260826c4"></script>
+<script src="js/ai配置/aiGEMINI组.js?v=20260826c4"></script>
+<script src="js/aiSelector.js?v=20260819c3"></script>
+<script src="js/apiAI.js?v=20260817c3"></script>
+<script src="js/update.js?v=20260827c1"></script>
+<script src="js/render.js?v=20260826c1"></script>
+<script src="js/ui.js?v=20260827c1"></script>
+<script src="js/deckManager.js?v=20260817c3"></script>
+<script src="js/main.js?v=20260827c2"></script>
+<!-- ===== 导出确认子界面（防止误触）===== -->
+</body>
+</html>
