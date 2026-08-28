@@ -76,7 +76,7 @@ document.getElementById('localMultiBtn').addEventListener('click', () => {
     document.getElementById('topCardPanel').style.display = 'flex';
     document.getElementById('topCardPanel').innerHTML = '';
 
-    // 🔗 联机 UI：对方卡区不渲染卡牌（只显示圣水条），己方信息不对对手公开 // 清空重绘
+    document.getElementById('topCardPanel').innerHTML = ''; // 清空重绘
 
     // 下方圣水标签改为蓝方
     document.getElementById('rightElixirLabel').innerHTML = '🔵 蓝方 圣水 <span id="aiElixirDisplay">5.0</span>';
@@ -324,8 +324,9 @@ function startOnlineBattle(seed, myDeck, oppDeck, myName, oppName, onlineMode) {
 
     // 全卡模式显示全部卡牌；卡组模式显示双方各自卡组
     const panelMode = onlineMode === 'classic' ? 'classic' : 'deck';
-    renderCardPanel(panelMode, myDeck);
-+   // 🔗 联机 UI：只显示己方卡牌，隐藏对方卡区（对方圣水条保留）
+    // 🔗 联机：卡组渲染到「自己可操作」的面板（Host=蓝方→下方 cardPanel，Client=红方→上方 topCardPanel）
+    if (NET_ROLE === 'client') renderTopCardPanel(panelMode, myDeck);
+    else renderCardPanel(panelMode, myDeck);
     resetGame(seed);
     showGameTip('⚔️ 对决开始！');
 }
