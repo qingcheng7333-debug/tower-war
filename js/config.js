@@ -39,7 +39,7 @@ const BAT_TEMPLATE = {
     _isSpawned: true, lifetime: 20
 };
 const WORM_TEMPLATE = {
-    type: 'troop', flying: false, hp: 150, atk: 10, atkSpeed: 0.6,
+    type: 'troop', flying: false, hp: 280, atk: 22, atkSpeed: 1.2,
     moveSpeed: 40, range: 20, targetMode: 'buildings', icon: '🐛',
     _isSpawned: true, lifetime: 15
 };
@@ -54,13 +54,18 @@ const STRONG_GOBLIN_TEMPLATE = {
     _isSpawned: true
 };
 const GOBLIN_THROWER_TEMPLATE = {
-    type: 'troop', flying: false, hp: 40, atk: 18, atkSpeed: 1.6,
+    type: 'troop', flying: false, hp: 40, atk: 20, atkSpeed: 1.6,
     moveSpeed: 40, range: 105, targetMode: 'all', name: '哥布林投矛手', icon: '🔱',
     _isSpawned: true
 };
 const GOBLIN_MELEE_TEMPLATE = {
     type: 'troop', flying: false, hp: 60, atk: 28, atkSpeed: 1.1,
     moveSpeed: 40, range: 25, targetMode: 'all', name: '哥布林', icon: '🔪',
+    _isSpawned: true
+};
+const BARREL_GUARD_TEMPLATE = {
+    type: 'troop', flying: false, hp: 280, shield: 120, atk: 32, atkSpeed: 1.3,
+    moveSpeed: 28, range: 25, targetMode: 'all', name: '木桶护卫', icon: '🛡️',
     _isSpawned: true
 };
 const CRAFTED_WATER_CARRIER_TEMPLATE = {
@@ -74,7 +79,7 @@ const SMALL_WATER_CARRIER_TEMPLATE = {
     _isSpawned: true
 };
 const LAVA_PUP_TEMPLATE = {
-    type: 'troop', flying: true, hp: 50, atk: 20, atkSpeed: 1.7,
+    type: 'troop', flying: true, hp: 50, atk: 24, atkSpeed: 1.7,
     moveSpeed: 28, range: 75, targetMode: 'all', name: '猎犬幼崽', icon: '🐕',
     canHitAir: true, // 可对空，无攻击偏好
     _isSpawned: true
@@ -106,25 +111,25 @@ const CARDS = {
         deployDelay: 1.5, cooldown: 6
     },
     archer: {
-        type: 'troop', name: '弓箭手', cost: 2, hp: 70, atk: 20,
+        type: 'troop', name: '弓箭手', cost: 2, hp: 70, atk: 24,
         atkSpeed: 0.9, moveSpeed: 28, range: 135, targetMode: 'all', icon: '🏹',
         count: 2, deployDelay: 1.0, cooldown: 4.5
     },
     tram_squad: {
-        type: 'troop', name: '电车小队', cost: 4, hp: 120, atk: 28,
+        type: 'troop', name: '电车小队', cost: 4, hp: 240, atk: 22,
         atkSpeed: 2.2, moveSpeed: 28, range: 105, targetMode: 'all', icon: '🚃',
         count: 3, deployDelay: 1.0, cooldown: 8,
         desc: '🚃 3辆小电车。远程单体攻击（射程108），命中眩晕0.5秒💫'
     },
     fly_swarm: {
-        type: 'troop', name: '苍蝇海', cost: 5, hp: 60, atk: 26,
+        type: 'troop', name: '苍蝇海', cost: 5, hp: 85, atk: 40,
         atkSpeed: 1.2, moveSpeed: 34, range: 22, targetMode: 'all', icon: '🪰',
         count: 6, deployDelay: 1.0, cooldown: 10,
         flying: true, canHitAir: true, // 空中单位、近战可对空（canTargetFlying 豁免近战限制）
         desc: '🪰 5费群蝇：一次部署6只、部署点周围随机散开。空中单位、近战单体、可对空；生命60、攻击22、攻速1.2s、移速34'
     },
     skeleton_guard: {
-        type: 'troop', name: '守卫骷髅', cost: 3, hp: 25, atk: 30,
+        type: 'troop', name: '守卫骷髅', cost: 3, hp: 25, atk: 60,
         atkSpeed: 1.1, moveSpeed: 40, range: 22, targetMode: 'all', icon: '☠️',
         count: 3, deployDelay: 0.5, cooldown: 7.5,
         shield: 120,
@@ -137,7 +142,7 @@ const CARDS = {
         desc: '🎈 空中单位：只攻击建筑（锁建筑），近战贴脸轰炸。生命760、攻击111、攻速2s、移速28，可被对空单位攻击；死亡时留下💣，2秒后爆炸（范围同法师塔群攻45px）对周围所有敌方单位造成111伤害'
     },
     firework_gunner: {
-        type: 'troop', name: '烟花炮手', cost: 3, hp: 100, atk: 40,
+        type: 'troop', name: '烟花炮手', cost: 3, hp: 125, atk: 65,
         atkSpeed: 3, moveSpeed: 16, range: 135, targetMode: 'all', icon: '🎆',
         deployDelay: 1.5, cooldown: 6,
         desc: '🎆 发射慢速火箭🚀（直线飞行不追踪，发射时后坐力后退）：碰到敌人即伤害并分裂5个橙色小球扇形向前射出；未命中则飞满射程后在最远点分裂'
@@ -147,6 +152,12 @@ const CARDS = {
         atkSpeed: 2.2, moveSpeed: 22, range: 105, targetMode: 'all', icon: '🏹',
         shotCount: 10, spreadAngle: 120, deployDelay: 1.5, cooldown: 7.5,
         desc: '🏹 散射猎手：每次攻击向120°扇形随机散射10发弹药（45×10），直线飞行命中即消散，距离越近命中弹数越多伤害越高，可对空'
+    },
+    ninja: {
+        type: 'troop', name: '忍者', cost: 5, hp: 320, atk: 18,
+        atkSpeed: 0.8, moveSpeed: 34, range: 135, targetMode: 'all', icon: '🥷',
+        deployDelay: 1.5, cooldown: 8, canHitAir: true,
+        desc: '🥷单体追踪飞镖，可对空。敌人进入100px内时主动后退，保持100~110px距离；每两次攻击后立即随机翻滚30px，翻滚期间可受伤。'
     },
     goblin_gang: {
         type: 'troop', name: '骷髅海', cost: 3, spawnUnit: 'goblin',
@@ -162,6 +173,14 @@ const CARDS = {
         count: 4, icon: '👺', deployDelay: 1.0, cooldown: 7,
         desc: '👺 召唤4只近战哥布林（小刀）：低费人海，近战单体'
     },
+    barrel_guard: {
+        type: 'troop', name: '木桶卫队', cost: 7, count: 6,
+        hp: 280, shield: 120, atk: 32, atkSpeed: 1.3,
+        moveSpeed: 28, range: 25, targetMode: 'all', icon: '🪵',
+        deployDelay: 1.5, cooldown: 14,
+        desc: '🪵7费召唤一排6名木桶护卫：生命280、护盾120、移速28、伤害32、攻速1.3秒，近战单体攻击。护卫以骑士为基础，头部为木桶并手持长矛。'
+    },
+
     goblin_blowgun: {
         type: 'troop', name: '哥布林吹箭手', cost: 3, hp: 90, atk: 48,
         atkSpeed: 0.8, moveSpeed: 40, range: 135, targetMode: 'all', goblin: true,
@@ -192,10 +211,25 @@ const CARDS = {
         deathBoomRadius: 75, deathBoomDmg: 50,
         desc: '🛡️ 肉盾：HP极高、攻击力高，只攻击建筑（同野猪/熔岩猎犬），攻速慢(2.0s)；死亡时爆炸（周围75px内所有敌方单位50伤害）'
     },
+    anti_armor_giant: {
+        type: 'troop', name: '反甲巨人', cost: 7, hp: 2000, atk: 65,
+        atkSpeed: 1.8, moveSpeed: 16, range: 25, targetMode: 'buildings', icon: '🦔',
+        deployDelay: 2.0, cooldown: 12,
+        thornsRadius: 75, thornsDamage: 35, thornsStun: 0.5,
+        desc: '🦔 反甲巨人：生命2000、伤害85、攻速1.8秒、移速22，只攻击建筑。75px反甲范围内，攻击它的单位受到35伤害并眩晕0.5秒。'
+    },
     dragon: {
         type: 'troop', name: '飞龙', cost: 4, hp: 580, atk: 34,
         atkSpeed: 1.5, moveSpeed: 34, range: 75, splash: 34, // 范围伤害34
         flying: true, targetMode: 'all', icon: '🐉', deployDelay: 1.5, cooldown: 7.5
+    },
+    inferno_dragon: {
+        type: 'troop', name: '地狱飞龙', cost: 4, hp: 640, atk: 5,
+        atkSpeed: 0.4, moveSpeed: 28, range: 75, moveTargetRange: 65, splash: 0,
+        flying: true, canHitAir: true, targetMode: 'all', icon: '🐲',
+        deployDelay: 1.5, cooldown: 7.5,
+        infernoRamp: [7, 15, 23, 31, 39],
+        desc: '🐲 地狱光束：可索敌空中与地面单位；锁定目标后持续灼烧，基础伤害5，每阶段递增7/15/23/31/39，最高120；目标死亡、脱离射程或隐身后解除锁定，1秒后重新索敌。'
     },
     lava_hound: {
         type: 'troop', name: '熔岩猎犬', cost: 7, hp: 3000, atk: 10,
@@ -219,7 +253,7 @@ const CARDS = {
         desc: '🧙‍♀️ 群伤远程：溅射25px、范围伤害32、可对空，射程同弓箭手(135)；每7秒召唤4只骷髅'
     },
     lightning_wizard: {
-        type: 'troop', name: '雷电法师', cost: 4, hp: 300, atk: 55,
+        type: 'troop', name: '雷电法师', cost: 4, hp: 320, atk: 55,
         atkSpeed: 1.6, moveSpeed: 28, range: 105, targetMode: 'all', icon: '⚡',
         deployDelay: 0.5, cooldown: 7.5,
         chainRange: 90, chainCount: 2, chainDmgMul: 0.8,
@@ -253,7 +287,7 @@ const CARDS = {
         desc: '🐗 快速突击，只攻击建筑'
     },
     ranger: {
-        type: 'troop', name: '游侠', cost: 4, hp: 250, atk: 45,
+        type: 'troop', name: '游侠', cost: 4, hp: 260, atk: 45,
         atkSpeed: 1.2, moveSpeed: 28, range: 135, targetMode: 'all', icon: '🏹',
         deployDelay: 1.5, cooldown: 12,
         pierce: true, arrowRange: 220,
@@ -269,7 +303,7 @@ const CARDS = {
         type: 'troop', name: '火豆', cost: 1, hp: 50, atk: 0,
         atkSpeed: 0, moveSpeed: 34, range: 35, targetMode: 'all', icon: '🔥',
         deployDelay: 0.5, cooldown: 6,
-        desc: '🔥跳跃自爆单位。敌人进入90px范围时抛物线跳过去（真实弧线飞行）以敌人为中心自爆，35px范围造成5伤害+🔥灼烧5秒(20/秒)。HP50移速34'
+        desc: '🔥跳跃自爆单位。敌人进入90px范围时抛物线跳过去（真实弧线飞行）以敌人为中心自爆，35px范围造成10伤害+🔥灼烧3秒(20/秒)，总伤害70。HP50移速34'
     },
     ghost: {
         type: 'troop', name: '幽灵', cost: 3, hp: 580, atk: 40,
@@ -338,13 +372,13 @@ const CARDS = {
         desc: '🚛 只对地远程炮车（射程同电磁炮135）。被打爆后原地变形成🛡️炮台建筑：底座变正方形、回满血=第二条命、射程保持135不变、每秒自流血12'
     },
     mini_pekka: {
-        type: 'troop', name: '小皮卡', cost: 4, hp: 600, atk: 220,
+        type: 'troop', name: '小皮卡', cost: 4, hp: 600, atk: 240,
         atkSpeed: 2.2, moveSpeed: 22, range: 25, targetMode: 'all', icon: '⚔️',
         deployDelay: 1.0, cooldown: 6,
         desc: '近战单体，超高攻击力，低攻速，一击致命'
     },
     big_pekka: {
-        type: 'troop', name: '大皮卡', cost: 7, hp: 1800, atk: 205,
+        type: 'troop', name: '大皮卡', cost: 7, hp: 1800, atk: 225,
         atkSpeed: 2.0, moveSpeed: 16, range: 25, targetMode: 'all', icon: '🗡️',
         deployDelay: 1.5, cooldown: 12,
         desc: '近战单体，超高攻击力一击致命，皮糙肉厚，只对地（近战天然不对空）'
@@ -365,11 +399,11 @@ const CARDS = {
         type: 'troop', name: '渔夫', cost: 3, hp: 440, atk: 42,
         atkSpeed: 1.3, moveSpeed: 16, range: 25, targetMode: 'all', icon: '🎣',
         groundOnly: true, deployDelay: 1.0, cooldown: 6,
-        hookMin: 90, hookMax: 150, hookCharge: 1.2, hookLineSpeed: 700, hookPullSpeed: 260,
-        desc: '🎣戴斗笠的渔夫，对地单体近战。距离90~150px锁定目标蓄力1.2秒甩出棕色鱼线：兵种被勾到面前，建筑则把自己拉过去'
+        hookMin: 90, hookMax: 200, hookCharge: 1.2, hookLineSpeed: 700, hookPullSpeed: 260,
+        desc: '🎣戴斗笠的渔夫，对地单体近战。距离90~200px锁定目标蓄力1.2秒甩出棕色鱼线：兵种被勾到面前，建筑则把自己拉过去'
     },
     princess: {
-        type: 'troop', name: '公主', cost: 3, hp: 70, atk: 45,
+        type: 'troop', name: '公主', cost: 3, hp: 95, atk: 60,
         atkSpeed: 3, moveSpeed: 16, range: 165, cooldown: 10,
         splash: 45, // 群箭落地范围伤害45px（公主自身档位）
         icon: '👸',
@@ -378,9 +412,9 @@ const CARDS = {
 
     fat_tiger: {
         type: 'troop', name: '飞斧胖虎', cost: 5, hp: 640, atk: 38,
-        atkSpeed: 2.4, moveSpeed: 28, range: 105, targetMode: 'all', icon: '🪓',
+        atkSpeed: 2.4, moveSpeed: 28, range: 135, moveTargetRange: 105, targetMode: 'all', icon: '🪓',
         deployDelay: 1.5, cooldown: 10,
-        desc: '🪓 5费远程单体：生命640、攻击35、攻速2.4s、移速28、射程105（可对空）。黑蓝配色胖虎，抡起飞斧远程砍人'
+        desc: '🪓 5费远程单体：生命640、攻击35、攻速2.4s、移速28、攻击索敌135、移动索敌105（可对空）。黑蓝配色胖虎，抡起飞斧远程砍人'
     },
 
     // ==================== 精锐 ====================
@@ -489,10 +523,11 @@ const CARDS = {
         deployDelay: 2.5, cooldown: 20
     },
     inferno_tower: {
-        type: 'tower', name: '地狱塔', cost: 7, hp: 1100, atk: 12,
+        type: 'tower', name: '地狱塔', cost: 7, hp: 1100, atk: 6,
         atkSpeed: 0.2, range: 120, splash: 0, icon: '🔥',
         deployDelay: 2.5, cooldown: 30,
-        desc: '🔥 光束连线随持续时长增粗增伤，切换目标冷却2.0秒'
+        infernoRamp: [4, 7, 10, 13, 16, 19],
+        desc: '🔥 光束连线随持续锁定分段增伤：第一秒内6点伤害（DPS30），之后每秒依次增加4、7、10、13、16、19，最高75点伤害（DPS375）；切换目标冷却1.0秒'
     },
     tesla_tower: {
         type: 'tower', name: '电磁塔', cost: 4, hp: 500, atk: 40,
@@ -568,13 +603,13 @@ const CARDS = {
 
     // ==================== 法术 ====================
     log: {
-        type: 'spell', halfOnly: true, name: '滚木', cost: 2, damage: 90,
+        type: 'spell', halfOnly: true, name: '滚木', cost: 2, damage: 100,
         towerDmgMul: 0.5, radius: 32.5, icon: '🪵', deployDelay: 0.8, cooldown: 18,
         knockback: 30, rollSpeed: 250,
         rollDistance: 560,   // 法术影响范围长度：滚动560px后消失
         logLength: 65,       // 木头本体长度（竖直方向，=影响范围宽65px）
         logWidth: 7,         // 木头本体宽度（滚动方向厚度）
-        desc: '🪵 2费法术：只能在己方半场释放（与军队相同）。一根竖直滚木（长65px厚7px）横向滚出560px，影响范围长560px×宽65px（剑仙攻击范围直径），沿途每个接触的敌人造成90伤害并平滑击退30px（位移式滑动，每个敌人仅结算一次，不影响空中单位，对主塔/堡垒伤害减半）；滚到头消失'
+        desc: '🪵 2费法术：只能在己方半场释放（与军队相同）。一根竖直滚木（长65px厚7px）横向滚出560px，影响范围长560px×宽65px（剑仙攻击范围直径），沿途每个接触的敌人造成100伤害并平滑击退30px（位移式滑动，每个敌人仅结算一次，不影响空中单位，对主塔/堡垒伤害减半）；滚到头消失'
     },
     fireball: {
         type: 'spell', name: '火球术', cost: 4, damage: 320,
@@ -589,9 +624,9 @@ const CARDS = {
         desc: '🚀 6费法术：己方主塔从圆心开洞(0.5s)，火箭钻出垂直升空飞出屏幕(1.5s)，屏外等待后落点影子出现、火箭俯冲下落，共3.5秒命中造成740伤害（范围同火球术，对主塔/堡垒伤害1/3）并击退30px，命中处升起1秒小蘑菇云'
     },
     arrows: {
-        type: 'spell', name: '箭雨', cost: 3, damage: 35,
+        type: 'spell', name: '箭雨', cost: 3, damage: 44,
         radius: 85, towerDmgMul: 0.5, icon: '🌧️', deployDelay: 0.5, cooldown: 18,
-        strikes: 3, strikeInterval: 0.3,  // 三段攻击：每0.3秒一段，共3段，每段35，总伤害105
+        strikes: 3, strikeInterval: 0.3,  // 三段攻击：每0.3秒一段，共3段，每段44，总伤害132
         flightTime: 1.4,              // 箭束从主塔飞往落点耗时（秒），落地后开始下箭
     },
     earthquake: {
@@ -636,9 +671,10 @@ const CARDS = {
         desc: '🧪 2费诅咒法术：48px范围形成暗绿魔咒领域6秒，每秒对圈内所有敌人造成10点伤害（可对空、无视目标类型，对主塔/堡垒伤害减半）'
     },
     hurricane: {
-        type: 'spell', name: '飓风法术', cost: 3, damage: 20,
-        radius: 105, duration: 1.0, icon: '🌪️',
-        deployDelay: 0.8, cooldown: 12
+        type: 'spell', name: '飓风法术', cost: 3, damage: 8,
+        radius: 105, duration: 1.5, tickInterval: 0.5, icon: '🌪️',
+        deployDelay: 0.8, cooldown: 12,
+        desc: '🌪️ 3费法术：105px范围持续1.5秒的飓风领域，持续向中心牵引圈内敌人，每0.5秒造成8点伤害（共3跳24伤害，不影响建筑）'
     },
     speed_spell: {
         type: 'spell', name: '极速法术', cost: 2,
@@ -667,9 +703,9 @@ const CARDS = {
     },
     smoke_guide: {
         type: 'spell', name: '烟引', cost: 1, icon: '🧭',
-        radius: 26, deployDelay: 0.5, cooldown: 15,
-        smokeDuration: 17, smokeRadius: 12,
-        desc: '🧭 1费引导法术：先点选一名友军单位（再点地图选择放烟点）；友军将持续朝烟点前进10秒（按自身速度，无速度则不动），烟雾在友军抵达或10秒结束时消散'
+        radius: 85, deployDelay: 0.2, cooldown: 15,
+        smokeDuration: 17, smokeRadius: 12, pendingDuration: 20,
+        desc: '🧭 1费引导法术：点击地图选范围→范围内友军套上🧭闪烁buff（已扣费）；20秒内再点地图选放烟点→友军朝烟点前进至抵达或超时。超时未放烟则buff消失、无冷却直接变回烟引'
     },
     mirror: {
         type: 'spell', name: '镜像法术', cost: 1, icon: '🪞',
@@ -700,5 +736,6 @@ const BASE_UNITS = {
     small_water_carrier: SMALL_WATER_CARRIER_TEMPLATE,
     lava_pup: LAVA_PUP_TEMPLATE,
     main_tower_guard: MAIN_TOWER_GUARD_TEMPLATE,
-    prince_reinforcement: PRINCE_REINFORCEMENT_TEMPLATE
+    prince_reinforcement: PRINCE_REINFORCEMENT_TEMPLATE,
+    barrel_guard: BARREL_GUARD_TEMPLATE
 };

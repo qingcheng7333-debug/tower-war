@@ -124,7 +124,46 @@ function draw(alpha) {
     for (let p of game.projectiles) {
         const alpha = p.timer < 0.08 ? (p.timer / 0.08) : 1;
         DC.globalAlpha = alpha;
-        if (p.isCannonball) {
+        if (p.isNinjaDart) {
+            // 🥷 四角弯刃手里剑：中心空心圆环 + 四个弯曲尖刃，飞行中持续自转
+            const r = p.size * 0.23;
+            const outer = p.size * 0.62;
+            const spin = game.time * 16 + (p.spinOffset || 0);
+            DC.save();
+            DC.translate(p.x, p.y);
+            DC.rotate(spin);
+            DC.shadowColor = 'rgba(120,210,255,0.75)';
+            DC.shadowBlur = 5;
+            // 四片弯刃：每片从中心外侧弯向切线方向，再收成尖端
+            for (let i = 0; i < 4; i++) {
+                DC.save();
+                DC.rotate(i * Math.PI / 2);
+                DC.beginPath();
+                DC.moveTo(r * 0.65, -r * 0.7);
+                DC.quadraticCurveTo(outer * 0.45, -outer * 0.9, outer * 0.95, -outer * 0.28);
+                DC.quadraticCurveTo(outer * 0.78, -outer * 0.12, outer * 0.55, outer * 0.08);
+                DC.quadraticCurveTo(outer * 0.32, outer * 0.32, r * 0.65, r * 0.7);
+                DC.quadraticCurveTo(r * 0.9, 0, r * 0.65, -r * 0.7);
+                DC.closePath();
+                DC.fillStyle = p.color || '#d8f3ff';
+                DC.fill();
+                DC.strokeStyle = 'rgba(255,255,255,0.9)';
+                DC.lineWidth = 0.8;
+                DC.stroke();
+                DC.restore();
+            }
+            // 中心空心圆环：只描边，中心保持透明，呈现真正的“○”
+            DC.strokeStyle = '#e8f8ff';
+            DC.lineWidth = 1.5;
+            DC.beginPath();
+            DC.arc(0, 0, r, 0, Math.PI * 2);
+            DC.stroke();
+            DC.fillStyle = 'rgba(255,255,255,0.85)';
+            DC.beginPath();
+            DC.arc(-r * 0.3, -r * 0.3, r * 0.18, 0, Math.PI * 2);
+            DC.fill();
+            DC.restore();
+        } else if (p.isCannonball) {
             // 炮塔黑色实心炮弹
             DC.fillStyle = '#111';
             DC.beginPath();
@@ -1039,17 +1078,20 @@ function draw(alpha) {
         if (card.type === 'spell') drawBarrierRanges('player');
         // 🔮 屏障卡部署预览：同步显示场上【我方】已有屏障的庇护范围（紫色圈）
         if (game.uiState.selectedCardId === 'spell_barrier') drawOwnBarrierRanges('player');
-        // 🧭 烟引：特殊引导预览（已扣费→鼠标⬇️+虚线+友军🧭虚影；未扣费→鼠标指向友军图标变🧭）
-        if (game.uiState.selectedCardId === 'smoke_guide') {
-            if (game.smokeGuidePick && game.smokeGuidePick.team === 'player') drawSmokeGuidePick();
-            else drawSmokeGuidePreview('player');
+        // 🧭 烟引：阶段1（pending 放烟中）→ 虚线箭头+友军🧭闪烁虚影；阶段0 → 极速同款大圈(85)
+        //    镜像烟引 pending 中选中镜像卡 → 同样走「下烟」虚线预览（镜像卡=下烟载体）
+        const playerSmokeIsMirror = game.uiState.selectedCardId === 'mirror';
+        const playerSmokePending = getSmokePending('player', playerSmokeIsMirror);
+        if (game.uiState.selectedCardId === 'smoke_guide' || (playerSmokeIsMirror && playerSmokePending)) {
+            if (playerSmokePending) drawSmokeReleasePreview('player', playerSmokeIsMirror);
+            else drawSmokeGuideRangePreview('player');
         } else {
         // ★ 镜像法术：预览跟随被镜像的卡牌（镜像矿工→全屏白框、镜像迫击炮→射程圈+盲区内圈、镜像法术→淡红环等）
         let previewCard = card;
         let previewCardId = game.uiState.selectedCardId;
-        if (previewCardId === 'mirror' && game.lastDeployedCardId && game.lastDeployedCardId !== 'mirror' && CARDS[game.lastDeployedCardId]) {
-            previewCard = CARDS[game.lastDeployedCardId];
-            previewCardId = game.lastDeployedCardId;
+        if (previewCardId === 'mirror' && getMirrorCopiedCard('player') && CARDS[getMirrorCopiedCard('player')]) {
+            previewCard = CARDS[getMirrorCopiedCard('player')];
+            previewCardId = getMirrorCopiedCard('player');
         }
         // 整片可部署区域白色浅光框（法术/任意部署卡全屏，非法术动态边界渐隐；halfOnly 法术如滚木按军队规则限己方半场）
         if ((previewCard.type === 'spell' && !previewCard.halfOnly) || previewCard.anywhere) {
@@ -1153,17 +1195,19 @@ function draw(alpha) {
         if (card.type === 'spell') drawBarrierRanges('ai');
         // 🔮 屏障卡部署预览：同步显示场上【我方】已有屏障的庇护范围（紫色圈）
         if (game.uiState.selectedCardId2 === 'spell_barrier') drawOwnBarrierRanges('ai');
-        // 🧭 烟引：特殊引导预览（已扣费→鼠标⬇️+虚线+友军🧭虚影；未扣费→鼠标指向友军图标变🧭）
-        if (game.uiState.selectedCardId2 === 'smoke_guide') {
-            if (game.smokeGuidePick && game.smokeGuidePick.team === 'ai') drawSmokeGuidePick();
-            else drawSmokeGuidePreview('ai');
+        // 🧭 烟引：阶段1（pending 放烟中）→ 虚线箭头+友军🧭闪烁虚影；阶段0 → 极速同款大圈(85)
+        //    镜像烟引 pending 中选中镜像卡 → 同样走「下烟」虚线预览（镜像卡=下烟载体）
+        const aiSmokeIsMirror = game.uiState.selectedCardId2 === 'mirror';
+        const aiSmokePending = getSmokePending('ai', aiSmokeIsMirror);
+        if (game.uiState.selectedCardId2 === 'smoke_guide' || (aiSmokeIsMirror && aiSmokePending)) {
+            if (aiSmokePending) drawSmokeReleasePreview('ai', aiSmokeIsMirror);
+            else drawSmokeGuideRangePreview('ai');
         } else {
-        // ★ 镜像法术：预览跟随被镜像的卡牌（镜像矿工→全屏白框、镜像迫击炮→射程圈+盲区内圈、镜像法术→淡红环等）
         let previewCard = card;
         let previewCardId = game.uiState.selectedCardId2;
-        if (previewCardId === 'mirror' && game.lastDeployedCardId2 && game.lastDeployedCardId2 !== 'mirror' && CARDS[game.lastDeployedCardId2]) {
-            previewCard = CARDS[game.lastDeployedCardId2];
-            previewCardId = game.lastDeployedCardId2;
+        if (previewCardId === 'mirror' && getMirrorCopiedCard('ai') && CARDS[getMirrorCopiedCard('ai')]) {
+            previewCard = CARDS[getMirrorCopiedCard('ai')];
+            previewCardId = getMirrorCopiedCard('ai');
         }
         // 整片可部署区域白色浅光框（法术/任意部署卡全屏，非法术动态边界渐隐；halfOnly 法术如滚木按军队规则限己方半场）
         if ((previewCard.type === 'spell' && !previewCard.halfOnly) || previewCard.anywhere) {
@@ -1392,6 +1436,7 @@ function drawUnitBody(e) {
         else if (e.cardId === 'ranger') drawRanger(e);
         else if (e.cardId === 'archer') drawArcher(e);
         else if (e.cardId === 'hunter') drawHunter(e);
+        else if (e.cardId === 'ninja') drawNinja(e);
         else if (e.cardId === 'goblin_thrower') drawGoblinThrower(e);
         else if (e.cardId === 'goblin_melee') drawGoblinMelee(e);
         else if (e.cardId === 'goblin_blowgun') drawGoblinBlowgun(e);
@@ -1401,6 +1446,7 @@ function drawUnitBody(e) {
         else if (e.cardId === 'firework_gunner') drawFireworkGunner(e);
         else if (e.cardId === 'tram_squad') drawTram(e);
         else if (e.cardId === 'knight') drawKnight(e);
+        else if (e.cardId === 'barrel_guard') drawBarrelGuard(e);
         else if (e.cardId === 'bow_queen') drawBowQueen(e);
         else if (e.cardId === 'fat_tiger') drawFatTiger(e);
         else if (e.cardId === 'ronin') drawRonin(e);
@@ -1425,6 +1471,7 @@ function drawUnitBody(e) {
         else if (e.cardId === 'crafted_water_carrier') drawCraftedWaterCarrier(e);
         else if (e.cardId === 'small_water_carrier') drawSmallWaterCarrier(e);
         else if (e.cardId === 'small_ice_man') drawSmallIceMan(e);
+        else if (e.cardId === 'inferno_dragon') drawInfernoDragon(e);
         else if (e.cardId === 'lava_hound') drawLavaHound(e);
         else if (e.cardId === 'lava_pup') drawLavaPup(e);
         else if (e.cardId === 'balloon') drawBalloon(e);
@@ -1580,7 +1627,16 @@ function drawDeployRing(item) {
 
 /** 🧭 烟引·放烟点特效：countdown 计时环（参考部署延迟转圈环）+ active 持续烟雾发散（10秒） */
 function drawSmokeGuideEffects() {
+    // 🧭 多友军同烟点（一条引导=一个友军，全指向同一放烟点）：按 (team,tx,ty) 分组，
+    //    每组只画「剩余时间最长」的一条特效 → 烟点只显示一套烟/环（不再叠放多套）
+    const sgByPos = new Map();
     for (const sg of game.smokeGuides) {
+        const key = sg.team + '|' + sg.tx.toFixed(1) + '|' + sg.ty.toFixed(1);
+        const remain = sg.phase === 'countdown' ? sg.countdown : sg.timer;
+        const prev = sgByPos.get(key);
+        if (!prev || remain > (prev.phase === 'countdown' ? prev.countdown : prev.timer)) sgByPos.set(key, sg);
+    }
+    for (const sg of sgByPos.values()) {
         if (sg.phase === 'countdown') {
             // —— 计时特效（参考部署延迟：外圈光晕+外环轮廓+进度弧）——
             const progress = 1 - sg.countdown / sg.countdownMax;
@@ -1702,70 +1758,54 @@ function drawSmokeGuideEffects() {
     }
 }
 
-/** 🧭 烟引·选中卡牌时的引导预览（未扣费）：鼠标指向友军 → 图标变为🧭；否则提示选择友军 */
-function drawSmokeGuidePreview(team) {
-    // 鼠标指向我方非建筑友军 → 图标变为🧭 + 友军高亮圈
-    const hoverFriendly = game.entities.find(e =>
-        isFriendlyTroop(e, team)
-        && Math.hypot(e.x - game.uiState.mouseX, e.y - game.uiState.mouseY) <= (getHitRadius(e) || 14) + 4);
-    if (hoverFriendly) {
-        // 友军高亮虚线圈
-        DC.beginPath();
-        DC.arc(hoverFriendly.x, hoverFriendly.y, (getHitRadius(hoverFriendly) || 14) + 6, 0, 2 * Math.PI);
-        DC.strokeStyle = 'rgba(255,255,255,0.75)';
-        DC.lineWidth = 2;
-        DC.setLineDash([3, 3]);
-        DC.stroke();
-        DC.setLineDash([]);
-        // 鼠标位置显示 🧭（图标变为🧭）
-        DC.font = '28px sans-serif';
-        DC.textAlign = 'center';
-        DC.textBaseline = 'middle';
-        DC.fillStyle = 'rgba(255,255,255,0.95)';
-        DC.fillText('🧭', game.uiState.mouseX, game.uiState.mouseY - 12);
-        DC.textBaseline = 'alphabetic';
-    } else {
-        // 未指向友军：灰色十字准心 + 引导提示
-        drawCrosshair(game.uiState.mouseX, game.uiState.mouseY, 'rgba(255,255,255,0.5)');
-        DC.font = '12px sans-serif';
-        DC.textAlign = 'center';
-        DC.fillStyle = 'rgba(255,255,255,0.75)';
-        DC.fillText('🧭 点击友军进行引导', game.uiState.mouseX, game.uiState.mouseY + 24);
-        DC.textBaseline = 'alphabetic';
-    }
+/** 🧭 烟引·阶段0 范围预览（未扣费，与极速法术同款大圈）；屏障内变红 */
+function drawSmokeGuideRangePreview(team) {
+    const radius = CARDS.smoke_guide.radius || 85;
+    const mx = game.uiState.mouseX, my = game.uiState.mouseY;
+    const canPlace = !isSpellBlockedByBarrier(team, mx, my); // 🔮 屏障内禁放 → 变红
+    // 极速同款大圈：黄色半透明填充 + 黄边
+    DC.beginPath();
+    DC.arc(mx, my, radius, 0, 2 * Math.PI);
+    DC.fillStyle = canPlace ? 'rgba(255,255,0,0.2)' : 'rgba(255,0,0,0.15)';
+    DC.fill();
+    DC.strokeStyle = canPlace ? '#facc15' : '#ef4444';
+    DC.lineWidth = 2;
+    DC.setLineDash([]);
+    DC.stroke();
 }
 
-/** 🧭 烟引·引导中（已扣费）交互特效：鼠标⬇️ + 虚线与友军相连 + 友军身上🧭虚影 */
-function drawSmokeGuidePick() {
-    const pick = game.smokeGuidePick;
-    if (!pick) return;
-    const unit = game.entities.find(e => e.id === pick.unitId && e.hp > 0 && e.team === pick.team);
-    if (!unit) return;
+/** 🧭 烟引·阶段1 放烟预览（pending 中，已扣费）：鼠标⬇️ + 与各待引导友军虚线相连 + 友军🧭闪烁虚影 */
+function drawSmokeReleasePreview(team, isMirror) {
+    const pend = getSmokePending(team, !!isMirror);
+    if (!pend) return;
+    const mx = game.uiState.mouseX, my = game.uiState.mouseY;
+    const canPlace = !isSpellBlockedByBarrier(team, mx, my); // 🔮 屏障内禁放 → 变红
+    // 快照中仍存活的待引导友军
+    const units = game.entities.filter(e => pend.unitIds.includes(e.id) && e.hp > 0 && e.team === team);
 
-    // 友军身上 🧭 虚影（半透明上下浮动）
+    // 友军 🧭 闪烁虚影 + 与鼠标虚线相连
     const bob = Math.sin(performance.now() / 300) * 4;
-    DC.globalAlpha = 0.7;
-    DC.font = '24px sans-serif';
-    DC.textAlign = 'center';
-    DC.textBaseline = 'middle';
-    DC.fillText('🧭', unit.x, unit.y - 26 + bob);
-    DC.globalAlpha = 1;
-
-    // 鼠标位置 ⬇️（大号指示）
-    DC.font = '30px sans-serif';
-    DC.fillStyle = 'rgba(255,255,255,0.95)';
-    DC.fillText('⬇️', game.uiState.mouseX, game.uiState.mouseY - 14);
-
-    // 虚线与友军相连（从友军头顶到鼠标）
     DC.setLineDash([5, 5]);
-    DC.strokeStyle = 'rgba(255,255,255,0.6)';
+    DC.strokeStyle = canPlace ? 'rgba(255,255,255,0.6)' : 'rgba(255,80,80,0.6)';
     DC.lineWidth = 2;
-    DC.beginPath();
-    DC.moveTo(unit.x, unit.y - 26 + bob);
-    DC.lineTo(game.uiState.mouseX, game.uiState.mouseY);
-    DC.stroke();
+    for (const unit of units) {
+        DC.beginPath();
+        DC.moveTo(unit.x, unit.y - 26 + bob);
+        DC.lineTo(mx, my);
+        DC.stroke();
+        DC.globalAlpha = 0.45 + 0.35 * Math.sin(performance.now() / 180 + unit.id);
+        DC.font = '24px sans-serif';
+        DC.textAlign = 'center';
+        DC.textBaseline = 'middle';
+        DC.fillText('🧭', unit.x, unit.y - 30 + bob);
+        DC.globalAlpha = 1;
+    }
     DC.setLineDash([]);
-    DC.textBaseline = 'alphabetic';
+
+    // 鼠标位置 ⬇️（大号指示）+ 放烟合法性
+    DC.font = '30px sans-serif';
+    DC.fillStyle = canPlace ? 'rgba(255,255,255,0.95)' : 'rgba(255,80,80,0.95)';
+    DC.fillText('⬇️', mx, my - 14);
 }
 
 /** 绘制地面兵种（圆形 + 名称 + 血条） */
@@ -1773,8 +1813,15 @@ function drawTroop(unit) {
     const isPlayer = unit.team === 'player';
     const isGiant = CARDS[unit.cardId]?.name === '巨人';
     const isMainGuard = unit.cardId === 'main_tower_guard';
+    // 注：goblin_melee/goblin_thrower 是「哥布林」本体，走专属绘制函数；isGoblin 分支实际全是骷髅家族
     const isGoblin = unit.cardId === 'goblin_gang' || unit.cardId === 'goblin' || unit.cardId === 'skeleton_guard';
-    const radius = isGiant ? 16 : (isMainGuard ? 16 : (isGoblin ? 8 : 10));  // 巨人/主塔守卫圆身同熔岩猎犬(16)
+    const radius = isGiant ? 16 : (isMainGuard ? 16 : (isGoblin ? 7 : 10));  // 巨人/主塔守卫圆身同熔岩猎犬(16)；骷髅家族建模再次略微缩小 8→7
+
+    // ---- 🦔 反甲巨人：保持巨人轮廓与尺寸的专属立绘 ----
+    if (unit.cardId === 'anti_armor_giant') {
+        drawAntiArmorGiant(unit);
+        return;
+    }
 
     // ---- 剑士：大圆头 + 小正方体身子 ----
     if (unit.cardId === 'swordman') {
@@ -2222,6 +2269,114 @@ function drawPrincess(unit) {
         name: CARDS[unit.cardId]?.name || '',
         nameY: unit.y - 21,
         barY: unit.y - 17,
+    });
+}
+
+/** 绘制木桶护卫（骑士体型 + 木桶头盔 + 长柄卫矛；盾条由通用 drawNameBar 绘制） */
+function drawBarrelGuard(unit) {
+    const isPlayer = unit.team === 'player';
+    const bodyColor = isPlayer ? '#286090' : '#a93226';
+    const armorColor = isPlayer ? '#5dade2' : '#d98880';
+    const wood = '#9a642f';
+    const woodLight = '#c38b52';
+    const metal = isPlayer ? '#bfe8ff' : '#ffe0d6';
+
+    // 长柄卫矛：自动对准当前目标，攻击时沿目标方向前戳再收回（剑仙同款节奏）
+    let spearAngle = unit._spearAngle;
+    if (spearAngle === undefined) {
+        const target = unit.targetId && game.entities.find(en => en.id === unit.targetId && en.hp > 0);
+        spearAngle = target ? Math.atan2(target.y - unit.y, target.x - unit.x) : 0;
+    }
+    const spearTimer = unit._spearTimer || 0;
+    const spearThrust = spearTimer > 0
+        ? Math.sin((1 - Math.min(spearTimer / 0.3, 1)) * Math.PI) * 10
+        : 0;
+    const sx = unit.x + Math.cos(spearAngle) * spearThrust;
+    const sy = unit.y + Math.sin(spearAngle) * spearThrust;
+    const px = Math.cos(spearAngle), py = Math.sin(spearAngle);
+    const nx = -py, ny = px;
+    const shaftStartX = sx - px * 20, shaftStartY = sy - py * 20;
+    const shaftEndX = sx + px * 20, shaftEndY = sy + py * 20;
+
+    DC.save();
+    DC.strokeStyle = spearTimer > 0 ? '#f5d76e' : '#68451f';
+    DC.lineWidth = 3.2;
+    DC.beginPath();
+    DC.moveTo(shaftStartX, shaftStartY);
+    DC.lineTo(shaftEndX, shaftEndY);
+    DC.stroke();
+    DC.strokeStyle = '#d7a35e';
+    DC.lineWidth = 1;
+    DC.beginPath();
+    DC.moveTo(shaftStartX + nx, shaftStartY + ny);
+    DC.lineTo(shaftEndX + nx, shaftEndY + ny);
+    DC.stroke();
+    // 细长菱形矛头，尖端始终指向敌人
+    const tipX = sx + px * 27, tipY = sy + py * 27;
+    DC.fillStyle = spearTimer > 0 ? '#fff4b0' : metal;
+    DC.beginPath();
+    DC.moveTo(tipX, tipY);
+    DC.lineTo(sx + px * 13 + nx * 3.2, sy + py * 13 + ny * 3.2);
+    DC.lineTo(sx + px * 9, sy + py * 9);
+    DC.lineTo(sx + px * 13 - nx * 3.2, sy + py * 13 - ny * 3.2);
+    DC.closePath();
+    DC.fill();
+    DC.strokeStyle = 'rgba(255,255,255,0.8)';
+    DC.lineWidth = 1;
+    DC.stroke();
+    DC.restore();
+
+    // 收窄身体：保留骑士方形护甲基底，但不画手臂或外扩肩甲
+    DC.fillStyle = bodyColor;
+    DC.fillRect(unit.x - 6, unit.y, 12, 11);
+    DC.strokeStyle = 'rgba(255,255,255,0.65)';
+    DC.lineWidth = 1.1;
+    DC.strokeRect(unit.x - 6, unit.y, 12, 11);
+    // 简洁胸甲纹路与腰带
+    DC.strokeStyle = 'rgba(230,245,255,0.75)';
+    DC.lineWidth = 1;
+    DC.beginPath();
+    DC.moveTo(unit.x, unit.y + 1);
+    DC.lineTo(unit.x, unit.y + 10);
+    DC.moveTo(unit.x - 5, unit.y + 7);
+    DC.lineTo(unit.x + 5, unit.y + 7);
+    DC.stroke();
+
+    // 木桶头部：圆桶轮廓、两道桶箍、木板纹理
+    DC.fillStyle = wood;
+    DC.beginPath();
+    DC.roundRect(unit.x - 10, unit.y - 18, 20, 16, 3);
+    DC.fill();
+    DC.strokeStyle = '#553515';
+    DC.lineWidth = 1.4;
+    DC.stroke();
+    DC.strokeStyle = woodLight;
+    DC.lineWidth = 1.5;
+    for (const yy of [unit.y - 14, unit.y - 5]) {
+        DC.beginPath();
+        DC.moveTo(unit.x - 9, yy);
+        DC.lineTo(unit.x + 9, yy);
+        DC.stroke();
+    }
+    DC.strokeStyle = 'rgba(80,45,20,0.65)';
+    DC.lineWidth = 0.8;
+    DC.beginPath();
+    DC.moveTo(unit.x - 3, unit.y - 17);
+    DC.lineTo(unit.x - 3, unit.y - 3);
+    DC.moveTo(unit.x + 3, unit.y - 17);
+    DC.lineTo(unit.x + 3, unit.y - 3);
+    DC.stroke();
+    // 桶口/面部观察缝
+    DC.fillStyle = '#25170d';
+    DC.fillRect(unit.x - 7, unit.y - 11, 14, 3);
+    DC.fillStyle = metal;
+    DC.fillRect(unit.x - 5, unit.y - 10.2, 2.5, 1.2);
+    DC.fillRect(unit.x + 2.5, unit.y - 10.2, 2.5, 1.2);
+
+    // 名称和生命/护盾条使用统一模板
+    drawNameBar(unit, {
+        name: '木桶护卫', nameY: unit.y - 28, barY: unit.y - 24,
+        baseline: 'alphabetic',
     });
 }
 
@@ -3865,6 +4020,112 @@ function drawGoblinBlowgun(unit) {
     });
 }
 
+/** 绘制反甲巨人（以巨人为基底：保持轮廓紧凑，加入薄背甲与少量短刺） */
+function drawAntiArmorGiant(unit) {
+    const isPlayer = unit.team === 'player';
+    const bodyColor = '#7f8c8d';
+    const armorColor = isPlayer ? '#2874a6' : '#922b21';
+    const plateColor = isPlayer ? '#5dade2' : '#e67e22';
+    const r = 16;
+    const thornRadius = CARDS[unit.cardId]?.thornsRadius || 75;
+
+    // 🦔 反甲范围：淡色小环，低频呼吸式渐变闪烁（不使用高频闪烁）
+    const pulse = 0.5 + 0.5 * Math.sin(game.time * 1.6);
+    DC.save();
+    // 最暗时完全消失，最亮时提高透明度和线宽，保持低频呼吸感
+    DC.globalAlpha = pulse * 0.38;
+    DC.strokeStyle = '#d7edf2';
+    DC.lineWidth = 1.5 + pulse * 1.0;
+    DC.setLineDash([4, 5]);
+    DC.beginPath();
+    DC.arc(unit.x, unit.y, thornRadius, 0, 2 * Math.PI);
+    DC.stroke();
+    DC.setLineDash([]);
+    DC.restore();
+
+    // 背后短刺：只沿轮廓分布，不扩大主体体积
+    DC.save();
+    DC.fillStyle = plateColor;
+    DC.strokeStyle = '#34495e';
+    DC.lineWidth = 1;
+    const spikes = [
+        [-13, -9, -20, -13], [-16, -2, -24, -3], [-15, 6, -22, 10],
+        [13, -9, 20, -13], [16, -2, 24, -3], [15, 6, 22, 10],
+    ];
+    for (const [bx, by, tx, ty] of spikes) {
+        DC.beginPath();
+        DC.moveTo(unit.x + bx - 3, unit.y + by + 2);
+        DC.lineTo(unit.x + tx, unit.y + ty);
+        DC.lineTo(unit.x + bx + 3, unit.y + by - 2);
+        DC.closePath();
+        DC.fill();
+        DC.stroke();
+    }
+    DC.restore();
+
+    // 保持普通巨人的紧凑圆形身体
+    DC.fillStyle = bodyColor;
+    DC.beginPath();
+    DC.arc(unit.x, unit.y, r, 0, 2 * Math.PI);
+    DC.fill();
+    DC.strokeStyle = '#ecf0f1';
+    DC.lineWidth = 1.5;
+    DC.stroke();
+
+    // 薄型背甲/胸甲，只覆盖局部，不让身体显得更胖
+    DC.fillStyle = armorColor;
+    DC.beginPath();
+    DC.arc(unit.x, unit.y + 1, 11, Math.PI * 0.15, Math.PI * 0.85);
+    DC.lineTo(unit.x + 7, unit.y + 8);
+    DC.lineTo(unit.x - 7, unit.y + 8);
+    DC.closePath();
+    DC.globalAlpha = 0.82;
+    DC.fill();
+    DC.globalAlpha = 1;
+    DC.strokeStyle = 'rgba(230,240,245,0.75)';
+    DC.lineWidth = 1;
+    DC.beginPath();
+    DC.moveTo(unit.x, unit.y - 8);
+    DC.lineTo(unit.x, unit.y + 8);
+    DC.moveTo(unit.x - 8, unit.y + 5);
+    DC.lineTo(unit.x + 8, unit.y + 5);
+    DC.stroke();
+
+    // 头部保留巨人简洁识别度，增加小型刺冠
+    DC.fillStyle = bodyColor;
+    DC.beginPath();
+    DC.arc(unit.x, unit.y - 3, 10, 0, 2 * Math.PI);
+    DC.fill();
+    DC.strokeStyle = '#ecf0f1';
+    DC.lineWidth = 1.2;
+    DC.stroke();
+    DC.fillStyle = plateColor;
+    DC.beginPath();
+    DC.moveTo(unit.x - 7, unit.y - 10);
+    DC.lineTo(unit.x - 4, unit.y - 16);
+    DC.lineTo(unit.x, unit.y - 11);
+    DC.lineTo(unit.x + 4, unit.y - 16);
+    DC.lineTo(unit.x + 7, unit.y - 10);
+    DC.closePath();
+    DC.fill();
+    DC.strokeStyle = '#34495e';
+    DC.stroke();
+
+    // 少量铆钉，强化反甲材质
+    DC.fillStyle = '#f1c40f';
+    for (const [dx, dy] of [[-7, 3], [7, 3], [-6, 8], [6, 8]]) {
+        DC.beginPath();
+        DC.arc(unit.x + dx, unit.y + dy, 1.2, 0, 2 * Math.PI);
+        DC.fill();
+    }
+
+    drawNameBar(unit, {
+        name: CARDS[unit.cardId]?.name || '反甲巨人',
+        nameY: unit.y - 25,
+        barY: unit.y - 21,
+    });
+}
+
 /** 绘制哥布林巨人（大号哥布林底座 + 腰间两个鼓包袋子，锁定建筑） */
 function drawGoblinGiant(unit) {
     const isPlayer = unit.team === 'player';
@@ -4328,6 +4589,103 @@ function drawDragon(unit) {
     // 名称 + 血条（跟随浮动）
     drawNameBarFloat(unit, {
         name: '飞龙',
+        nameY: unit.y - size - 12,
+        barY: unit.y - size - 18,
+    });
+}
+
+/** 绘制地狱飞龙：严格参考普通飞龙的倒三角身体，加入熔岩纹、外展扇动小翅膀与上置吐息口 */
+function drawInfernoDragon(unit) {
+    const isPlayer = unit.team === 'player';
+    const size = 14;
+    const floatOffset = Math.sin(game.time * 3) * 3;
+    unit._floatY = floatOffset;
+    drawUnitShadow(unit, 20, 16, 8, 0.3);
+    const y = unit.y + floatOffset;
+
+    // 少量装饰置于身体后方：小翅膀略微向外斜、放大，并做扇动效果
+    const wingFlap = Math.sin(game.time * 9) * 2.5;
+    DC.fillStyle = isPlayer ? '#7d1f16' : '#4a1010';
+    DC.beginPath();
+    DC.moveTo(unit.x - 6, y - 5);
+    DC.lineTo(unit.x - 24, y - 18 - wingFlap);
+    DC.lineTo(unit.x - 15, y + 6 + wingFlap * 0.35);
+    DC.closePath();
+    DC.fill();
+    DC.beginPath();
+    DC.moveTo(unit.x + 6, y - 5);
+    DC.lineTo(unit.x + 24, y - 18 - wingFlap);
+    DC.lineTo(unit.x + 15, y + 6 + wingFlap * 0.35);
+    DC.closePath();
+    DC.fill();
+
+    // 背部熔岩尖刺装饰
+    DC.fillStyle = isPlayer ? '#b83220' : '#7b1e1e';
+    DC.beginPath();
+    DC.moveTo(unit.x - 8, y - size + 3);
+    DC.lineTo(unit.x - 4, y - size - 7);
+    DC.lineTo(unit.x, y - size + 2);
+    DC.lineTo(unit.x + 5, y - size - 8);
+    DC.lineTo(unit.x + 9, y - size + 4);
+    DC.closePath();
+    DC.fill();
+
+    // 普通飞龙同款：倒三角身体（▽）
+    DC.fillStyle = isPlayer ? '#9e2b20' : '#681515';
+    DC.beginPath();
+    DC.moveTo(unit.x - size, y - size);
+    DC.lineTo(unit.x + size, y - size);
+    DC.lineTo(unit.x, y + size);
+    DC.closePath();
+    DC.fill();
+    DC.strokeStyle = '#ffb347';
+    DC.lineWidth = 1.5;
+    DC.stroke();
+
+    // 熔岩纹路：保留装饰感，但不绘制眼睛
+    DC.strokeStyle = '#ff6b22';
+    DC.lineWidth = 1.5;
+    DC.beginPath();
+    DC.moveTo(unit.x - 6, y + 4);
+    DC.lineTo(unit.x, y - 1);
+    DC.lineTo(unit.x + 6, y + 4);
+    DC.moveTo(unit.x - 4, y - 7);
+    DC.lineTo(unit.x, y - 3);
+    DC.lineTo(unit.x + 4, y - 7);
+    DC.stroke();
+
+    // 吐息口位于身体上部
+    const mouthX = unit.x;
+    const mouthY = y - 9;
+    DC.fillStyle = '#fff3b0';
+    DC.beginPath();
+    DC.arc(mouthX, mouthY, 3.5, 0, 2 * Math.PI);
+    DC.fill();
+    DC.strokeStyle = '#ff7a18';
+    DC.lineWidth = 1;
+    DC.stroke();
+
+    // 光束从偏上方的吐息口发出
+    if (unit._beamTargetId) {
+        const target = game.entities.find(en => en.id === unit._beamTargetId && en.hp > 0);
+        if (target) {
+            DC.beginPath();
+            DC.moveTo(mouthX, mouthY);
+            DC.lineTo(target.x, target.y);
+            DC.strokeStyle = 'rgba(255,120,20,0.35)';
+            DC.lineWidth = 8;
+            DC.stroke();
+            DC.beginPath();
+            DC.moveTo(mouthX, mouthY);
+            DC.lineTo(target.x, target.y);
+            DC.strokeStyle = '#ffd54a';
+            DC.lineWidth = 2 + Math.min(unit._beamTimer || 0, 5) * 2;
+            DC.stroke();
+        }
+    }
+
+    drawNameBarFloat(unit, {
+        name: '地狱飞龙',
         nameY: unit.y - size - 12,
         barY: unit.y - size - 18,
     });
@@ -5036,7 +5394,16 @@ function drawStatusIcon(entity) {
         icons.push('🔥');
     }
 
-    // 🧭 烟引引导状态（朝烟点前进中）
+    // 🤢 中毒状态（忍者飞镖命中；不叠加，只刷新持续时间）
+    if (entity._poisonTimer > 0) {
+        icons.push('🤢');
+    }
+
+    // 🧭 烟引·pending 闪烁 buff（原烟引/镜像烟引分别记账）
+    if (entity._smokePendingBuff || entity._smokePendingBuffMirror) {
+        if (Math.sin(performance.now() / 180) > 0) icons.push('🧭');
+    }
+    // 🧭 烟引引导状态（朝烟点前进中，稳显）
     if (entity._smokeGuide) {
         icons.push('🧭');
     }
@@ -5094,6 +5461,128 @@ function drawTram(unit) {
         nameY: unit.y - 17,
         barY: unit.y - 12,
         baseline: 'alphabetic',
+    });
+}
+
+/** 绘制忍者（分层忍者造型；翻滚时旋转、淡化并隐身，但仍可受伤） */
+function drawNinja(unit) {
+    const isPlayer = unit.team === 'player';
+    const rolling = (unit._ninjaRollRemain || 0) > 0;
+    const body = isPlayer ? '#34495e' : '#8e3328';
+    const dark = isPlayer ? '#17202a' : '#4a1510';
+    const cloth = isPlayer ? '#566573' : '#b04a3a';
+    const metal = isPlayer ? '#b9c6d0' : '#f0b8a8';
+
+    DC.save();
+    if (rolling) {
+        // 翻滚参考暗影刺客：整体变淡，不做无敌处理
+        DC.globalAlpha = 0.42;
+        DC.translate(unit.x, unit.y);
+        DC.rotate(unit._ninjaRollAngle || 0);
+        DC.translate(-unit.x, -unit.y);
+        DC.shadowColor = isPlayer ? 'rgba(100,190,255,0.8)' : 'rgba(255,100,80,0.8)';
+        DC.shadowBlur = 8;
+    }
+
+    // 身体与肩部轮廓
+    DC.fillStyle = body;
+    DC.beginPath();
+    DC.ellipse(unit.x, unit.y + 2, 8.5, 9.5, 0, 0, Math.PI * 2);
+    DC.fill();
+    DC.strokeStyle = dark;
+    DC.lineWidth = 1.4;
+    DC.stroke();
+    DC.fillStyle = cloth;
+    DC.beginPath();
+    DC.moveTo(unit.x - 8, unit.y + 1);
+    DC.lineTo(unit.x - 12, unit.y + 5);
+    DC.lineTo(unit.x - 7, unit.y + 7);
+    DC.closePath();
+    DC.fill();
+    DC.beginPath();
+    DC.moveTo(unit.x + 8, unit.y + 1);
+    DC.lineTo(unit.x + 12, unit.y + 5);
+    DC.lineTo(unit.x + 7, unit.y + 7);
+    DC.closePath();
+    DC.fill();
+
+    // 头巾/兜帽：尖顶与两侧布带
+    DC.fillStyle = dark;
+    DC.beginPath();
+    DC.moveTo(unit.x, unit.y - 17);
+    DC.lineTo(unit.x - 9, unit.y - 8);
+    DC.lineTo(unit.x - 7, unit.y + 1);
+    DC.lineTo(unit.x + 7, unit.y + 1);
+    DC.lineTo(unit.x + 9, unit.y - 8);
+    DC.closePath();
+    DC.fill();
+    DC.fillStyle = cloth;
+    DC.beginPath();
+    DC.moveTo(unit.x - 7, unit.y - 5);
+    DC.lineTo(unit.x - 14, unit.y - 1);
+    DC.lineTo(unit.x - 9, unit.y + 1);
+    DC.lineTo(unit.x - 3, unit.y - 4);
+    DC.closePath();
+    DC.fill();
+    DC.beginPath();
+    DC.moveTo(unit.x + 7, unit.y - 5);
+    DC.lineTo(unit.x + 14, unit.y - 1);
+    DC.lineTo(unit.x + 9, unit.y + 1);
+    DC.lineTo(unit.x + 3, unit.y - 4);
+    DC.closePath();
+    DC.fill();
+
+    // 眼部面罩与高亮眼睛
+    DC.fillStyle = '#101820';
+    DC.fillRect(unit.x - 7, unit.y - 6, 14, 5);
+    DC.fillStyle = metal;
+    DC.fillRect(unit.x - 5, unit.y - 4.5, 3.5, 1.6);
+    DC.fillRect(unit.x + 1.5, unit.y - 4.5, 3.5, 1.6);
+
+    // 胸前护甲线
+    DC.strokeStyle = 'rgba(220,235,245,0.65)';
+    DC.lineWidth = 1;
+    DC.beginPath();
+    DC.moveTo(unit.x - 5, unit.y + 5);
+    DC.lineTo(unit.x, unit.y + 7);
+    DC.lineTo(unit.x + 5, unit.y + 5);
+    DC.stroke();
+
+    // 背后苦无与飘带
+    DC.strokeStyle = metal;
+    DC.lineWidth = 2;
+    DC.beginPath();
+    DC.moveTo(unit.x - 6, unit.y + 4);
+    DC.lineTo(unit.x - 14, unit.y + 11);
+    DC.stroke();
+    DC.fillStyle = cloth;
+    DC.beginPath();
+    DC.moveTo(unit.x - 7, unit.y + 7);
+    DC.lineTo(unit.x - 16, unit.y + 10);
+    DC.lineTo(unit.x - 11, unit.y + 14);
+    DC.lineTo(unit.x - 5, unit.y + 10);
+    DC.closePath();
+    DC.fill();
+
+    // 手中短苦无
+    DC.strokeStyle = metal;
+    DC.lineWidth = 1.8;
+    DC.beginPath();
+    DC.moveTo(unit.x + 5, unit.y + 6);
+    DC.lineTo(unit.x + 14, unit.y - 4);
+    DC.stroke();
+    DC.fillStyle = metal;
+    DC.beginPath();
+    DC.moveTo(unit.x + 14, unit.y - 4);
+    DC.lineTo(unit.x + 9, unit.y - 3);
+    DC.lineTo(unit.x + 12, unit.y + 1);
+    DC.closePath();
+    DC.fill();
+
+    DC.restore();
+    drawNameBar(unit, {
+        name: '忍者', nameY: unit.y - 20, barY: unit.y - 15,
+        baseline: 'alphabetic', color: rolling ? 'rgba(255,255,255,0.48)' : 'white',
     });
 }
 
@@ -5671,17 +6160,28 @@ function drawSmallIceMan(unit) {
     });
 }
 
-/** 绘制治疗兵（绿色 + 血条） */
+/** 绘制治疗兵（白底绿纹医疗风：白圆身+绿描边+浅绿同心环+绿色医疗十字 + 血条） */
 function drawHealer(unit) {
-    const isPlayer = unit.team === 'player';
-
-    DC.fillStyle = '#2ecc71';
+    // ── 本体圆（白色底）──
+    DC.fillStyle = '#f4fbf4';
     DC.beginPath();
     DC.arc(unit.x, unit.y, 10, 0, 2 * Math.PI);
     DC.fill();
-    DC.strokeStyle = 'white';
+    DC.strokeStyle = '#27ae60';
     DC.lineWidth = 1.5;
     DC.stroke();
+
+    // ── 浅绿同心环（内圈纹路装饰）──
+    DC.strokeStyle = 'rgba(46, 204, 113, 0.45)';
+    DC.lineWidth = 1;
+    DC.beginPath();
+    DC.arc(unit.x, unit.y, 7, 0, 2 * Math.PI);
+    DC.stroke();
+
+    // ── 中央医疗十字（绿色，治疗身份标识）──
+    DC.fillStyle = '#2ecc71';
+    DC.fillRect(unit.x - 1.5, unit.y - 4.5, 3, 9);   // 竖
+    DC.fillRect(unit.x - 4.5, unit.y - 1.5, 9, 3);   // 横
 
     // 名称 + 血条（第一层样板收口）
     drawNameBar(unit, {
@@ -6713,12 +7213,9 @@ function drawBuilding(b, showRange) {
         // ── 血条（通用模板）──
         drawNameBar(b, { barY: b.y - 19 });
 
-        // ── 蓄力条（血条下方：白蓝→满蓄红，独特样式保留）──
+        // ── 蓄力条（通用模板：血条正上方紧贴；白蓝→满蓄红）──
         const progress = charge / (b._chargeMax || 6);
-        DC.fillStyle = '#333';
-        DC.fillRect(b.x - 14, b.y - 12, 28, 4);
-        DC.fillStyle = progress >= 1 ? '#e74c3c' : '#4fc3f7';
-        DC.fillRect(b.x - 14, b.y - 12, 28 * Math.min(progress, 1), 4);
+        drawChargeBar(b, progress, progress >= 1 ? '#e74c3c' : '#4fc3f7');
 
         return; // ← 盔甲铺绘制完毕
     }

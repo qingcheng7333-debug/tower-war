@@ -33,6 +33,7 @@ function createGameState(gameMode) {
         // lastDeployedCardId / lastDeployedCardId2 保留在顶层：镜像法术依赖它们，属于战斗数据（非纯 UI）
         lastDeployedCardId: null,  // 蓝方上一次部署的卡牌（供镜像法术使用）
         lastDeployedCardId2: null, // 红方上一次部署的卡牌（供镜像法术使用）
+        mirrorDeploySeq: 0,         // 镜像部署唯一令牌序号，防止延迟部署重复执行
         aiDecisionTimer: 0,
         aiThinking: false,
         // ---- 可视化特效 ----
@@ -57,10 +58,12 @@ function createGameState(gameMode) {
         freezeZones: [], // { x, y, radius, timer, maxTimer }
         // ---- 🧪 哥布林魔咒诅咒领域 ----
         curseZones: [],  // { x, y, radius, timer, maxTimer, team, dps, tickTimer, bubbleTimer, bubbles[] }
-        // ---- 🧭 烟引法术：引导待选点 + 活跃引导 ----
-        smokeGuidePick: null, // { team, unitId } 已扣费、待选放烟点（引导中，无法取消）
+        hurricaneZones: [],  // { x, y, radius, timer, maxTimer, tickTimer, tickInterval, pullAndDamage } 飓风领域（持续牵引+每0.5s一跳伤害）
+        // ---- 🧭 烟引法术：pending 待放烟 + 活跃引导 ----
+        // smokePending 与 mirrorSmokePending 分开，防止镜像烟引影响原烟引
+        smokePending: { player: null, ai: null },
+        mirrorSmokePending: { player: null, ai: null },
         smokeGuides: [],      // { team, unitId, tx, ty, phase:'countdown'|'active', countdown, countdownMax, timer, maxTimer, isPlayer }
-        lastSmokeGuide: null, // { team, unitId, tx, ty, time } 最近一次烟引记录（供镜像烟引特殊版续引导原目标）
         // ---- 箭雨三段延迟伤害 ----
         arrowRainStrikes: [], // { x, y, radius, team, damage, mul, strikesLeft, interval, timer }
         // ---- 🔥 火球术：从主塔抛物线飞向落点（落地结算伤害+击退+爆炸）----
@@ -111,6 +114,66 @@ let game = createGameState('classic');
 let entityIdCounter = 1;
 
 // ---- 重置所有状态 ----
+/** 🧭 读取对应类型的烟引 pending，原烟引与镜像烟引严格隔离 */
+function getSmokePending(team, isMirror) {
+    const bucket = isMirror ? game.mirrorSmokePending : game.smokePending;
+    return bucket && bucket[team] ? bucket[team] : null;
+}
+
+/** 🪞 镜像法术状态查询与冷却接口：镜像逻辑统一从这里读写，避免各处直接操作散落字段 */
+function getMirrorCopiedCard(team) {
+    const id = team === 'player' ? game.lastDeployedCardId : game.lastDeployedCardId2;
+    return id && id !== 'mirror' && CARDS[id] ? id : null;
+}
+
+function getMirrorCooldown(team) {
+    return Math.max(0, Number((game.cardCooldowns[team] || {}).mirror) || 0);
+}
+
+function isMirrorCoolingDown(team) {
+    return getMirrorCooldown(team) > 0;
+}
+
+function setMirrorCooldown(team, seconds) {
+    const value = Math.max(0, Number(seconds) || 0);
+    if (!game.cardCooldowns[team]) game.cardCooldowns[team] = {};
+    if (value > 0) game.cardCooldowns[team].mirror = value;
+    else delete game.cardCooldowns[team].mirror;
+    return value;
+}
+
+function clearMirrorCooldown(team) {
+    setMirrorCooldown(team, 0);
+}
+
+function getMirrorEliteSkillState(team, cardId) {
+    const es = (game.eliteSkills && game.eliteSkills[team]) || {};
+    return cardId ? (es['mirror_' + cardId] || null) : null;
+}
+
+function getMirrorState(team) {
+    const copiedCardId = getMirrorCopiedCard(team);
+    const pending = getSmokePending(team, true);
+    let eliteSkillKey = null;
+    const es = (game.eliteSkills && game.eliteSkills[team]) || {};
+    for (const key in es) {
+        if (key.indexOf('mirror_') === 0) { eliteSkillKey = key; break; }
+    }
+    return {
+        team,
+        copiedCardId,
+        cooldown: getMirrorCooldown(team),
+        pendingSmoke: pending,
+        eliteSkillKey,
+        eliteSkill: eliteSkillKey ? es[eliteSkillKey] : null,
+    };
+}
+
+function nextMirrorDeployToken() {
+    game.mirrorDeploySeq = (game.mirrorDeploySeq || 0) + 1;
+    return game.mirrorDeploySeq;
+}
+
 function resetGame(seed) {
     setRandomSeed(seed !== undefined ? seed : (Date.now() >>> 0));  // 联机前置：开局同步种子（单机用时间戳）
     game = createGameState(game.gameMode);  // 保留当前模式

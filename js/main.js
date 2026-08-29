@@ -120,6 +120,10 @@ async function openOnlineLobby(onlineMode) {
     if (!nameInput.value) nameInput.value = getSavedOnlineName() || '玩家' + Math.floor(1000 + Math.random() * 9000);
     const deck = getActiveDeck();
     onlineModal.dataset.mode = onlineMode;
+    // 🐛 标题按模式动态显示（原来写死"卡组"，全卡入口进来也显示错）
+    const onlineModalTitle = document.getElementById('onlineModalTitle');
+    if (onlineModalTitle) onlineModalTitle.textContent = onlineMode === 'classic'
+        ? '🔗 双人联机（全卡）' : '🔗 双人联机（卡组）';
     onlineDeckName.textContent = onlineMode === 'classic'
         ? '全部卡牌'
         : ((deck && deck.name) ? deck.name : '默认卡组（前15张）');
@@ -325,8 +329,15 @@ function startOnlineBattle(seed, myDeck, oppDeck, myName, oppName, onlineMode) {
     // 全卡模式显示全部卡牌；卡组模式显示双方各自卡组
     const panelMode = onlineMode === 'classic' ? 'classic' : 'deck';
     // 🔗 联机：卡组渲染到「自己可操作」的面板（Host=蓝方→下方 cardPanel，Client=红方→上方 topCardPanel）
-    if (NET_ROLE === 'client') renderTopCardPanel(panelMode, myDeck);
-    else renderCardPanel(panelMode, myDeck);
+    if (NET_ROLE === 'client') {
+        renderTopCardPanel(panelMode, myDeck);
+        document.getElementById('cardPanel').innerHTML = '';      // 清掉残留卡牌
+        document.getElementById('cardPanel').style.display = 'none'; // 对方（蓝方）卡牌面板不显示
+    } else {
+        renderCardPanel(panelMode, myDeck);
+        document.getElementById('topCardPanel').innerHTML = '';   // 清掉残留卡牌
+        document.getElementById('topCardPanel').style.display = 'none'; // 对方（红方）卡牌面板不显示
+    }
     resetGame(seed);
     showGameTip('⚔️ 对决开始！');
 }
@@ -881,6 +892,8 @@ function goBackHome() {
     // 隐藏双人模式顶部UI
     document.getElementById('topElixirBar').style.display = 'none';
     document.getElementById('topCardPanel').style.display = 'none';
+    // 恢复下方卡牌面板显示（联机 Client 模式下曾被隐藏）
+    document.getElementById('cardPanel').style.display = '';
     // 恢复下方圣水标签为 AI
     document.getElementById('rightElixirLabel').innerHTML = 'AI 圣水 <span id="aiElixirDisplay">5.0</span>';
     // 重置联机状态（避免残留角色标记影响下次进入）

@@ -57,7 +57,7 @@ function deploy(cardId, team, x, y) {
 
     // ★ 镜像法术：复制上一次部署的卡牌（费用+1）
     if (cardId === 'mirror') {
-        const lastId = team === 'player' ? game.lastDeployedCardId : game.lastDeployedCardId2;
+        const lastId = getMirrorCopiedCard(team);
         if (!lastId || lastId === 'mirror' || !CARDS[lastId]) {
             game.uiState.deployFailReason = 'invalid';
             return false;
@@ -86,9 +86,19 @@ function deploy(cardId, team, x, y) {
             }
         }
         // 检查镜像自身的冷却
-        const cd = (game.cardCooldowns[team] || {})['mirror'] || 0;
+        const cd = getMirrorCooldown(team);
         if (cd > 0) {
             game.uiState.deployFailReason = 'cooldown';
+            return false;
+        }
+        // 🪞 镜像精英占用检查：技能槽、场上实体、部署队列三处任一存在即拒绝，避免覆盖已有镜像状态
+        const mirrorEliteState = getMirrorState(team);
+        const mirrorEliteOccupied = !!mirrorEliteState.eliteSkillKey
+            || game.entities.some(e => e.cardId === lastId && e.team === team
+                && e.isMirrored && e.hp > 0 && !e.isCopy)
+            || game.deploying.some(d => d.cardId === lastId && d.team === team && d.isMirrored);
+        if (origCard.activeSkill && mirrorEliteOccupied) {
+            game.uiState.deployFailReason = 'elite_used';
             return false;
         }
         // ★ ⛺ 镜像营地拆除：镜像上次部署的营地，点击己方已部署营地 → 消耗镜像标价（原价+1）直接拆除
@@ -100,7 +110,7 @@ function deploy(cardId, team, x, y) {
                 else game.elixir.ai -= mirrorCost;
                 ownCamp.hp = 0; // 标记死亡 → update.js 统一清理；被收编成员下一帧因营地消失自动解除🚩
                 // ★ 镜像拆除营地同样进入冷却（继承营地冷却），不能无限拆
-                game.cardCooldowns[team]['mirror'] = origCard.cooldown || 0;
+                setMirrorCooldown(team, origCard.cooldown || 0);
                 return true;
             }
         }
@@ -124,6 +134,30 @@ function deploy(cardId, team, x, y) {
             }
         }
 
+        // ★ 🧭 镜像复制烟引：走新流程（扣镜像费2 → 0.2s延迟 → 套buff进pending → 12s内放烟）
+        //   镜像烟引 pending 期间镜像卡锁定为烟引下烟态（0费🧭+倒计时），不跟随 lastDeployedCardId 变化
+        if (lastId === 'smoke_guide') {
+            if (game.mirrorSmokePending[team]) {     // 镜像烟引使用独立 pending，不能影响原烟引
+                game.uiState.deployFailReason = 'invalid';
+                return false;
+            }
+            // 扣镜像费（烟引1费+1=2费）
+            if (team === 'player') game.elixir.player -= mirrorCost;
+            else game.elixir.ai -= mirrorCost;
+            // 镜像冷却继承烟引（15s），但 pending 期间不读秒——放烟/超时才真正开始
+            clearMirrorCooldown(team);   // 先清除，pending 结束时再设
+            // 加入部署延迟队列（用烟引的0.2s延迟）
+            game.deploying.push({
+                cardId: 'smoke_guide', team, x, y,
+                timer: CARDS.smoke_guide.deployDelay || 0.2,
+                totalDelay: CARDS.smoke_guide.deployDelay || 0.2,
+                isPlayer: team === 'player',
+                isMirrored: true,
+                isSmokePhase1: true,
+            });
+            return true;
+        }
+
         // 扣除圣水（按镜像费用）
         if (team === 'player') game.elixir.player -= mirrorCost;
         else game.elixir.ai -= mirrorCost;
@@ -132,13 +166,15 @@ function deploy(cardId, team, x, y) {
 
         // ★ 镜像冷却：继承被复制卡的冷却（复制冷却3s的卡 → 镜像也黑3s；期间使用其他卡不影响镜像冷却）
         //   🕊️ 精英卡特殊：镜像精英在场期间镜像卡是技能卡、不读秒；等镜像精英死亡后才开始读秒（update.js 死亡结算设置）
+        let mirrorDeployToken = null;
         if (origCard.activeSkill) {
-            delete game.cardCooldowns[team]['mirror'];
+            clearMirrorCooldown(team);
             // 立即预创建镜像槽：部署延迟结束前镜像卡即变为技能卡，防止延迟窗口内重复部署出多个镜像
             const es = game.eliteSkills[team] || {};
-            es['mirror_' + lastId] = { mode: 'skill', cdLeft: 0, skillCdLeft: 0, blessCost: origCard.activeSkill.cost };
+            mirrorDeployToken = nextMirrorDeployToken();
+            es['mirror_' + lastId] = { mode: 'skill', cdLeft: 0, skillCdLeft: 0, blessCost: origCard.activeSkill.cost, mirrorDeployToken };
         } else {
-            game.cardCooldowns[team]['mirror'] = origCard.cooldown || 0;
+            setMirrorCooldown(team, origCard.cooldown || 0);
         }
 
         // 记录敌方部署信息（供 AI 使用）
@@ -157,6 +193,7 @@ function deploy(cardId, team, x, y) {
             totalDelay: delay,
             isPlayer: team === 'player',
             isMirrored: true,
+            mirrorDeployToken: origCard.activeSkill ? mirrorDeployToken : null,
             templeBlessed: !!(origCard.goblin && isTempleOnField(team))   // 🛕 神庙接收提示：镜像复制哥布林卡且神庙在场
         });
 
@@ -180,8 +217,9 @@ function deploy(cardId, team, x, y) {
         }
     }
 
-    // ★ 🧭 烟引法术：两段式引导（玩家交互由 ui.js 的 handleSmokeGuideClick 处理，不会走到这里）
-    //    AI/兜底路径：直接以点击处为烟点、自动选择最近的友军非建筑单位，扣费并创建引导
+    // ★ 🧭 烟引法术·第一段（选范围→套buff进pending）：
+    //    点击地图 → 扣费 → 0.2s部署延迟后给范围内（radius=85同极速）友军套🧭闪烁buff → 进入12s pending
+    //    不进冷却（等放烟或超时才进冷却）；不注册 lastDeployedCardId（放烟那一刻才注册，防镜像 pending 期间误触发复制）
     if (cardId === 'smoke_guide') {
         const elixirS = team === 'player' ? game.elixir.player : game.elixir.ai;
         if (elixirS < card.cost) {
@@ -193,32 +231,27 @@ function deploy(cardId, team, x, y) {
             game.uiState.deployFailReason = 'cooldown';
             return false;
         }
-        // 🔮 法术屏障：敌方不能在庇护范围内放烟（AI/兜底路径）
+        // 🔮 法术屏障：敌方不能在庇护范围内放烟（第一段选范围也受限）
         if (isSpellBlockedByBarrier(team, x, y)) {
             game.uiState.deployFailReason = 'barrier';
             return false;
         }
-        if (team === 'player') game.elixir.player -= card.cost;
-        else game.elixir.ai -= card.cost;
-        game.cardCooldowns[team]['smoke_guide'] = card.cooldown;
-        if (team === 'player') game.lastDeployedCardId = 'smoke_guide';
-        else game.lastDeployedCardId2 = 'smoke_guide';
-        // 自动选择距离烟点最近的友军非建筑单位
-        let best = null, bestD = Infinity;
-        for (const e of game.entities) {
-            if (!isFriendlyTroop(e, team)) continue;
-            const d = Math.hypot(e.x - x, e.y - y);
-            if (d < bestD) { bestD = d; best = e; }
-        }
-        if (!best) {
-            // 无友军可引导 → 退款并清除冷却
-            if (team === 'player') game.elixir.player += card.cost;
-            else game.elixir.ai += card.cost;
-            delete game.cardCooldowns[team]['smoke_guide'];
+        // ★ 同一方已有 pending → 不可重复（防止叠加）
+        if (game.smokePending[team]) {
             game.uiState.deployFailReason = 'invalid';
             return false;
         }
-        startSmokeGuide(team, best.id, x, y);
+        // 扣费（此时不进冷却，不注册 lastDeployedCardId）
+        if (team === 'player') game.elixir.player -= card.cost;
+        else game.elixir.ai -= card.cost;
+        // 加入部署延迟队列（0.2s后由 finishDeployItem 套buff进pending）
+        game.deploying.push({
+            cardId: 'smoke_guide', team, x, y,
+            timer: card.deployDelay || 0.2,
+            totalDelay: card.deployDelay || 0.2,
+            isPlayer: team === 'player',
+            isSmokePhase1: true,   // ★ 烟引第一段标记（finishDeployItem 据此走 pending 逻辑）
+        });
         return true;
     }
 
@@ -291,6 +324,20 @@ function deploy(cardId, team, x, y) {
     //    避免技能卡上误显示部署冷却（部署后卡牌应立即变为技能卡）
     if (!card.activeSkill) game.cardCooldowns[team][cardId] = card.cooldown;
 
+    // 🕊️ 精英卡在扣费并进入部署延迟时立即切换为技能态，锁住卡牌，防止延迟期间重复部署。
+    //    技能真正释放前仍由 castActiveSkill 检查场上实体是否已经生成。
+    if (card.activeSkill) {
+        const es = game.eliteSkills[team] || {};
+        const key = cardId;
+        const oldState = es[key] || {};
+        es[key] = {
+            mode: 'skill',
+            cdLeft: 0,
+            skillCdLeft: 0,
+            blessCost: oldState.blessCost != null ? oldState.blessCost : card.activeSkill.cost,
+        };
+    }
+
     // ★ 记录玩家（敌方）的最后部署信息，供 AI 即时反制使用
     if (team === 'player') {
         game.lastEnemyDeploy = { cardId, x, y, time: game.time };
@@ -330,8 +377,6 @@ function startSmokeGuide(team, unitId, tx, ty) {
         maxTimer: 0,
         isPlayer: team === 'player',
     });
-    // ★ 记录最近一次烟引（供镜像烟引特殊版：紧跟使用镜像烟引时，只续引导原目标）
-    game.lastSmokeGuide = { team, unitId, tx, ty, time: game.time };
 }
 
 /** 🥷 部署哥布林团伙：3只哥布林投矛手 + 3只近战哥布林（蓝方投矛手在左/哥布林在右，红方镜像） */
@@ -369,10 +414,52 @@ function spawnGoblinPack(item) {
     }
 }
 
+/** 🪵 部署木桶卫队：6名护卫纵向一列，间距加大，保持整齐阵型向前推进 */
+function spawnBarrelGuard(item) {
+    const tpl = BARREL_GUARD_TEMPLATE;
+    const count = 6;
+    const spacing = 75; // 超大间距：6名护卫纵向展开约375px
+    const minY = 30, maxY = H - 30;
+    const span = (count - 1) * spacing;
+    // 先整体规划队列，再根据部署点贴向最近边缘；不对每个成员单独夹紧，避免重叠
+    let firstY;
+    if (item.y - span / 2 < minY) {
+        // 贴近上边：最上方成员以安全边界为基准，向下依次排开
+        firstY = minY;
+    } else if (item.y + span / 2 > maxY) {
+        // 贴近下边：最下方成员以安全边界为基准，向上依次排开
+        firstY = maxY - span;
+    } else {
+        // 中部部署：以部署点为中心排列
+        firstY = item.y - span / 2;
+    }
+    const spawnX = Math.min(W - 30, Math.max(30, item.x));
+    for (let i = 0; i < count; i++) {
+        const spawnY = firstY + i * spacing;
+        const entity = createSummon(tpl, 'barrel_guard', spawnX, spawnY, item.team,
+            { jitterX: 0, jitterY: 0, extra: item.isMirrored ? { isMirrored: true } : {} });
+        game.entities.push(entity);
+    }
+}
+
 /** 完成一个部署延迟项（由 update.js 在倒计时归零时调用） */
 function finishDeployItem(item) {
     const card = CARDS[item.cardId];
     if (!card) return;
+
+    // 🪞 二次防重复：延迟部署真正生成前再次确认镜像精英未被同类镜像实体/部署占用。
+    //    防止重复指令或延迟队列重复项覆盖同一个 mirror_技能槽；普通镜像兵种不受此限制。
+    if (item.isMirrored && card.activeSkill && !item._mirrorValidated) {
+        const state = getMirrorEliteSkillState(item.team, item.cardId);
+        const tokenMatches = !!state && state.mirrorDeployToken === item.mirrorDeployToken;
+        const duplicateEntity = game.entities.some(e => e.cardId === item.cardId
+            && e.team === item.team && e.isMirrored && e.hp > 0 && !e.isCopy);
+        const duplicateDeploy = game.deploying.some(d => d !== item && d.isMirrored
+            && d.cardId === item.cardId && d.team === item.team);
+        // 技能槽令牌必须匹配当前部署项；已有实体或其他在途项存在时，当前项取消且不触碰合法项状态
+        if (!tokenMatches || duplicateEntity || duplicateDeploy) return;
+        item._mirrorValidated = true;
+    }
 
     // ★ 矿工/哥布林钻机 三段式部署：部署延迟结束后 → ①土堆从己方主塔挖地道前进(tunnelTime)抵达部署点 → ②原地潜伏(digTime) → ③真正生成实体破土出现
     //   全程纯特效（无实体、不参与碰撞/推动），不可被锁定，AOE/溅射仍可波及
@@ -427,6 +514,11 @@ function finishDeployItem(item) {
             spawnGoblinPack(item);
             return;
         }
+        // ★ 木桶卫队：6名木桶护卫横向排成一排，使用独立模板和建模
+        if (item.cardId === 'barrel_guard') {
+            spawnBarrelGuard(item);
+            return;
+        }
         const count = card.count || 1;
         const spread = count > 4 ? 22 : 14;
         const gangSpawnRadius = 50;   // 骷髅海：在部署点周围范围内随机召唤
@@ -479,6 +571,12 @@ function finishDeployItem(item) {
                 entity._maxLevel = 10;
                 entity._baseHp = entity.hp;
                 entity._baseAtk = entity.atk;
+            }
+            // 地狱飞龙：光束灼烧字段初始化（攻击模式复用地狱塔）
+            if (item.cardId === 'inferno_dragon') {
+                entity._beamSwitchCooldown = 0;
+                entity._beamTimer = 0;
+                entity._beamTargetId = null;
             }
             // 攻城人：自爆标记
             if (item.cardId === 'siege_man') {
@@ -687,6 +785,50 @@ function finishDeployItem(item) {
         if (item.isMirrored) entity.isMirrored = true; // 🪞 镜像法术产物标记
         game.entities.push(entity);
     } else if (card.type === 'spell') {
+        // ★ 🧭 烟引第一段：0.2s延迟结束 → 给范围内友军套🧭闪烁buff + 进入12s pending（不走 applySpellDamage）
+        if (item.isSmokePhase1) {
+            const radius = CARDS.smoke_guide.radius || 85;
+            const unitIds = [];
+            for (const e of game.entities) {
+                if (!isFriendlyTroop(e, item.team)) continue;
+                if (Math.hypot(e.x - item.x, e.y - item.y) <= radius) {
+                    unitIds.push(e.id);
+                }
+            }
+            // 范围提示环（淡红 static，同其他法术）
+            game.deployEffects.push({ x: item.x, y: item.y, radius, timer: 0.4, maxTimer: 0.4, color: AOE_RING_COLOR, static: true });
+            // ★ 无友军也正常走流程（0个buff友军不影响法术执行，同其他法术空放一样正常结算）
+            // 🤖 AI/自动托管路径（classic/api 模式电脑方）：取消12s等待，直接圈内友军全部引导去点击处（行为：1个单位→全部圈内单位）
+            const aiAuto = item.team === 'ai' && game.gameMode !== 'local_multi' && game.gameMode !== 'online';
+            if (aiAuto) {
+                for (const uid of unitIds) startSmokeGuide(item.team, uid, item.x, item.y);
+                if (item.isMirrored) {
+                    setMirrorCooldown(item.team, CARDS.smoke_guide.cooldown);
+                } else {
+                    game.cardCooldowns[item.team]['smoke_guide'] = CARDS.smoke_guide.cooldown;
+                }
+                if (item.team === 'player') game.lastDeployedCardId = 'smoke_guide';
+                else game.lastDeployedCardId2 = 'smoke_guide';
+                return;
+            }
+            // 人类路径：圈内友军套 🧭 闪烁 buff；镜像与原烟引分别记账
+            for (const e of game.entities) {
+                if (unitIds.includes(e.id)) {
+                    if (item.isMirrored) e._smokePendingBuffMirror = true;
+                    else e._smokePendingBuff = true;
+                }
+            }
+            // 进入对应 pending 槽（镜像烟引不得覆盖原烟引）
+            const pendingBucket = item.isMirrored ? game.mirrorSmokePending : game.smokePending;
+            pendingBucket[item.team] = {
+                team: item.team,
+                unitIds,
+                timer: CARDS.smoke_guide.pendingDuration || 12,
+                maxTimer: CARDS.smoke_guide.pendingDuration || 12,
+                isMirror: !!item.isMirrored,
+            };
+            return;
+        }
         applySpellDamage(item.cardId, item.team, item.x, item.y);
     }
 
@@ -695,7 +837,15 @@ function finishDeployItem(item) {
     if (card.activeSkill) {
         const es = game.eliteSkills[item.team] || {};
         const key = item.isMirrored ? 'mirror_' + item.cardId : item.cardId;
-        es[key] = { mode: 'skill', cdLeft: 0, skillCdLeft: 0, blessCost: card.activeSkill.cost };
+        const state = es[key];
+        // 部署阶段已经建立技能态；这里只补建异常缺失的状态，并保留镜像部署令牌。
+        if (!state) {
+            es[key] = {
+                mode: 'skill', cdLeft: 0, skillCdLeft: 0,
+                blessCost: card.activeSkill.cost,
+                ...(item.mirrorDeployToken != null ? { mirrorDeployToken: item.mirrorDeployToken } : {}),
+            };
+        }
     }
 }
 
@@ -794,37 +944,6 @@ function applySpellDamage(cardId, casterTeam, x, y) {
         game.deployEffects.push({ x, y, radius: card.radius, timer: 0.4, maxTimer: 0.4, color: AOE_RING_COLOR, static: true });
     }
 
-    // ---- 🧭 烟引法术：正常路径由 deploy() 特殊分支直接 startSmokeGuide，不经过这里；
-    //      仅「镜像法术复制烟引」会走到此 ----
-    // ★ 续引机制：使用过烟引后，镜像烟引直接部署、仅续引导原目标去新烟点（无时间限制，不影响其他兵种）；
-    //   否则兜底：自动引导距离烟点最近的友军非建筑单位
-    if (cardId === 'smoke_guide') {
-        const last = game.lastSmokeGuide;
-        const fresh = last && last.team === casterTeam;
-        let target = null;
-        if (fresh) {
-            // 上次被引导的兵种（若仍存活）→ 只续引导它
-            target = game.entities.find(e => e.id === last.unitId && e.hp > 0 && e.team === casterTeam);
-            if (target) {
-                // 清除该单位旧引导（旧烟点干扰），直奔新目的地（接力续引导）
-                game.smokeGuides = game.smokeGuides.filter(s => !(s.unitId === target.id && s.team === casterTeam));
-                if (casterTeam === 'player') showGameTip('🪞 镜像烟引：仅续引导原目标 🧭');
-            }
-        }
-        if (!target) {
-            // 兜底：距离烟点最近的友军非建筑单位
-            let best = null, bestD = Infinity;
-            for (const e of game.entities) {
-                if (!isFriendlyTroop(e, casterTeam)) continue;
-                const d = Math.hypot(e.x - x, e.y - y);
-                if (d < bestD) { bestD = d; best = e; }
-            }
-            target = best;
-        }
-        if (target) startSmokeGuide(casterTeam, target.id, x, y);
-        return;
-    }
-
     // ---- 🪵 滚木：竖直木头（长65px厚7px）以释放点为中心横向滚动560px（法术影响范围：长560px×宽65px=剑仙攻击范围直径；只影响地面单位，不影响空中），沿途每个接触的敌人仅结算一次（90伤害+30px平滑击退；主塔/堡垒伤害减半）----
     if (cardId === 'log') {
         const dir = casterTeam === 'player' ? 1 : -1;
@@ -857,6 +976,9 @@ function applySpellDamage(cardId, casterTeam, x, y) {
             speedBoost: card.speedBoost,
             boostDuration: card.boostDuration,
         });
+        // ✨ 小红圈持续到法术结束：静态环 timer 延长至加速区域结束（同蝙蝠法术）
+        const ring = game.deployEffects[game.deployEffects.length - 1];
+        if (ring && ring.static) { ring.timer = card.zoneDuration; ring.maxTimer = card.zoneDuration; }
         // 部署提示特效
         game.spellEffects.push({ x, y, char: '⚡', size: 44, timer: 0.8, maxTimer: 0.8 });
         for (let i = 0; i < 8; i++) {
@@ -896,6 +1018,9 @@ function applySpellDamage(cardId, casterTeam, x, y) {
             rageTick: card.rageTick || 0.5,
             pulseTimer: 0,
         });
+        // ✨ 小红圈持续到法术结束：静态环 timer 延长至狂暴区域结束（同蝙蝠法术）
+        const ring = game.deployEffects[game.deployEffects.length - 1];
+        if (ring && ring.static) { ring.timer = zoneDuration; ring.maxTimer = zoneDuration; }
         // 部署提示特效
         game.spellEffects.push({ x, y, char: '😡', size: 44, timer: 0.8, maxTimer: 0.8 });
         for (let i = 0; i < 8; i++) {
@@ -1015,6 +1140,9 @@ function applySpellDamage(cardId, casterTeam, x, y) {
             timer: freezeDuration,
             maxTimer: freezeDuration,
         });
+        // ✨ 小红圈持续到法术结束：静态环 timer 延长至冻结区域结束（同蝙蝠法术）
+        const ring = game.deployEffects[game.deployEffects.length - 1];
+        if (ring && ring.static) { ring.timer = freezeDuration; ring.maxTimer = freezeDuration; }
         // 部署提示特效
         game.spellEffects.push({ x, y, char: '🧊', size: 40, timer: 0.8, maxTimer: 0.8 });
         for (let i = 0; i < 6; i++) {
@@ -1078,6 +1206,9 @@ function applySpellDamage(cardId, casterTeam, x, y) {
             count: card.goblinCount || 3,
             timer: flightTime, maxTimer: flightTime,
         });
+        // ✨ 小红圈持续到法术结算完：静态环 timer 延长至木桶落地（同火球/火箭）
+        const ring = game.deployEffects[game.deployEffects.length - 1];
+        if (ring && ring.static) { ring.timer = flightTime; ring.maxTimer = flightTime; }
         // 释放瞬间特效：落点处淡淡木桶虚影（提示落地位置，轻微不夸张）
         game.spellEffects.push({ x, y, char: '🛢️', size: 16, timer: 0.5, maxTimer: 0.5, color: 'rgba(210,170,100,0.55)' });
         return;
@@ -1098,6 +1229,9 @@ function applySpellDamage(cardId, casterTeam, x, y) {
             bubbleTimer: 0.3, // 首个绿泡稍快冒出
             bubbles: [],
         });
+        // ✨ 小红圈持续到法术结束：静态环 timer 延长至魔咒领域结束（同蝙蝠法术）
+        const ring = game.deployEffects[game.deployEffects.length - 1];
+        if (ring && ring.static) { ring.timer = card.duration || 6; ring.maxTimer = card.duration || 6; }
         // 部署提示特效：暗绿脉冲 + 小绿泡粒子
         game.spellEffects.push({ x, y, char: '🧪', size: 44, timer: 0.8, maxTimer: 0.8, isPulse: true });
         for (let i = 0; i < 10; i++) {
@@ -1112,25 +1246,42 @@ function applySpellDamage(cardId, casterTeam, x, y) {
         return;
     }
 
-    // ---- 飓风法术：拉拢敌人并造成伤害 ----
+    // ---- 飓风法术：1.5秒飓风领域——持续向中心牵引圈内敌人，每0.5秒一跳8伤害（共3跳24，不影响建筑）----
     if (cardId === 'hurricane') {
-        const radius = card.radius || 108;
-        const damage = card.damage || 20;
-        const duration = card.duration || 1.0;
-        for (let e of game.entities) {
-            if (e.team === casterTeam || e.hp <= 0 || e.fortification || e._headHidden) continue;
-            // 仅对有移动能力的兵种生效（排除建筑/防御工事）
-            if (e.moveSpeed === undefined) continue;
-            if (dist(e, { x, y }) <= radius) {
-                const dmg = calcActualDmg(damage, null, e); // 法术伤害统一收口（框架第13条），无攻击者狂暴
-                e.hp -= dmg;
-                spawnDmgNum(e.x, e.y - 20, dmg);
-                // 标记拉拢
-                e._pullToX = x;
-                e._pullToY = y;
-                e._pullTimer = duration;
+        const radius = card.radius || 105;
+        const damage = card.damage || 8;
+        const duration = card.duration || 1.5;
+        const tickInterval = card.tickInterval || 0.5;
+        const pullAndDamage = () => {
+            for (let e of game.entities) {
+                if (e.team === casterTeam || e.hp <= 0 || e.fortification || e._headHidden) continue;
+                // 仅对有移动能力的兵种生效（排除建筑/防御工事）
+                if (e.moveSpeed === undefined) continue;
+                if (dist(e, { x, y }) <= radius) {
+                    const dmg = calcActualDmg(damage, null, e); // 法术伤害统一收口（框架第13条），无攻击者狂暴
+                    e.hp -= dmg;
+                    spawnDmgNum(e.x, e.y - 20, dmg);
+                    // 标记拉拢（持续牵引：每次跳伤都刷新拉拢计时到下一跳之后）
+                    e._pullToX = x;
+                    e._pullToY = y;
+                    e._pullTimer = Math.min(tickInterval + 0.1, 0.6);
+                }
             }
-        }
+        };
+        // 第一跳立即结算（t=0），之后每0.5秒一跳（t=0.5、t=1.0），共3跳24伤害
+        pullAndDamage();
+        game.hurricaneZones.push({
+            x, y,
+            radius,
+            timer: duration,
+            maxTimer: duration,
+            tickTimer: tickInterval,
+            tickInterval,
+            pullAndDamage,
+        });
+        // ✨ 小红圈持续到法术结束：静态环 timer 延长至飓风领域结束（同蝙蝠法术）
+        const ring = game.deployEffects[game.deployEffects.length - 1];
+        if (ring && ring.static) { ring.timer = duration; ring.maxTimer = duration; }
         // 法术特效：中央风眼（小🌪️ + 周围🌀粒子向中心靠拢消失）
         game.spellEffects.push({ x, y, char: '🌪️', size: 24, timer: 0.7, maxTimer: 0.7 });
         for (let i = 0; i < 8; i++) {
@@ -1182,6 +1333,12 @@ function applySpellDamage(cardId, casterTeam, x, y) {
         }
         // 释放瞬间特效：落点处淡淡箭束虚影（提示落地位置，轻微不夸张）
         game.spellEffects.push({ x, y, char: '།', size: 16, timer: 0.5, maxTimer: 0.5, color: 'rgba(255,255,255,0.5)' });
+        // ✨ 小红圈持续到法术结算完：静态环 timer 延长至最后一波箭落地（flightTime + (波数-1)*间隔）
+        {
+            const ring = game.deployEffects[game.deployEffects.length - 1];
+            const total = flightTime + (waveCount - 1) * interval;
+            if (ring && ring.static) { ring.timer = total; ring.maxTimer = total; }
+        }
         return;
     }
 
@@ -1201,6 +1358,12 @@ function applySpellDamage(cardId, casterTeam, x, y) {
             interval: card.strikeInterval || 1.5,
             timer: 0, // 第一段在下一帧立即触发
         });
+        // ✨ 小红圈持续到法术结算完：静态环 timer 延长至第三段地震结束（3段×1.5s=4.5s）
+        {
+            const ring = game.deployEffects[game.deployEffects.length - 1];
+            const total = (card.strikes || 3) * (card.strikeInterval || 1.5);
+            if (ring && ring.static) { ring.timer = total; ring.maxTimer = total; }
+        }
         return;
     }
 
@@ -1273,6 +1436,9 @@ function applySpellDamage(cardId, casterTeam, x, y) {
             knockback: 15,   // ★ 火球击退（参考超骑落地击退）
             timer: flightTime, maxTimer: flightTime,
         });
+        // ✨ 小红圈持续到法术结算完：静态环 timer 延长至火球落地（同火箭弹道全程显示）
+        const ring = game.deployEffects[game.deployEffects.length - 1];
+        if (ring && ring.static) { ring.timer = flightTime; ring.maxTimer = flightTime; }
         // 释放瞬间特效：落点处淡淡火球虚影（提示落地位置，轻微不夸张）
         game.spellEffects.push({ x, y, char: '🔥', size: 16, timer: 0.5, maxTimer: 0.5, color: 'rgba(255,120,30,0.5)' });
         return;
