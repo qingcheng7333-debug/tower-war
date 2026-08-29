@@ -154,46 +154,40 @@ function renderCardPanel(mode, deckCards) {
             const isDbl = !!(prev && prev.isSkill && prev.id === id && now - prev.time <= 300);
 
             // 🕊️🪞 技能卡统一交互：单击=选中（可再单击取消），300ms内双击=释放技能
+            //    （🧭 烟引 pending 中选技能卡：只收预览，pending 后台继续计时）
             if (isSkillCardState('player', id)) {
-                // 🧭 烟引锁定中：选技能卡 = 取消烟引引导（未扣费，无损）
-                if (game.smokeGuidePick && game.smokeGuidePick.team === 'player') {
-                    game.smokeGuidePick = null;
-                    showGameTip('🧭 已取消烟引引导');
-                }
                 handleSkillCardClick(id, btn, 'player', isDbl);
                 return;
             }
 
             // ★ 冷却中的卡牌不可选中（镜像法术冷却来源特殊=继承被复制卡冷却，点击时给出提示避免"没反应"）
-            const cd = (game.cardCooldowns.player || {})[id] || 0;
+            const cd = id === 'mirror' ? getMirrorCooldown('player') : ((game.cardCooldowns.player || {})[id] || 0);
             if (cd > 0) {
                 if (id === 'mirror') showGameTip(`镜像法术冷却中 ${Math.ceil(cd)}s`);
-                else if (id === 'smoke_guide' && game.smokeGuidePick && game.smokeGuidePick.team === 'player') showGameTip('🧭 已锁定友军，请选择放烟点');
+                return;
+            }
+
+            // 🧭 烟引/镜像烟引 pending 中：点烟引卡或镜像卡 = 普通法术式 toggle（已选中时再点=放弃选中；pending 后台继续计时）
+            const pendingPlayer = id === 'mirror' ? getSmokePending('player', true) : getSmokePending('player', false);
+            if ((id === 'smoke_guide' || id === 'mirror') && pendingPlayer) {
+                if (game.uiState.selectedCardId === id) {
+                    game.uiState.selectedCardId = null;
+                    document.querySelectorAll('.card-btn').forEach(b => b.classList.remove('selected'));
+                } else {
+                    game.uiState.selectedCardId = id;
+                    document.querySelectorAll('.card-btn').forEach(b => b.classList.remove('selected'));
+                    btn.classList.add('selected');
+                }
+                showGameTip(`🧭 烟引待放烟中（${Math.ceil(pendingPlayer.timer)}s），点击地图放烟`);
                 return;
             }
 
             if (game.uiState.selectedCardId === id) {
-                // 取消选中（烟引锁定中：再点烟引卡 = 取消引导，未扣费无损）
-                if (id === 'smoke_guide' && game.smokeGuidePick && game.smokeGuidePick.team === 'player') {
-                    game.smokeGuidePick = null;
-                    showGameTip('🧭 已取消烟引引导');
-                }
+                // 取消选中
                 game.uiState.selectedCardId = null;
                 document.querySelectorAll('.card-btn').forEach(b => b.classList.remove('selected'));
             } else {
-                // 🧭 烟引锁定中：点烟引卡 = 恢复引导流程；点其他卡 = 取消引导并选中新卡（未扣费，无损）
-                if (game.smokeGuidePick && game.smokeGuidePick.team === 'player') {
-                    if (id === 'smoke_guide') {
-                        game.uiState.selectedCardId = id;
-                        document.querySelectorAll('.card-btn').forEach(b => b.classList.remove('selected'));
-                        btn.classList.add('selected');
-                        showGameTip('🧭 已锁定友军，点击地图放烟');
-                        return;
-                    }
-                    game.smokeGuidePick = null;
-                    showGameTip('🧭 已取消烟引引导');
-                }
-                // 选中新卡牌
+                // 选中新卡牌（pending 中选其他卡：只收预览、pending 后台继续计时）
                 game.uiState.selectedCardId = id;
                 document.querySelectorAll('.card-btn').forEach(b => b.classList.remove('selected'));
                 btn.classList.add('selected');
@@ -252,48 +246,42 @@ function renderTopCardPanel(mode, deckCards) {
             const isDbl = !!(prev && prev.isSkill && prev.id === id && now - prev.time <= 300);
 
             // 🕊️🪞 技能卡统一交互：单击=选中（可再单击取消），300ms内双击=释放技能
+            //    （🧭 烟引 pending 中选技能卡：只收预览，pending 后台继续计时）
             if (isSkillCardState('ai', id)) {
-                // 🧭 烟引锁定中：选技能卡 = 取消烟引引导（未扣费，无损）
-                if (game.smokeGuidePick && game.smokeGuidePick.team === 'ai') {
-                    game.smokeGuidePick = null;
-                    showGameTip('🧭 已取消烟引引导');
-                }
                 handleSkillCardClick(id, btn, 'ai', isDbl);
                 return;
             }
 
             // 冷却判断（红方复用 ai 冷却槽；镜像法术冷却来源特殊=继承被复制卡冷却，点击时给出提示避免"没反应"）
-            const cd = (game.cardCooldowns.ai || {})[id] || 0;
+            const cd = id === 'mirror' ? getMirrorCooldown('ai') : ((game.cardCooldowns.ai || {})[id] || 0);
             if (cd > 0) {
                 if (id === 'mirror') showGameTip(`镜像法术冷却中 ${Math.ceil(cd)}s`);
-                else if (id === 'smoke_guide' && game.smokeGuidePick && game.smokeGuidePick.team === 'ai') showGameTip('🧭 已锁定友军，请选择放烟点');
+                return;
+            }
+
+            // 🧭 烟引/镜像烟引 pending 中：点烟引卡或镜像卡 = 普通法术式 toggle（已选中时再点=放弃选中；pending 后台继续计时）
+            const pendingAi = id === 'mirror' ? getSmokePending('ai', true) : getSmokePending('ai', false);
+            if ((id === 'smoke_guide' || id === 'mirror') && pendingAi) {
+                if (game.uiState.selectedCardId2 === id) {
+                    game.uiState.selectedCardId2 = null;
+                    document.querySelectorAll('#topCardPanel .card-btn').forEach(b => b.classList.remove('selected'));
+                } else {
+                    // 选中红方烟引 → 取消蓝方选中
+                    game.uiState.selectedCardId = null;
+                    document.querySelectorAll('#cardPanel .card-btn').forEach(b => b.classList.remove('selected'));
+                    game.uiState.selectedCardId2 = id;
+                    document.querySelectorAll('#topCardPanel .card-btn').forEach(b => b.classList.remove('selected'));
+                    btn.classList.add('selected');
+                }
+                showGameTip(`🧭 烟引待放烟中（${Math.ceil(pendingAi.timer)}s），点击地图放烟`);
                 return;
             }
 
             if (game.uiState.selectedCardId2 === id) {
-                // 取消选中（烟引锁定中：再点烟引卡 = 取消引导，未扣费无损）
-                if (id === 'smoke_guide' && game.smokeGuidePick && game.smokeGuidePick.team === 'ai') {
-                    game.smokeGuidePick = null;
-                    showGameTip('🧭 已取消烟引引导');
-                }
+                // 取消选中
                 game.uiState.selectedCardId2 = null;
                 document.querySelectorAll('#topCardPanel .card-btn').forEach(b => b.classList.remove('selected'));
             } else {
-                // 🧭 烟引锁定中：点烟引卡 = 恢复引导流程；点其他卡 = 取消引导并选中新卡（未扣费，无损）
-                if (game.smokeGuidePick && game.smokeGuidePick.team === 'ai') {
-                    if (id === 'smoke_guide') {
-                        // 恢复红方烟引引导 → 取消蓝方选中
-                        game.uiState.selectedCardId = null;
-                        document.querySelectorAll('#cardPanel .card-btn').forEach(b => b.classList.remove('selected'));
-                        game.uiState.selectedCardId2 = id;
-                        document.querySelectorAll('#topCardPanel .card-btn').forEach(b => b.classList.remove('selected'));
-                        btn.classList.add('selected');
-                        showGameTip('🧭 已锁定友军，点击地图放烟');
-                        return;
-                    }
-                    game.smokeGuidePick = null;
-                    showGameTip('🧭 已取消烟引引导');
-                }
                 // 选中红方卡牌 → 取消蓝方选中
                 game.uiState.selectedCardId = null;
                 document.querySelectorAll('#cardPanel .card-btn').forEach(b => b.classList.remove('selected'));
@@ -335,7 +323,9 @@ function setupUI() {
         // 优先蓝方（下方玩家；🔗 联机：仅房主可操作蓝方）
         if (canOperateTeam('player') && game.uiState.selectedCardId) {
             // 🧭 烟引：两段式引导交互（不走 deploy 常规路径）
-            if (game.uiState.selectedCardId === 'smoke_guide') {
+            //    镜像烟引 pending 中：镜像卡=「下烟」载体，点地图同样走放烟交互（不重复部署）
+            const _p = getSmokePending('player', game.uiState.selectedCardId === 'mirror');
+            if (game.uiState.selectedCardId === 'smoke_guide' || (game.uiState.selectedCardId === 'mirror' && _p)) {
                 handleSmokeGuideClick('player', x, y);
                 return;
             }
@@ -346,8 +336,12 @@ function setupUI() {
                 return;
             }
             if (dispatchCommand({ type: 'DEPLOY', team: 'player', cardId: game.uiState.selectedCardId, x, y })) {
-                game.uiState.selectedCardId = null;
-                document.querySelectorAll('#cardPanel .card-btn').forEach(b => b.classList.remove('selected'));
+                // 🧭 烟引第一阶段（选范围套buff）部署成功后：保持选中烟引卡
+                //    → 预览无缝切换为「下烟」阶段（虚线箭头），继续放烟流程，无需重新点卡
+                if (game.uiState.selectedCardId !== 'smoke_guide') {
+                    game.uiState.selectedCardId = null;
+                    document.querySelectorAll('#cardPanel .card-btn').forEach(b => b.classList.remove('selected'));
+                }
             } else {
                 // 部署失败：位置无效保留选中方便换位置；其余失败清空选中并提示，避免选中状态/预览残留造成"点了没反应/再次点击还是预览"
                 const failReason = game.uiState.deployFailReason;
@@ -370,7 +364,9 @@ function setupUI() {
         // 红方（上方玩家；🔗 联机：仅加入者可操作红方）
         if (canOperateTeam('ai') && game.uiState.selectedCardId2) {
             // 🧭 烟引：两段式引导交互（红方双人模式同样支持）
-            if (game.uiState.selectedCardId2 === 'smoke_guide') {
+            //    镜像烟引 pending 中：镜像卡=「下烟」载体，点地图同样走放烟交互（不重复部署）
+            const _p = getSmokePending('ai', game.uiState.selectedCardId2 === 'mirror');
+            if (game.uiState.selectedCardId2 === 'smoke_guide' || (game.uiState.selectedCardId2 === 'mirror' && _p)) {
                 handleSmokeGuideClick('ai', x, y);
                 return;
             }
@@ -381,8 +377,12 @@ function setupUI() {
                 return;
             }
             if (dispatchCommand({ type: 'DEPLOY', team: 'ai', cardId: game.uiState.selectedCardId2, x, y })) {
-                game.uiState.selectedCardId2 = null;
-                document.querySelectorAll('#topCardPanel .card-btn').forEach(b => b.classList.remove('selected'));
+                // 🧭 烟引第一阶段（选范围套buff）部署成功后：保持选中烟引卡
+                //    → 预览无缝切换为「下烟」阶段（虚线箭头），继续放烟流程，无需重新点卡
+                if (game.uiState.selectedCardId2 !== 'smoke_guide') {
+                    game.uiState.selectedCardId2 = null;
+                    document.querySelectorAll('#topCardPanel .card-btn').forEach(b => b.classList.remove('selected'));
+                }
             } else {
                 // 部署失败：同上，清空选中并提示（位置无效保留选中）
                 const failReason = game.uiState.deployFailReason;
@@ -419,8 +419,24 @@ function refreshTopCardCooldowns() {
         const card = CARDS[id];
         if (card && card.activeSkill) return; // 🕊️ 精英卡冷却由 eliteSkills 管理，不走普通冷却
         if (btn.dataset.mirrorSkill) return;  // 🪞 镜像精英技能卡：冷却由镜像槽管理（技能冷却/已用在 updateSingleMirror 显示）
+        // 🧭 烟引：pending 已结束（放烟/超时）但卡面仍被改写过 → 恢复原卡面
+        if (id === 'smoke_guide' && btn.dataset.smokePendingState && !getSmokePending('ai', false)) {
+            btn.dataset.smokePendingState = '';
+            btn.innerHTML = `<span class="card-cost">${card.cost}</span>${card.icon}<br>${card.name}<span class="card-cooldown-overlay"></span>`;
+        }
         const cd = cooldowns[id] || 0;
         const overlay = btn.querySelector('.card-cooldown-overlay');
+        // 🧭 烟引 pending：卡面变「0费⬇️+倒计时」（非黑，无冷却覆盖层；倒计时实时刷新）
+        if (id === 'smoke_guide' && getSmokePending('ai', false)) {
+            const secs = Math.ceil(getSmokePending('ai', false).timer);
+            if (btn.dataset.smokePendingState !== String(secs)) {
+                btn.dataset.smokePendingState = String(secs);
+                btn.innerHTML = `<span class="card-cost">0</span>⬇️<br>下烟 ${secs}s<span class="card-cooldown-overlay"></span>`;
+            }
+            btn.classList.remove('on-cooldown');
+            return;
+        }
+        btn.dataset.smokePendingState = '';
         // 🔮 法术屏障：动态费用显示（场上每多1座己方屏障费用+2）
         if (id === 'spell_barrier') {
             const costEl = btn.querySelector('.card-cost');
@@ -503,86 +519,68 @@ function refreshEliteSkillPanel(selector, team) {
     });
 }
 
-/** 🧭 烟引法术两段式交互（由 canvas 点击调用，不走 deploy 常规路径）：
- *  ① 未锁定：点击我方非建筑友军 → 锁定目标（★ 不扣费不进冷却，期间选其他卡/再点烟引=取消，无损）
- *  ② 已锁定：点击地图任意处 = 选择放烟点（★ 此时才扣费+冷却+生效；点击敌方兵种不放烟） */
+/** 🧭 烟引法术·新状态机交互（由 canvas 点击调用）：
+ *  阶段0（选中卡）：预览 = 极速同款大圈(radius=85)，点地图任意处 → 扣1费 → 0.2s部署延迟
+ *  阶段1（pending 中，12s倒计时）：点地图 = 选放烟点 → 校验敌方兵种/屏障 → 圈内友军全部
+ *        startSmokeGuide 去该点 → buff停闪稳显 → 进冷却15s → 注册 lastDeployedCardId
+ *  阶段2（超时/放烟后）：清理 pending；期间选其他卡只收预览、pending 后台继续计时
+ *  ★ 该函数只处理「第一段扣费」（阶段0→阶段1），放烟点选择由 handleSmokeReleaseClick 执行 */
 function handleSmokeGuideClick(team, x, y) {
     const card = CARDS.smoke_guide;
     if (!card) return;
+    // 阶段1（pending 放烟中）→ 交给 handleSmokeReleaseClick（选放烟点）
+    //    （镜像 pending 同理：镜像卡此时就是「下烟」载体，交互完全一致）
+    const selectedId = team === 'player' ? game.uiState.selectedCardId : game.uiState.selectedCardId2;
+    const isMirror = selectedId === 'mirror';
+    if (getSmokePending(team, isMirror)) {
+        handleSmokeReleaseClick(team, x, y);
+        return;
+    }
+    // 阶段0：扣1费 → 0.2s部署延迟 → 套buff进pending（由 finishDeployItem 完成）
+    dispatchCommand({ type: 'DEPLOY', team, cardId: 'smoke_guide', x, y });
+}
+
+/** 🧭 烟引·阶段2：pending 中点击地图 = 选放烟点
+ *  圈内所有 buff 友军 startSmokeGuide 去该点（改变🧭buff为引导特殊状态）→ 进冷却 → 清 pending */
+function handleSmokeReleaseClick(team, x, y) {
+    const card = CARDS.smoke_guide;
+    if (!card) return;
+    const selectedId = team === 'player' ? game.uiState.selectedCardId : game.uiState.selectedCardId2;
+    const isMirror = selectedId === 'mirror';
+    const pendingBucket = isMirror ? game.mirrorSmokePending : game.smokePending;
+    const pend = getSmokePending(team, isMirror);
+    if (!pend) return;
+    // 🔮 法术屏障：敌方不能在庇护范围内放烟（同其他法术的通用规则）
+    if (isSpellBlockedByBarrier(team, x, y)) {
+        showGameTip('🔮 敌方法术屏障笼罩该区域，无法释放法术');
+        return;
+    }
+    // 🧭 过滤仍存活的 buff 友军 → 全部引导去放烟点（行为同 AI：圈内友军全引导）
+    // ★ 无友军存活也正常走流程，且烟点照常出烟特效（真正法术：空放也有视觉效果）
+    let guided = 0;
+    for (const uid of pend.unitIds) {
+        const e = game.entities.find(ent => ent.id === uid && ent.hp > 0 && ent.team === team);
+        if (!e) continue;
+        guided++;
+        if (isMirror) e._smokePendingBuffMirror = false;
+        else e._smokePendingBuff = false; // 🧭 buff 停闪（pending 闪烁结束）
+        startSmokeGuide(team, uid, x, y);
+        e._smokeGuide = true;        // 🧭 立即稳显（不等 countdown→active）
+    }
+    if (guided === 0) startSmokeGuide(team, null, x, y); // 纯特效引导：无友军时烟点也出烟
+    // 进冷却（15s；镜像烟引冷却继承15s）+ 注册 lastDeployedCardId（供镜像复制）
+    const cd = card.cooldown;
+    if (isMirror) setMirrorCooldown(team, cd);
+    else game.cardCooldowns[team]['smoke_guide'] = cd;
+    if (team === 'player') game.lastDeployedCardId = 'smoke_guide';
+    else game.lastDeployedCardId2 = 'smoke_guide';
+    // 清对应 pending，原烟引与镜像烟引互不影响
+    pendingBucket[team] = null;
+    // 清选中态（放烟完成）
     const selKey = team === 'player' ? 'selectedCardId' : 'selectedCardId2';
     const panelSel = team === 'player' ? '#cardPanel .card-btn' : '#topCardPanel .card-btn';
-
-    // ② 已锁定友军：点击任意处 = 选放烟点（放烟时才扣费，取消/失败无损）
-    if (game.smokeGuidePick && game.smokeGuidePick.team === team) {
-        // 🧭 友军已阵亡：引导取消（未扣费，无损）
-        const pickUnit = game.entities.find(e => e.id === game.smokeGuidePick.unitId && e.hp > 0 && e.team === team);
-        if (!pickUnit) {
-            showGameTip('🧭 友军已阵亡，引导取消');
-            game.smokeGuidePick = null;
-            game.uiState[selKey] = null;
-            document.querySelectorAll(panelSel).forEach(b => b.classList.remove('selected'));
-            return;
-        }
-        // 🧭 点击敌方兵种：不放烟（防止误触吃掉烟引），保持锁定可继续选
-        const enemyHit = game.entities.find(e => e.team !== team && e.hp > 0
-            && Math.hypot(e.x - x, e.y - y) <= (getHitRadius(e) || 14) + 4);
-        if (enemyHit) {
-            showGameTip('🧭 不能对敌方放烟，请选择其他位置');
-            return;
-        }
-        // 🔮 敌方法术屏障：庇护范围内不能放烟（保持锁定，可重新选点）
-        if (isSpellBlockedByBarrier(team, x, y)) {
-            showGameTip('🔮 敌方法术屏障笼罩该区域，无法放烟');
-            return;
-        }
-        // ★ 放烟时才扣费：检查费用/冷却
-        const elixir = team === 'player' ? game.elixir.player : game.elixir.ai;
-        if (elixir < card.cost) {
-            showGameTip('圣水不足，无法放烟（已取消）');
-            game.smokeGuidePick = null;
-            game.uiState[selKey] = null;
-            document.querySelectorAll(panelSel).forEach(b => b.classList.remove('selected'));
-            return;
-        }
-        const cd = (game.cardCooldowns[team] || {})['smoke_guide'] || 0;
-        if (cd > 0) {
-            showGameTip('卡牌冷却中，无法放烟（已取消）');
-            game.smokeGuidePick = null;
-            game.uiState[selKey] = null;
-            document.querySelectorAll(panelSel).forEach(b => b.classList.remove('selected'));
-            return;
-        }
-        // 扣费 + 冷却 + 记录（此时才真正生效）
-        if (team === 'player') game.elixir.player -= card.cost;
-        else game.elixir.ai -= card.cost;
-        game.cardCooldowns[team]['smoke_guide'] = card.cooldown;
-        if (team === 'player') game.lastDeployedCardId = 'smoke_guide';
-        else game.lastDeployedCardId2 = 'smoke_guide';
-        startSmokeGuide(team, game.smokeGuidePick.unitId, x, y);
-        game.smokeGuidePick = null;
-        game.uiState[selKey] = null;
-        document.querySelectorAll(panelSel).forEach(b => b.classList.remove('selected'));
-        return;
-    }
-
-    // 🧭 双人模式：对方正在引导中 → 阻止（smokeGuidePick 为单槽位，防止互相覆盖）
-    if (game.smokeGuidePick && game.smokeGuidePick.team !== team) {
-        showGameTip('🧭 对方正在选择放烟点，请稍候');
-        return;
-    }
-
-    // ① 未锁定：点击我方非建筑友军 → 锁定目标（不扣费不进冷却，期间选其他卡即取消）
-    const hit = game.entities.find(e =>
-        isFriendlyTroop(e, team)
-        && Math.hypot(e.x - x, e.y - y) <= (getHitRadius(e) || 14) + 4);
-    if (hit) {
-        game.smokeGuidePick = { team, unitId: hit.id };
-        showGameTip('🧭 已锁定友军，点击地图放烟（放烟时才扣费）');
-        return;
-    }
-
-    // 点击其他东西 → 提示
-    showGameTip('该法术用于引导友军');
+    game.uiState[selKey] = null;
+    document.querySelectorAll(panelSel).forEach(b => b.classList.remove('selected'));
 }
 
 /** 轻量提示浮字（技能释放失败等场景，自动淡出） */
@@ -604,9 +602,9 @@ function showGameTip(text) {
 /** 更新镜像法术卡牌的显示内容（每帧更新，让按钮动态反映上一次部署的卡牌） */
 function updateMirrorCardDisplay() {
     // 更新蓝方（玩家）镜像
-    updateSingleMirror('#cardPanel .card-btn.card-mirror', game.lastDeployedCardId, 'player');
+    updateSingleMirror('#cardPanel .card-btn.card-mirror', getMirrorCopiedCard('player'), 'player');
     // 更新红方镜像（AI 或玩家2，用自己的记录）
-    updateSingleMirror('#topCardPanel .card-btn.card-mirror', game.lastDeployedCardId2, 'ai');
+    updateSingleMirror('#topCardPanel .card-btn.card-mirror', getMirrorCopiedCard('ai'), 'ai');
 }
 
 /** 更新单个镜像按钮的显示（🪞 镜像精英在场时，镜像卡变为该精英的独立技能卡——镜像与本体互不影响） */
@@ -616,13 +614,10 @@ function updateSingleMirror(selector, lastCardId, team) {
 
     // 🪞 当前在场的镜像精英：遍历镜像槽（存在 = 镜像精英在场）。
     //    镜像技能卡的显示**只由镜像精英决定**，与最近部署的卡牌无关（使用其他卡不会刷新镜像卡）
-    const es = (game.eliteSkills || {})[team] || {};
-    let mirrorCardId = null;
-    for (const key in es) {
-        if (key.indexOf('mirror_') === 0) { mirrorCardId = key.slice(7); break; }
-    }
+    const mirrorState = getMirrorState(team);
+    const mirrorCardId = mirrorState.eliteSkillKey ? mirrorState.eliteSkillKey.slice(7) : null;
     if (mirrorCardId && CARDS[mirrorCardId] && CARDS[mirrorCardId].activeSkill) {
-        const st = es['mirror_' + mirrorCardId];
+        const st = mirrorState.eliteSkill;
         const origCard = CARDS[mirrorCardId];
         // 清除可能残留的部署冷却样式（镜像法术自身冷却），技能卡冷却由镜像槽管理
         mirrorBtn.classList.remove('on-cooldown', 'card-skill-used', 'card-skill-cd');
@@ -652,12 +647,23 @@ function updateSingleMirror(selector, lastCardId, team) {
         const origCard = CARDS[lastCardId];
         // 🔮 镜像复制屏障：费用跟随屏障动态费用+1（屏障6→镜像7，屏障8→镜像9）
         const mirrorCost = (lastCardId === 'spell_barrier' ? getCardCost(team, 'spell_barrier') : origCard.cost) + 1;
-        // ★ 续引：使用过烟引后镜像复制烟引 → 名称显示「续引」（镜像烟引特殊版：无时间限制，续引导原目标）
-        const showName = (lastCardId === 'smoke_guide' && game.lastSmokeGuide) ? '续引' : origCard.name;
-        mirrorBtn.innerHTML = `<span class="card-cost">${mirrorCost}</span>🪞<br><span class="mirror-copied-name">${showName}</span><span class="card-cooldown-overlay"></span>`;
+        // 🧭 镜像烟引 pending：镜像卡锁定「0费⬇️+倒计时」（非黑；放烟/超时后恢复普通镜像卡显示）
+        if (lastCardId === 'smoke_guide' && getSmokePending(team, true)) {
+            const secs = Math.ceil(getSmokePending(team, true).timer);
+            if (mirrorBtn.dataset.smokePendingState !== String(secs)) {
+                mirrorBtn.dataset.smokePendingState = String(secs);
+                mirrorBtn.innerHTML = `<span class="card-cost">0</span>⬇️<br><span class="mirror-copied-name">下烟 ${secs}s</span><span class="card-cooldown-overlay"></span>`;
+            }
+            mirrorBtn.classList.add('mirror-active');
+            mirrorBtn.classList.remove('on-cooldown', 'card-skill-mode', 'card-skill-used', 'card-skill-cd');
+            return;
+        }
+        mirrorBtn.dataset.smokePendingState = '';
+        mirrorBtn.innerHTML = `<span class="card-cost">${mirrorCost}</span>🪞<br><span class="mirror-copied-name">${origCard.name}</span><span class="card-cooldown-overlay"></span>`;
         mirrorBtn.classList.add('mirror-active');
         mirrorBtn.classList.remove('card-skill-mode', 'card-skill-used', 'card-skill-cd');
     } else {
+        mirrorBtn.dataset.smokePendingState = '';
         mirrorBtn.innerHTML = `<span class="card-cost">1</span>🪞<br>镜像法术<span class="card-cooldown-overlay"></span>`;
         mirrorBtn.classList.remove('mirror-active', 'card-skill-mode', 'card-skill-used', 'card-skill-cd');
     }
@@ -674,8 +680,24 @@ function refreshCardCooldowns() {
         const card = CARDS[id];
         if (card && card.activeSkill) return; // 🕊️ 精英卡冷却由 eliteSkills 管理，不走普通冷却
         if (btn.dataset.mirrorSkill) return;  // 🪞 镜像精英技能卡：冷却由镜像槽管理（技能冷却/已用在 updateSingleMirror 显示）
+        // 🧭 烟引：pending 已结束（放烟/超时）但卡面仍被改写过 → 恢复原卡面
+        if (id === 'smoke_guide' && btn.dataset.smokePendingState && !getSmokePending('player', false)) {
+            btn.dataset.smokePendingState = '';
+            btn.innerHTML = `<span class="card-cost">${card.cost}</span>${card.icon}<br>${card.name}<span class="card-cooldown-overlay"></span>`;
+        }
         const cd = cooldowns[id] || 0;
         const overlay = btn.querySelector('.card-cooldown-overlay');
+        // 🧭 烟引 pending：卡面变「0费⬇️+倒计时」（非黑，无冷却覆盖层；倒计时实时刷新）
+        if (id === 'smoke_guide' && getSmokePending('player', false)) {
+            const secs = Math.ceil(getSmokePending('player', false).timer);
+            if (btn.dataset.smokePendingState !== String(secs)) {
+                btn.dataset.smokePendingState = String(secs);
+                btn.innerHTML = `<span class="card-cost">0</span>⬇️<br>下烟 ${secs}s<span class="card-cooldown-overlay"></span>`;
+            }
+            btn.classList.remove('on-cooldown');
+            return;
+        }
+        btn.dataset.smokePendingState = '';
         // 🔮 法术屏障：动态费用显示（场上每多1座己方屏障费用+2）
         if (id === 'spell_barrier') {
             const costEl = btn.querySelector('.card-cost');
