@@ -33,7 +33,7 @@ const TEAMS = ['player', 'ai'];
 
 // ---- 单位属性模板 ----
 const BAT_TEMPLATE = {
-    type: 'troop', flying: true, hp: 20, atk: 15, atkSpeed: 1.2,
+    type: 'troop', flying: true, hp: 24, atk: 22, atkSpeed: 1.2,
     moveSpeed: 40, range: 20, targetMode: 'all', icon: '🦇',
     canHitAir: true, // 蝙蝠可对空（近战也可攻击飞行目标，update.js canTargetFlying判定）
     _isSpawned: true, lifetime: 20
@@ -44,7 +44,7 @@ const WORM_TEMPLATE = {
     _isSpawned: true, lifetime: 15
 };
 const GOBLIN_TEMPLATE = {
-    type: 'troop', flying: false, hp: 25, atk: 20, atkSpeed: 1.1,
+    type: 'troop', flying: false, hp: 25, atk: 25, atkSpeed: 1.1,
     moveSpeed: 40, range: 22, targetMode: 'all', name: '骷髅', icon: '☠️',
     _isSpawned: true
 };
@@ -54,12 +54,12 @@ const STRONG_GOBLIN_TEMPLATE = {
     _isSpawned: true
 };
 const GOBLIN_THROWER_TEMPLATE = {
-    type: 'troop', flying: false, hp: 40, atk: 20, atkSpeed: 1.6,
+    type: 'troop', flying: false, hp: 60, atk: 18, atkSpeed: 1.6,
     moveSpeed: 40, range: 105, targetMode: 'all', name: '哥布林投矛手', icon: '🔱',
     _isSpawned: true
 };
 const GOBLIN_MELEE_TEMPLATE = {
-    type: 'troop', flying: false, hp: 60, atk: 28, atkSpeed: 1.1,
+    type: 'troop', flying: false, hp: 100, atk: 26, atkSpeed: 1.1,
     moveSpeed: 40, range: 25, targetMode: 'all', name: '哥布林', icon: '🔪',
     _isSpawned: true
 };
@@ -68,13 +68,18 @@ const BARREL_GUARD_TEMPLATE = {
     moveSpeed: 28, range: 25, targetMode: 'all', name: '木桶护卫', icon: '🛡️',
     _isSpawned: true
 };
+const BARBARIAN_TEMPLATE = {
+    type: 'troop', flying: false, hp: 340, atk: 32, atkSpeed: 1.4,
+    moveSpeed: 28, range: 25, targetMode: 'all', name: '蛮人', icon: '🪓',
+    _isSpawned: true
+};
 const CRAFTED_WATER_CARRIER_TEMPLATE = {
-    type: 'troop', flying: false, hp: 400, atk: 25, atkSpeed: 1.2,
+    type: 'troop', flying: false, hp: 460, atk: 25, atkSpeed: 1.2,
     moveSpeed: 28, range: 25, targetMode: 'buildings', icon: '💧',
     _isSpawned: true
 };
 const SMALL_WATER_CARRIER_TEMPLATE = {
-    type: 'troop', flying: false, hp: 150, atk: 15, atkSpeed: 1.0,
+    type: 'troop', flying: false, hp: 180, atk: 15, atkSpeed: 1.0,
     moveSpeed: 34, range: 25, targetMode: 'buildings', icon: '💧',
     _isSpawned: true
 };
@@ -96,6 +101,12 @@ const PRINCE_REINFORCEMENT_TEMPLATE = {
     _isSpawned: true   // 召唤物（非卡牌）
 };
 
+const WOOD_STAKE_TEMPLATE = {
+    type: 'tower', flying: false, hp: 220, atk: 0, atkSpeed: 0,
+    range: 0, name: '木桩', icon: '🪵',
+    _isSpawned: true   // 召唤物（非卡牌）：建筑型纯站桩阻挡（220血），不攻击不移动
+};
+
 // ---- 建筑属性模板 ----
 const BASTION_STATS = { hp: 4000, atk: 45, atkSpeed: 0.8, range: 163 };
 
@@ -109,6 +120,13 @@ const CARDS = {
         type: 'troop', name: '剑士', cost: 3, hp: 950, atk: 40,
         atkSpeed: 1.2, moveSpeed: 22, range: 25, targetMode: 'all', icon: '⚔️',
         deployDelay: 1.5, cooldown: 6
+    },
+    strong_barbarian: {
+        //  强壮蛮人：6费近战肉盾，一次部署2只、竖着排（纵向一列间距50）
+        type: 'troop', name: '强壮蛮人', cost: 6, hp: 620, atk: 82,
+        atkSpeed: 1.4, moveSpeed: 28, range: 25, targetMode: 'all', icon: '🪓',
+        count: 2, deployDelay: 1.5, cooldown: 10,
+        desc: '🪓 6费双蛮人：一次部署2只、竖着排（纵向一列间距50）。近战肉盾：生命580、攻击80、攻速1.4s、移速28'
     },
     archer: {
         type: 'troop', name: '弓箭手', cost: 2, hp: 70, atk: 24,
@@ -128,6 +146,12 @@ const CARDS = {
         flying: true, canHitAir: true, // 空中单位、近战可对空（canTargetFlying 豁免近战限制）
         desc: '🪰 5费群蝇：一次部署6只、部署点周围随机散开。空中单位、近战单体、可对空；生命60、攻击22、攻速1.2s、移速34'
     },
+    large_fly: {
+        type: 'troop', name: '大苍蝇', cost: 3, hp: 400, atk: 75,
+        atkSpeed: 1.5, moveSpeed: 28, range: 22, targetMode: 'all', icon: '🪰',
+        flying: true, canHitAir: true, deployDelay: 1.0, cooldown: 7.5,
+        desc: '🪰 大苍蝇：单体飞行近战单位，可攻击空中目标。生命400、攻击75、攻速1.5秒、移速28。'
+    },
     skeleton_guard: {
         type: 'troop', name: '守卫骷髅', cost: 3, hp: 25, atk: 60,
         atkSpeed: 1.1, moveSpeed: 40, range: 22, targetMode: 'all', icon: '☠️',
@@ -136,13 +160,13 @@ const CARDS = {
         desc: '☠️ 3个骷髅守卫（骷髅+黑色小盔甲）。🛡️蓝色护盾条120：护盾未破前伤害全被吸收（哪怕只剩1点护盾也能完整挡下一次攻击），护盾扣完才扣生命。攻击30，部署快(0.5s)'
     },
     balloon: {
-        type: 'troop', name: '气球兵', cost: 5, hp: 760, atk: 111,
+        type: 'troop', name: '气球兵', cost: 5, hp: 760, atk: 260,
         atkSpeed: 2.0, moveSpeed: 28, range: 22, targetMode: 'buildings', icon: '🎈',
         flying: true, deployDelay: 1.5, cooldown: 8,
         desc: '🎈 空中单位：只攻击建筑（锁建筑），近战贴脸轰炸。生命760、攻击111、攻速2s、移速28，可被对空单位攻击；死亡时留下💣，2秒后爆炸（范围同法师塔群攻45px）对周围所有敌方单位造成111伤害'
     },
     firework_gunner: {
-        type: 'troop', name: '烟花炮手', cost: 3, hp: 125, atk: 65,
+        type: 'troop', name: '烟花炮手', cost: 3, hp: 130, atk: 65,
         atkSpeed: 3, moveSpeed: 16, range: 135, targetMode: 'all', icon: '🎆',
         deployDelay: 1.5, cooldown: 6,
         desc: '🎆 发射慢速火箭🚀（直线飞行不追踪，发射时后坐力后退）：碰到敌人即伤害并分裂5个橙色小球扇形向前射出；未命中则飞满射程后在最远点分裂'
@@ -154,14 +178,19 @@ const CARDS = {
         desc: '🏹 散射猎手：每次攻击向120°扇形随机散射10发弹药（45×10），直线飞行命中即消散，距离越近命中弹数越多伤害越高，可对空'
     },
     ninja: {
-        type: 'troop', name: '忍者', cost: 5, hp: 320, atk: 18,
-        atkSpeed: 0.8, moveSpeed: 34, range: 135, targetMode: 'all', icon: '🥷',
+        type: 'troop', name: '忍者', cost: 5, hp: 300, atk: 18,
+        atkSpeed: 0.7, moveSpeed: 34, range: 135, targetMode: 'all', icon: '🥷',
         deployDelay: 1.5, cooldown: 8, canHitAir: true,
         desc: '🥷单体追踪飞镖，可对空。敌人进入100px内时主动后退，保持100~110px距离；每两次攻击后立即随机翻滚30px，翻滚期间可受伤。'
     },
     goblin_gang: {
         type: 'troop', name: '骷髅海', cost: 3, spawnUnit: 'goblin',
         count: 15, icon: '☠️', deployDelay: 1.5, cooldown: 7.5
+    },
+    barbarian: {
+        type: 'troop', name: '蛮人', cost: 5, spawnUnit: 'barbarian',
+        count: 5, icon: '🪓', deployDelay: 1.5, cooldown: 10,
+        desc: '🪓 5费召唤5只蛮人：生命350、攻击32、攻速1.4s、移速28。部署点周围随机分散。'
     },
     goblin_crew: {
         type: 'troop', name: '哥布林团伙', cost: 3, goblin: true,
@@ -182,7 +211,7 @@ const CARDS = {
     },
 
     goblin_blowgun: {
-        type: 'troop', name: '哥布林吹箭手', cost: 3, hp: 90, atk: 48,
+        type: 'troop', name: '哥布林吹箭手', cost: 3, hp: 100, atk: 48,
         atkSpeed: 0.8, moveSpeed: 40, range: 135, targetMode: 'all', goblin: true,
         icon: '🎯', deployDelay: 1.5, cooldown: 6,
         desc: '🎯 哥布林吹箭手：远程吹箭（直线弹道不追踪、命中即结算，可对空）。生命90、攻击48、攻速0.8s、移速40、射程135'
@@ -219,9 +248,26 @@ const CARDS = {
         desc: '🦔 反甲巨人：生命2000、伤害85、攻速1.8秒、移速22，只攻击建筑。75px反甲范围内，攻击它的单位受到35伤害并眩晕0.5秒。'
     },
     dragon: {
-        type: 'troop', name: '飞龙', cost: 4, hp: 580, atk: 34,
-        atkSpeed: 1.5, moveSpeed: 34, range: 75, splash: 34, // 范围伤害34
+        type: 'troop', name: '飞龙', cost: 4, hp: 580, atk: 36,
+        atkSpeed: 1.5, moveSpeed: 34, range: 75, splash: 36, // 范围伤害36，溅射全额不衰减
         flying: true, targetMode: 'all', icon: '🐉', deployDelay: 1.5, cooldown: 7.5
+    },
+    phoenix: {
+        // 🦅 凤凰：4费飞行近战火鸟（可对空）。死亡时烈焰爆发：45px范围80伤害并击退15px（击退仅兵种生效，参考超骑落地击退）
+        type: 'troop', name: '凤凰', cost: 4, hp: 520, atk: 44,
+        atkSpeed: 1.0, moveSpeed: 28, range: 25, targetMode: 'all', icon: '🔥',
+        flying: true, canHitAir: true, // 飞行单位、近战可对空（同大苍蝇）
+        deployDelay: 1.5, cooldown: 7.5,
+        deathBoomRadius: 45, deathBoomDmg: 80, deathBoomKnockback: 15,
+        desc: '🔥 4费飞行近战凤凰：生命520、攻击44、攻速1s、移速28，可对空。死亡时烈焰爆发：45px范围内80伤害并击退15px'
+    },
+    lightning_dragon: {
+        type: 'troop', name: '雷龙', cost: 5, hp: 500, atk: 40,
+        atkSpeed: 2.0, moveSpeed: 28, range: 75, moveTargetRange: 65, splash: 0,
+        flying: true, canHitAir: true, targetMode: 'all', icon: '🐲',
+        deployDelay: 1.5, cooldown: 9.0,
+        chainRange: 75, chainCount: 2, chainDmgMul: 1.0,
+        desc: '🐲 雷龙：蓝色飞行单位，攻击造成40点雷电伤害；以目标为起点向75范围内最多2个额外目标连锁（单次最多命中3个目标），连锁伤害不衰减，可攻击空中单位。'
     },
     inferno_dragon: {
         type: 'troop', name: '地狱飞龙', cost: 4, hp: 640, atk: 5,
@@ -245,12 +291,27 @@ const CARDS = {
         spawnInterval: 5.0, spawnCount: 2, spawnUnit: 'bat', deathSpawnCount: 1
     },
     witch: {
-        type: 'troop', name: '女巫', cost: 5, hp: 450, atk: 25,
+        type: 'troop', name: '女巫', cost: 5, hp: 420, atk: 25,
         atkSpeed: 1.1, moveSpeed: 22, range: 135, splash: 25, // 范围伤害32
         targetMode: 'all', canHitAir: true, icon: '🧙‍♀️',
         deployDelay: 1.5, cooldown: 7.5,
         spawnInterval: 7.0, spawnCount: 4, spawnUnit: 'skeleton', // 召唤物：骷髅（SUMMON_CREATORS 映射，spread 圆散）
         desc: '🧙‍♀️ 群伤远程：溅射25px、范围伤害32、可对空，射程同弓箭手(135)；每7秒召唤4只骷髅'
+    },
+    ice_mage: {
+        type: 'troop', name: '寒冰法师', cost: 3, hp: 340, atk: 18,
+        atkSpeed: 1.7, moveSpeed: 28, range: 105, targetMode: 'all', icon: '❄️',
+        canHitAir: true, splash: 25,
+        deployDelay: 1.5, cooldown: 7.5,
+        deploySpell: { radius: 40, damage: 20 },
+        desc: '❄️ 蓝灰寒冰法师：部署落地时对40px范围造成20伤害并产生冰雪冲击；发射带寒气的冰锥直线弹道，碰到敌人后爆裂；主目标18伤害，25px范围内其他目标受到60%溅射伤害，可对空；命中后减速与降低攻击力60%，持续2.5秒'
+    },
+    fire_mage: {
+        type: 'troop', name: '火法师', cost: 5, hp: 375, atk: 60,
+        atkSpeed: 1.4, moveSpeed: 28, range: 135, moveTargetRange: 105, targetMode: 'all', icon: '🔥',
+        canHitAir: true, splash: 35,
+        deployDelay: 1.5, cooldown: 7.5,
+        desc: '🔥 红灰火法师：攻击索敌135、移动索敌105（飞斧胖虎同款索敌分离，边走边打）；发射火球直线弹道，命中爆裂或飞到135终点爆裂；35px范围内所有目标受到全额60伤害（无衰减、不分主次），可对空'
     },
     lightning_wizard: {
         type: 'troop', name: '雷电法师', cost: 4, hp: 320, atk: 55,
@@ -273,6 +334,14 @@ const CARDS = {
         attackHeal: 10, deployHeal: 20, // 攻击/登场触发持续治疗：1.2秒内每0.3秒一次共4次
         desc: '👼飞行近战(不对空)，治疗范围同暗夜女巫射程(75px)，仅治疗持续时显示绿色光环。每次攻击触发1.2s持续治疗(每0.3s治疗10)；登场触发1.2s持续治疗(每0.3s治疗20)'
     },
+    barbarian_battering_ram: {
+        type: 'troop', name: '蛮人攻城槌', cost: 4, hp: 480, atk: 140,
+        atkSpeed: 1.0, moveSpeed: 28, range: 25, targetMode: 'buildings',
+        count: 1, icon: '🪵',
+        chargeTime: 4.0, chargeSpeedMul: 2.0, chargeAtkMul: 3.0,
+        deployDelay: 1.5, cooldown: 10,
+        desc: '单个兵种实体，由两名蛮人共同扛着铁尖木槌；只攻击建筑，部署4秒后进入冲锋，移速200%、攻击力300%；攻击建筑后死亡，并原地召唤两名蛮人继续作战'
+    },
     siege_man: {
         type: 'troop', name: '攻城人', cost: 2, hp: 140, atk: 60,
         atkSpeed: 1.0, moveSpeed: 40, range: 10, targetMode: 'buildings',
@@ -281,13 +350,13 @@ const CARDS = {
         desc: '一次部署2只，移速极快，冲向最近建筑。触碰建筑或死亡时留下💣，0.5秒后爆炸对周围所有敌方单位造成60伤害（对建筑3倍180，含主塔/堡垒），爆炸范围45px'
     },
     hog: {
-        type: 'troop', name: '野猪', cost: 4, hp: 800, atk: 85,
-        atkSpeed: 1.5, moveSpeed: 40, range: 25, targetMode: 'buildings', icon: '🐗',
+        type: 'troop', name: '野猪', cost: 4, hp: 800, atk: 135,
+        atkSpeed: 1.6, moveSpeed: 40, range: 25, targetMode: 'buildings', icon: '🐗',
         deployDelay: 1.5, cooldown: 10,
         desc: '🐗 快速突击，只攻击建筑'
     },
     ranger: {
-        type: 'troop', name: '游侠', cost: 4, hp: 260, atk: 45,
+        type: 'troop', name: '游侠', cost: 4, hp: 260, atk: 38,
         atkSpeed: 1.2, moveSpeed: 28, range: 135, targetMode: 'all', icon: '🏹',
         deployDelay: 1.5, cooldown: 12,
         pierce: true, arrowRange: 220,
@@ -312,7 +381,7 @@ const CARDS = {
         desc: '隐身状态不会被敌方锁定。攻击后现身，3秒未攻击自动恢复隐身'
     },
     miner: {
-        type: 'troop', name: '矿工', cost: 3, hp: 580, atk: 36,
+        type: 'troop', name: '矿工', cost: 3, hp: 650, atk: 36,
         atkSpeed: 1.3, moveSpeed: 28, range: 25, targetMode: 'all', icon: '⛏️',
         deployDelay: 0.5, cooldown: 6, digTime: 0.6, tunnelTime: 2, towerDmgMul: 1 / 3, anywhere: true,
         desc: '⛏️可部署于任意位置（不受半场限制，直达敌后）。部署延迟0.5秒，土堆从己方主塔挖地道潜行2秒抵达部署点，再潜伏钻出0.6秒（不被锁定，AOE仍可波及）后破土而出。单体近战，对主塔/堡垒（防御工事）伤害1/3'
@@ -341,12 +410,12 @@ const CARDS = {
         type: 'troop', name: '超级骑士', cost: 7, hp: 2000, atk: 50,
         atkSpeed: 1.2, moveSpeed: 22, range: 30, splash: 25, targetMode: 'all', icon: '\u{1F978}', // 普攻溅射低档25（跃击40特殊不动）
         deployDelay: 1.5, cooldown: 20,
-        desc: '近战群攻，部署时范围伤害并击退敌人；可蓄力1.5秒抛物线跳跃至中距离敌人（真实弧线飞行），落地击退',
-        deploySpell: { radius: 40, damage: 85, knockback: 15 },
+        desc: '近战群攻，部署落地与跃击落地均造成140范围伤害并击退敌人；可蓄力1.5秒抛物线跳跃至中距离敌人（真实弧线飞行）',
+        deploySpell: { radius: 40, damage: 140, knockback: 15 },
         leapRange: 105
     },
     wizard: {
-        type: 'troop', name: '巫师', cost: 4, hp: 320, atk: 28,
+        type: 'troop', name: '巫师', cost: 4, hp: 280, atk: 30,
         atkSpeed: 1.0, moveSpeed: 22, range: 105, targetMode: 'all', icon: '🧙',
         deployDelay: 1.5, cooldown: 12,
         desc: '远程单体魔法攻击，🫧气泡给敌人上🐛标记，死亡后召唤小虫'
@@ -359,7 +428,7 @@ const CARDS = {
         desc: '出场只有1/4血量(650)，❤️‍🩹每秒自动回复20血，可被治疗兵加速治疗，满血后孵化成🐉巨龙（飞行单位，单体伤害）'
     },
     electro_cannon: {
-        type: 'troop', name: '电磁炮', cost: 6, hp: 630, atk: 600,
+        type: 'troop', name: '电磁炮', cost: 6, hp: 630, atk: 570,
         atkSpeed: 0, moveSpeed: 16, range: 135, targetMode: 'all', icon: '🔫',
         groundOnly: true, deployDelay: 1.5, cooldown: 10,
         chargeTime: 5.0,
@@ -403,7 +472,7 @@ const CARDS = {
         desc: '🎣戴斗笠的渔夫，对地单体近战。距离90~200px锁定目标蓄力1.2秒甩出棕色鱼线：兵种被勾到面前，建筑则把自己拉过去'
     },
     princess: {
-        type: 'troop', name: '公主', cost: 3, hp: 95, atk: 60,
+        type: 'troop', name: '公主', cost: 3, hp: 110, atk: 60,
         atkSpeed: 3, moveSpeed: 16, range: 165, cooldown: 10,
         splash: 45, // 群箭落地范围伤害45px（公主自身档位）
         icon: '👸',
@@ -440,8 +509,21 @@ const CARDS = {
         },
         desc: '🗡️ 6费精锐近战单体：生命850、攻击75、攻速1.1s、移速22。🗡️飞剑：每9.5秒生成1把（最多3把）绕身旋转，200内有敌直线射出，命中150伤，未命中飞出场外。🕊️御剑期间飞剑变金色：命中敌人后朝最近的敌人改向飞去（最多转弯4次；伤害逐次衰减40%、最低伤害2后不再衰减），御剑结束恢复普通。🕊️主动技能·御剑（2费）：部署后卡牌变为「御剑」，变为空中单位，御剑期间大剑变金色、普攻提升至80、移速提升至40（持续10秒后自动落回地面并还原）；御剑释放后进入35秒冷却，冷却结束可再次释放；剑仙死亡后卡牌恢复可部署并开始35秒死亡冷却'
     },
+    yomi: {
+        type: 'troop', category: 'elite', name: '黄泉', cost: 7, hp: 900, atk: 48,
+        atkSpeed: 1.1, moveSpeed: 28, range: 35, moveTargetRange: 30, targetMode: 'all', icon: '🌑',
+        // 🎯 索敌分离（参考火法师）：移动索敌30 = 攻击索敌35 - 5（靠近到30px站桩，35px内边走边打不贴脸）
+        deployDelay: 1.5, cooldown: 35,  // 死亡冷却（暂定35秒同剑仙，可调）
+        hpPctDmg: 0.22,  // 🌑 普攻附加目标当前生命值14%伤害（随目标血量动态变化）
+        // 🌀 精英主动技能（占位）：部署后卡牌变为「界域」（3费）；效果待定，暂无实际作用
+        activeSkill: {
+            id: 'yomi_realm', name: '界域', icon: '🌀', cost: 3, cooldown: 30,
+            desc: '界域（3费·30s冷却）：施法0.6s后展开105范围界域、持续7s；界域内除黄泉外所有单位（敌我）冰冻+隐身（普通索敌看不见），黄泉无视隐身、索敌仅限界域内、伤害=5+敌人最大生命值33%、刀变纯红；黄泉阵亡则界域消散'
+        },
+        desc: '🌑 7费精锐近战单体：生命900、攻击48+目标当前生命值22%、攻速1.1s、移速28、近战范围35（同剑仙）。🌀主动技能·界域（3费·占位待定）'
+    },
     little_prince: {
-        type: 'troop', category: 'elite', name: '小王子', cost: 3, hp: 340, atk: 20,
+        type: 'troop', category: 'elite', name: '小王子', cost: 3, hp: 340, atk: 22,
         atkSpeed: 1.2, moveSpeed: 22, range: 135, targetMode: 'all', icon: '🤴',
         deployDelay: 1.5, cooldown: 28,  // 死亡冷却（暂定28秒，可调）
         // 👑 精英主动技能：部署后卡牌变为「护驾」（3费·单次技能）；释放后卡牌变黑（singleUse → used），小王子死亡后卡牌才恢复可部署并开始死亡冷却
@@ -461,6 +543,17 @@ const CARDS = {
             desc: '爆发：释放后进入20秒冷却。持续6秒：攻速0.2s、伤害30、移速40，且锁血最低1（不会死亡）'
         },
         desc: '🗡️ 2费精锐近战单体：生命380、攻击25、攻速0.6s、移速34。💥主动技能·爆发（3费）：释放后进入20秒冷却，冷却结束可再次释放'
+    },
+    jessie: {
+        type: 'troop', category: 'elite', name: '杰西', cost: 4, hp: 300, atk: 36,
+        atkSpeed: 1.4, moveSpeed: 22, range: 135, targetMode: 'all', icon: '🔫',
+        deployDelay: 1.5, cooldown: 25,  // 死亡冷却（暂定25秒，可调）
+        // 🔫 精英主动技能：部署后卡牌变为「后撤」（2费，暂占位；效果待定，冷却暂定30秒）
+        activeSkill: {
+            id: 'jessie_retreat', name: '后撤', icon: '↩️', cost: 2, cooldown: 30,
+            desc: '后撤：杰西立即向后方冲刺105px，并延迟0.3s在原地部署一根木桩（建筑·220血，每秒自流血10）阻挡敌人；后撤后4秒内电磁弹变为亮金色：飞行距离提升至500、命中附带眩晕1秒💫'
+        },
+        desc: '🔫 4费精锐远程单体：生命300、攻击36、攻速1.4s、移速22、射程135（可对空）。电磁枪发射连锁电磁团：命中后拐向下一个敌人（可回弹），伤害逐次-4（36→32→28→24→20→16→12→8→4），保底4，总射程250。↩️主动技能·后撤（2费）：立即后撤105px并延迟0.3s在原地部署木桩（建筑·220血，每秒自流血10）阻挡敌人，冷却30秒；后撤后4秒内电磁弹变亮金色（飞行距离500、命中眩晕1秒💫）'
     },
     monk: {
         type: 'troop', category: 'elite', name: '武僧', cost: 5, hp: 1100, atk: 30,
@@ -564,9 +657,16 @@ const CARDS = {
         desc: '🛠️可部署于任意位置（不受半场限制）。部署延迟0.5秒，钻机从己方主塔挖地道潜行2.8秒抵达部署点，再潜伏钻出0.8秒（不被锁定，AOE仍可波及）后破土而出。每秒自流血60，每3秒无条件钻出1只哥布林；被摧毁时钻出2只'
     },
     goblin_barrack: {
-        type: 'barrack', name: '骷髅墓碑', cost: 4, hp: 480,
+        type: 'barrack', name: '骷髅墓碑', cost: 4, hp: 430,
         spawnInterval: 7.0, spawnCount: 2, spawnUnit: 'goblin', icon: '🏕️',
         deployDelay: 2.5, cooldown: 12
+    },
+    barbarian_hut: {
+        type: 'barrack', name: '蛮人屋', cost: 8, hp: 1000,
+        spawnInterval: 15.0, spawnCount: 3, spawnUnit: 'barbarian', spawnBurstInterval: 0.3,
+        deathSpawnCount: 1, icon: '🛖',
+        deployDelay: 2.5, cooldown: 12,
+        desc: '🛖 8费兵营：每15秒出兵一轮，每轮3个蛮人，连续每0.3秒出1个；被摧毁时召唤1个蛮人'
     },
     elixir_collector: {
         type: 'collector', name: '圣水生成器', cost: 7, hp: 740,
@@ -603,13 +703,13 @@ const CARDS = {
 
     // ==================== 法术 ====================
     log: {
-        type: 'spell', halfOnly: true, name: '滚木', cost: 2, damage: 100,
+        type: 'spell', halfOnly: true, name: '滚木', cost: 2, damage: 110,
         towerDmgMul: 0.5, radius: 32.5, icon: '🪵', deployDelay: 0.8, cooldown: 18,
         knockback: 30, rollSpeed: 250,
         rollDistance: 560,   // 法术影响范围长度：滚动560px后消失
         logLength: 65,       // 木头本体长度（竖直方向，=影响范围宽65px）
         logWidth: 7,         // 木头本体宽度（滚动方向厚度）
-        desc: '🪵 2费法术：只能在己方半场释放（与军队相同）。一根竖直滚木（长65px厚7px）横向滚出560px，影响范围长560px×宽65px（剑仙攻击范围直径），沿途每个接触的敌人造成100伤害并平滑击退30px（位移式滑动，每个敌人仅结算一次，不影响空中单位，对主塔/堡垒伤害减半）；滚到头消失'
+        desc: '🪵 2费法术：只能在己方半场释放（与军队相同）。一根竖直滚木（长65px厚7px）横向滚出560px，影响范围长560px×宽65px（剑仙攻击范围直径），沿途每个接触的敌人造成110伤害并平滑击退30px（位移式滑动，每个敌人仅结算一次，不影响空中单位，对主塔/堡垒伤害减半）；滚到头消失'
     },
     fireball: {
         type: 'spell', name: '火球术', cost: 4, damage: 320,
@@ -737,5 +837,7 @@ const BASE_UNITS = {
     lava_pup: LAVA_PUP_TEMPLATE,
     main_tower_guard: MAIN_TOWER_GUARD_TEMPLATE,
     prince_reinforcement: PRINCE_REINFORCEMENT_TEMPLATE,
-    barrel_guard: BARREL_GUARD_TEMPLATE
+    wood_stake: WOOD_STAKE_TEMPLATE,
+    barrel_guard: BARREL_GUARD_TEMPLATE,
+    barbarian: BARBARIAN_TEMPLATE
 };
