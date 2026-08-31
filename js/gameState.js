@@ -40,6 +40,8 @@ function createGameState(gameMode) {
         projectiles: [],    // 弹道：{ x, y, tx, ty, char, size, speed, timer }
         spellEffects: [],   // 法术特效：{ x, y, char, size, timer, maxTimer }
         dmgNumbers: [],     // 伤害飘字：{ x, y, amount, color, timer, maxTimer }
+        yomiRealms: [],     // 🌑 黄泉·界域领域（固定位置，不随黄泉移动）：{ x, y, team, ownerId, timer, maxTimer, fading, fadeTimer }
+        realmCasts: [],     // 🌑 黄泉·界域施法扩散特效：{ x, y, team, ownerId, timer, maxTimer, fading, fadeTimer }
         // ---- 部署延迟队列 ----
         deploying: [],      // { cardId, team, x, y, timer, totalDelay, isPlayer }
         // ---- 闪电链特效 ----
@@ -78,6 +80,8 @@ function createGameState(gameMode) {
         thunderStrikes: [], // { x, y, radius, team, damage, towerDmgMul, targets, strikeIndex, interval, timer }
         // ---- 👑 小王子护驾：延迟1s召唤王子增援 ----
         princeGuardSpawns: [], // { ownerId, timer, x, y, dirX, dirY, team }
+        // ---- 🪵 杰西后撤：延迟0.3s部署木桩 ----
+        jessieStakeSpawns: [], // { x, y, team, timer }
         // ---- 🦇 蝙蝠法术：延迟分批召唤（释放1秒后开始，每0.2秒出2只，共6只）----
         batSpawns: [], // { x, y, radius, team, wavesLeft, perWave, interval, timer }
         // ---- 🛢️ 哥布林飞桶：木桶从主塔抛物线飞向落点（落地摔出3只哥布林）----
@@ -122,6 +126,9 @@ function getSmokePending(team, isMirror) {
 
 /** 🪞 镜像法术状态查询与冷却接口：镜像逻辑统一从这里读写，避免各处直接操作散落字段 */
 function getMirrorCopiedCard(team) {
+    // 🧭 镜像烟引下烟 pending 锁定：期间强制返回烟引（镜像卡保持「下烟」载体态），
+    //    防止此期间部署其他卡更新 lastDeployedCardId 顶掉下烟态（2026-08-29 bug 修复）
+    if (getSmokePending(team, true)) return 'smoke_guide';
     const id = team === 'player' ? game.lastDeployedCardId : game.lastDeployedCardId2;
     return id && id !== 'mirror' && CARDS[id] ? id : null;
 }
@@ -255,5 +262,6 @@ function getBattleStateSnapshot() {
         princeGuardSpawns: g.princeGuardSpawns, batSpawns: g.batSpawns,
         goblinBarrels: g.goblinBarrels, arrowRainFlights: g.arrowRainFlights,
         bombs: g.bombs, fishingLines: g.fishingLines,
+        yomiRealms: g.yomiRealms, realmCasts: g.realmCasts,
     };
 }

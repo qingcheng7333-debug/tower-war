@@ -2,14 +2,76 @@
 
 /** 创建实体（分配唯一 id，合并基础属性） */
 function createEntity(base) {
-    // 通用护盾字段兜底：任何实体创建统一带上 shield/maxShield（无盾则0），
-    // 未来带盾卡牌只需在配置里加 shield 即可自动生效
-    return { ...base, id: entityIdCounter++, shield: base.shield || 0, maxShield: base.shield || 0,
-             _chargeTimer: base._chargeTimer || 0,
-             // 渲染插值基准：上一逻辑帧位置（main.js 每帧投影绘制用，联机 Fixed Timestep 配套）
-             prevX: base.x ?? 0, prevY: base.y ?? 0 };
+    // 通用护盾字段兜底：任何实体创建统一带上 shield/maxShield（无盾则0）
+    const entity = { ...base, id: entityIdCounter++, shield: base.shield || 0, maxShield: base.shield || 0,
+                    _chargeTimer: base._chargeTimer || 0,
+                    // 渲染插值基准：上一逻辑帧位置（main.js 每帧投影绘制用，联机 Fixed Timestep 配套）
+                    prevX: base.x ?? 0, prevY: base.y ?? 0 };
+    return entity;
 }
 
+/** 可被硬控打断的状态注册表：机制只注册取消动作，控制系统不认识具体卡牌。 */
+function registerInterruptibleState(entity, cancel) {
+    if (!entity._interruptibleStates) entity._interruptibleStates = [];
+    entity._interruptibleStates.push(cancel);
+}
+
+/** 统一施加硬控：眩晕、冰冻及未来硬控都从这里进入，并统一打断已登记状态。 */
+function applyHardControl(entity, type, duration) {
+    if (!entity || entity.hp <= 0) return;
+    if (type === 'freeze') entity.freezeTimer = Math.max(entity.freezeTimer || 0, duration || 0);
+    else if (type === 'stun') entity._stunTimer = Math.max(entity._stunTimer || 0, duration || 0);
+    for (const cancel of (entity._interruptibleStates || [])) cancel(entity, type);
+}
+
+/**
+ * 注册一个冲锋机制。冲锋单位在自己的初始化代码中调用，不由控制系统按卡牌名识别。
+ * multiplier 为冲锋时总伤害倍率；onAttack/onBlocked 负责该机制自己的结束行为。
+ */
+function registerChargeMechanic(entity, config) {
+    entity._chargeMechanic = config;
+    registerInterruptibleState(entity, e => {
+        if (!e._charging) return;
+        e._charging = false;
+        e._chargeTimer = config.resetTime;
+    });
+}
+
+/** 读取冲锋后的攻击力；额外伤害由机制自己的 onAttack 处理。 */
+function getChargeAttackValue(attacker) {
+    const m = attacker._chargeMechanic;
+    return m && attacker._charging ? attacker.atk * (m.attackMultiplier || 1) : attacker.atk;
+}
+
+/** 冲锋攻击结算：执行机制回调，并统一结束冲锋/重置计时。 */
+function finishChargeAttack(attacker, target, context) {
+    const m = attacker._chargeMechanic;
+    if (!m) return;
+    const active = !!attacker._charging;
+    const extraDamage = (active || m.onAnyAttack) && m.onAttack
+        ? (m.onAttack(attacker, target, { ...(context || {}), active }) || 0) : 0;
+    if (active || m.resetOnAnyAttack) {
+        attacker._charging = false;
+        attacker._chargeTimer = m.resetTime;
+    }
+    return extraDamage;
+}
+
+/** 冲锋被格挡：执行机制回调，并统一结束冲锋/重置计时。 */
+function finishChargeBlocked(attacker, target, context) {
+    const m = attacker._chargeMechanic;
+    if (!m) return;
+    const active = !!attacker._charging;
+    const extraDamage = (active || m.onAnyBlocked) && m.onBlocked
+        ? (m.onBlocked(attacker, target, { ...(context || {}), active }) || 0) : 0;
+    if (active || m.resetOnAnyBlocked) {
+        attacker._charging = false;
+        attacker._chargeTimer = m.resetTime;
+    }
+    return extraDamage;
+}
+
+/** 其他可打断机制在自身初始化处注册，不再集中按 cardId 识别。 */
 /** 🔮 法术屏障：检查 (x,y) 是否落在【敌方】法术屏障的庇护范围内（敌方不能在该区域释放法术） */
 function isSpellBlockedByBarrier(casterTeam, x, y) {
     const enemyTeam = casterTeam === 'player' ? 'ai' : 'player';
@@ -365,6 +427,20 @@ function deploy(cardId, team, x, y) {
 
 /** 🧭 烟引：创建一条活跃引导（放烟点）。先出现部署延迟样式的计时环，结束后冒烟10秒并引导友军 */
 function startSmokeGuide(team, unitId, tx, ty) {
+    // 🧭 覆盖式下烟（2026-08-29）：同一单位已有旧引导（active 或 countdown）时，新下烟直接顶掉旧引导
+    //    —— 旧烟点消散、单位立刻转向新烟点，buff 栏只留一个 🧭（不再等旧引导超时）
+    if (unitId != null) {
+        for (let i = game.smokeGuides.length - 1; i >= 0; i--) {
+            const s = game.smokeGuides[i];
+            if (s.unitId === unitId && s.team === team) {
+                const oldUnit = game.entities.find(e => e.id === unitId);
+                if (oldUnit && !game.smokeGuides.some(o => o !== s && o.unitId === unitId && o.team === team)) {
+                    oldUnit._smokeGuide = false;   // 旧 🧭 图标清理（新引导 countdown→active 时会重新点亮）
+                }
+                game.smokeGuides.splice(i, 1);
+            }
+        }
+    }
     const countdown = CARDS.smoke_guide.deployDelay || 0.8;   // 计时特效时长（参考部署延迟，与卡牌配置一致）
     game.smokeGuides.push({
         team,
@@ -527,8 +603,8 @@ function finishDeployItem(item) {
         const unit = (card.hp ? card : ((card.spawnUnit && BASE_UNITS[card.spawnUnit]) || card));
         for (let i = 0; i < count; i++) {
             let spawnX, spawnY;
-            if (item.cardId === 'goblin_gang') {
-                // ★ 骷髅海：范围内召唤（圆形区域内随机分布，而非一字排开）
+            if (item.cardId === 'goblin_gang' || item.cardId === 'barbarian') {
+                // ★ 骷髅海 / 蛮人：范围内召唤（圆形区域内随机分布）
                 const ang = rand() * Math.PI * 2;
                 const r = Math.sqrt(rand()) * gangSpawnRadius;
                 spawnX = item.x + Math.cos(ang) * r;
@@ -539,6 +615,10 @@ function finishDeployItem(item) {
                 const r = Math.sqrt(rand()) * 50;
                 spawnX = item.x + Math.cos(ang) * r;
                 spawnY = item.y + Math.sin(ang) * r;
+            } else if (item.cardId === 'strong_barbarian') {
+                // 💪 强壮蛮人：2只竖着排（纵向一列），间距50（-25 / +25）
+                spawnX = item.x;
+                spawnY = item.y + (count > 1 ? (i - (count - 1) / 2) * 50 : 0);
             } else {
                 spawnX = item.x + (count > 1 ? (i - (count - 1) / 2) * spread : 0);
                 spawnY = item.y + (count > 1 ? (rand() - 0.5) * 28 : 0);
@@ -577,6 +657,7 @@ function finishDeployItem(item) {
                 entity._beamSwitchCooldown = 0;
                 entity._beamTimer = 0;
                 entity._beamTargetId = null;
+                registerInterruptibleState(entity, e => { e._beamTargetId = null; e._beamTimer = 0; });
             }
             // 攻城人：自爆标记
             if (item.cardId === 'siege_man') {
@@ -603,11 +684,37 @@ function finishDeployItem(item) {
             if (item.cardId === 'knight') {
                 entity._chargeTimer = 3.5;
                 entity._charging = false;
+                registerChargeMechanic(entity, {
+                    resetTime: 3.5, attackMultiplier: 1, resetOnAnyAttack: true, resetOnAnyBlocked: true,
+                    onAttack: (e, target, ctx) => {
+                        if (!ctx.active) return 0;
+                        const extra = calcActualDmg(e.atk * 3, e, target);
+                        target.hp -= extra;
+                        spawnDmgNum(target.x, target.y - 20, extra);
+                        game.spellEffects.push({ x: target.x, y: target.y, char: '✦', size: 36, color: '#ff6600', timer: 0.25, maxTimer: 0.25 });
+                        return extra;
+                    },
+                    onBlocked: (e, target, ctx) => ctx.active ? calcActualDmg(e.atk * 3, e, target) : 0
+                });
+            }
+            // 蛮人攻城槌：单个实体，4秒后冲锋
+            if (item.cardId === 'barbarian_battering_ram') {
+                entity._chargeTimer = 4.0;
+                entity._charging = false;
+                registerChargeMechanic(entity, {
+                    resetTime: 4.0, attackMultiplier: 3, resetOnAnyAttack: true, onAnyAttack: true,
+                    onAttack: e => {
+                        e.hp = 0;
+                        game.spellEffects.push({ x: e.x, y: e.y, char: '💥', size: 24, timer: 0.3, maxTimer: 0.3 });
+                        return 0;
+                    }
+                });
             }
             // 电磁炮：蓄能计时器
             if (item.cardId === 'electro_cannon') {
                 entity._chargeTimer = 0;
                 entity._chargeMax = card.chargeTime;
+                registerInterruptibleState(entity, e => { e._chargeTimer = 0; });
             }
             // 浪人：反弹就绪计时器（0=就绪可格挡反弹）
             if (item.cardId === 'ronin') {
@@ -627,7 +734,7 @@ function finishDeployItem(item) {
                             e.hp -= calcActualDmg(damage, null, e); // 部署法术无攻击者狂暴，目标减伤统一收口（框架第13条）
                             // 眩晕效果：范围内敌方单位被眩晕1秒
                             if (spell.stunDuration > 0) {
-                                e._stunTimer = spell.stunDuration;
+                                applyHardControl(e, 'stun', spell.stunDuration);
                             }
                         }
                     }
@@ -647,12 +754,14 @@ function finishDeployItem(item) {
                 entity._leapCharging = false;
                 entity._leapTimer = 0;
                 entity._leapTargetId = null;
+                registerInterruptibleState(entity, e => { e._leapCharging = false; e._leapTimer = 0; e._leapTargetId = null; });
             }
             // 暗影刺客：突袭状态（参考超骑跃击——距离85~105px触发，短暂隐身+蓄力1秒冲刺双倍伤害）
             if (item.cardId === 'shadow_assassin') {
                 entity._assaultCharging = false;
                 entity._assaultTimer = 0;
                 entity._assaultTargetId = null;
+                registerInterruptibleState(entity, e => { e._assaultCharging = false; e._assaultTimer = 0; e._assaultTargetId = null; });
             }
             // 超级骑士：部署时范围伤害 + 击退 + 从天而降虚影
             if (item.cardId === 'super_knight') {
@@ -705,6 +814,32 @@ function finishDeployItem(item) {
                     game.deployEffects.push({ x: item.x, y: item.y, radius: radius, timer: 0.4, maxTimer: 0.4, color: AOE_RING_COLOR, static: true });
                 }
             }
+            // ❄️ 寒冰法师：部署落地范围伤害 + 冰雪冲击特效（范围预览由 deploySpell.radius 自动显示）
+            if (item.cardId === 'ice_mage') {
+                const spell = card.deploySpell;
+                if (spell) {
+                    const radius = spell.radius || 40;
+                    const damage = spell.damage || 20;
+                    for (const enemy of game.entities) {
+                        if (enemy.team === item.team || enemy.hp <= 0 || enemy._headHidden) continue;
+                        if (dist(enemy, { x: item.x, y: item.y }) <= radius) {
+                            const dmgI = calcActualDmg(damage, null, enemy);
+                            enemy.hp -= dmgI;
+                            spawnDmgNum(enemy.x, enemy.y - 20, dmgI);
+                        }
+                    }
+                    // 自定义几何冰晶爆裂（不依赖emoji字体）：冰蓝扩散光环 + 旋转六臂雪花 + 冰晶碎片飞散
+                    game.spellEffects.push({
+                        type: 'iceImpact',
+                        x: item.x, y: item.y,
+                        radius: radius,
+                        seed: rand(),
+                        timer: 0.7, maxTimer: 0.7,
+                    });
+                    // 范围提示圈：颜色必须用 R,G,B 三元组（渲染层拼 rgba()），冰蓝色 158,223,255
+                    game.deployEffects.push({ x: item.x, y: item.y, radius: radius, timer: 0.45, maxTimer: 0.45, color: '158, 223, 255', static: true });
+                }
+            }
             // 巨龙蛋：初始1/4血量 + 蛋标记
             if (item.cardId === 'dragon_egg') {
                 entity.hp = entity.maxHp / 4;  // 出场1/4血量
@@ -755,6 +890,7 @@ function finishDeployItem(item) {
             entity._beamSwitchCooldown = 0;
             entity._beamTimer = 0;
             entity._beamTargetId = null;
+            registerInterruptibleState(entity, e => { e._beamTargetId = null; e._beamTimer = 0; });
         }
         // 盔甲铺：蓄力字段初始化（_chargeMax 必须取自 config.chargeMax，
         // 否则 update.js 中 _chargeTimer >= _chargeMax 永远为 false，蓄满后无法加盾）
@@ -762,6 +898,7 @@ function finishDeployItem(item) {
             entity._chargeTimer = 0;
             entity._chargeMax = card.chargeMax;
             entity.shieldAmount = card.shieldAmount; // 护盾量随 config 同步，改数值无需再动代码
+            registerInterruptibleState(entity, e => { e._chargeTimer = 0; });
         }
         if (item.isMirrored) entity.isMirrored = true; // 🪞 镜像法术产物标记（镜像神庙死亡后正确恢复镜像卡）
         game.entities.push(entity);
@@ -771,6 +908,8 @@ function finishDeployItem(item) {
             x: item.x, y: item.y, hp: card.hp, maxHp: card.hp,
             spawnTimer: 0, spawnInterval: card.spawnInterval,
             spawnCount: card.spawnCount, spawnUnit: card.spawnUnit,
+            // 蛮人屋：15秒周期内再按0.3秒间隔逐只出兵
+            _spawnQueue: 0, _spawnQueueTimer: 0,
             hitRadius: 15,  // 受击半径（匹配30×30视觉半宽，贴边即可攻击）
         });
         if (item.isMirrored) entity.isMirrored = true; // 🪞 镜像法术产物标记
@@ -904,7 +1043,12 @@ function createSkeleton(x, y, team) {
     return createSummon(GOBLIN_TEMPLATE, 'goblin', x, y, team, { spread: 'circle', radius: 50 });
 }
 
-/** 创建哥布林投矛手（召唤物模板：远程直线投矛弹道，可对空；召唤途径待定） */
+/** 创建一只蛮人（召唤物：强壮蛮人缩小版） */
+function createBarbarian(x, y, team) {
+    return createSummon(BARBARIAN_TEMPLATE, 'barbarian', x, y, team, { jitterX: 20, jitterY: 15 });
+}
+
+/** 创建一只哥布林投矛手（召唤物模板：远程直线投矛弹道，可对空；召唤途径待定） */
 function createGoblinThrower(x, y, team) {
     return createSummon(GOBLIN_THROWER_TEMPLATE, 'goblin_thrower', x, y, team, { jitterX: 20, jitterY: 15 });
 }
@@ -917,6 +1061,54 @@ function createGoblinMelee(x, y, team) {
 /** 创建王子增援（召唤物模板：剑士建模+盔甲纹路，近战；护驾技能召唤，可精确指定位置） */
 function createPrinceReinforcement(x, y, team, opts) {
     return createSummon(PRINCE_REINFORCEMENT_TEMPLATE, 'prince_reinforcement', x, y, team, Object.assign({ jitterX: 20, jitterY: 15 }, opts || {}));
+}
+
+/** 创建一根木桩（杰西后撤延迟0.3s后部署，建筑型纯阻挡物：140血，不攻击不移动） */
+function createWoodStake(x, y, team) {
+    const card = WOOD_STAKE_TEMPLATE;
+    return createEntity({
+        type: 'tower', team: team, cardId: 'wood_stake',
+        x: x, y: y, hp: card.hp, maxHp: card.hp,
+        atk: 0, atkSpeed: 0, atkCooldown: 0,
+        range: 0, splash: 0, minRange: 0,
+        onlyGround: false, flying: false,
+        hitRadius: 15,       // 建筑受击半径（与临时营地同款）
+        targetId: null,
+        _isSpawned: true,    // 召唤物标记（非卡牌部署）
+    });
+}
+
+/** 创建凤凰（凤凰蛋孵化产物：默认攻击/生命为原80%，其余属性同原凤凰；支持传入衰减后的 maxHp/atk 实现连续衰减） */
+function createPhoenix(x, y, team, opts) {
+    opts = opts || {};
+    const c = CARDS.phoenix;
+    const maxHp = (opts.maxHp !== undefined) ? opts.maxHp : Math.round(c.hp * 0.8);
+    const atk = (opts.atk !== undefined) ? opts.atk : Math.round(c.atk * 0.8);
+    return createEntity({
+        type: 'troop', team: team, cardId: 'phoenix',
+        x: x, y: y,
+        hp: maxHp, maxHp: maxHp,
+        atk: atk, atkSpeed: c.atkSpeed, atkCooldown: 0,
+        moveSpeed: c.moveSpeed, range: c.range,
+        targetMode: c.targetMode, targetId: null,
+        flying: true, canHitAir: true,
+    });
+}
+
+/** 创建凤凰蛋（凤凰死亡时原地留下：3.8s 后孵化出 80% 凤凰；蛋生命固定 160，可被打碎阻止孵化） */
+function createPhoenixEgg(x, y, team) {
+    return createEntity({
+        type: 'troop', team: team, cardId: 'phoenix_egg',
+        x: x, y: y,
+        hp: 160, maxHp: 160,
+        atk: 0, atkSpeed: 0, atkCooldown: 0,
+        moveSpeed: 0, range: 0, splash: 0,
+        targetMode: 'none', targetId: null,
+        flying: false, canHitAir: false,
+        _isPhoenixEgg: true,
+        _hatchTimer: 3.8,
+        _eggPulseTimer: 0,
+    });
 }
 
 /** 创建一只小虫（由巫师🐛标记死亡后召唤） */
@@ -1092,6 +1284,7 @@ function applySpellDamage(cardId, casterTeam, x, y) {
             copy.slowFactor = 1.0;
             copy._speedBoosted = false;
             copy._stunTimer = 0;
+            copy._goldBallTimer = 0; // ✨ 杰西金色电磁弹buff：复制体刚部署不继承
             copy._recoilTimer = 0;
             copy._stealthed = false;
             copy._charging = false;      copy._chargeTimer = 0;
@@ -1124,13 +1317,7 @@ function applySpellDamage(cardId, casterTeam, x, y) {
                 e.hp -= dmg;
                 spawnDmgNum(e.x, e.y - 20, dmg);
                 // ❄️ 冻结：暂停一切行动（移动/攻击/蓄力/召唤/生产），解冻后恢复
-                e.freezeTimer = Math.max(e.freezeTimer || 0, freezeDuration);
-                // 冻结瞬间打断进行中的蓄力/跳跃/冲锋蓄能
-                e._leapCharging = false;
-                e._leapTimer = 0;
-                e._leapTargetId = null;
-                e._chargeTimer = 0;
-                e._charging = false;
+                applyHardControl(e, 'freeze', freezeDuration);
             }
         }
         // 特效：静态冰蓝色区域（持续与冻结时间一致，4秒）
@@ -1408,7 +1595,7 @@ function applySpellDamage(cardId, casterTeam, x, y) {
                 e.hp -= dmg2;
                 spawnDmgNum(e.x, e.y - 20, dmg2);
                 // 💫 眩晕0.5秒（同大雷电/电磁塔，塔类眩晕同样暂停攻击）
-                e._stunTimer = Math.max(e._stunTimer || 0, card.stunDuration || 0.5);
+                applyHardControl(e, 'stun', card.stunDuration || 0.5);
             }
         }
         // 雷电落地特效（同大雷电落雷特效）：落雷 + ⚡ + 冲击圈
@@ -1615,6 +1802,37 @@ function applyActiveSkill(unit, skill) {
             char: '隐身！', size: 13, color: '#a29bfe',
             timer: 0.8, maxTimer: 0.8,
         });
+    } else if (skill.id === 'jessie_retreat') {
+        // ↩️ 后撤：杰西立即向后方冲刺105px（移速×8，同护驾冲锋速度），并在原地留下一根木桩阻挡敌人
+        //    后撤方向 = 前进方向的反方向：优先取当前攻击目标的反方向，否则默认朝己方主塔
+        let dirX = 0, dirY = 0;
+        if (unit.targetId) {
+            const t = game.entities.find(en => en.id === unit.targetId && en.hp > 0);
+            if (t) {
+                const dd = Math.hypot(t.x - unit.x, t.y - unit.y) || 1;
+                dirX = (t.x - unit.x) / dd;
+                dirY = (t.y - unit.y) / dd;
+            }
+        }
+        if (!dirX && !dirY) dirX = unit.team === 'player' ? 1 : -1; // 无目标时默认：玩家向右、AI向左为前进方向
+        // ⏳ 延迟0.3s部署木桩：先记录后撤前位置入队（update.js 每帧结算），
+        //    后撤冲刺与木桩部署互不影响（木桩0.3s后出现在原地）
+        game.jessieStakeSpawns.push({ x: unit.x, y: unit.y, team: unit.team, timer: 0.3, maxTimer: 0.3 });
+        // 落点预兆特效（半透明虚影，0.3s后正式生成时再出🪵实体特效）
+        game.spellEffects.push({ x: unit.x, y: unit.y, char: '🪵', size: 26, timer: 0.3, maxTimer: 0.3, alpha: 0.35 });
+        // 💨 杰西后撤冲刺（无伤害，不参与索敌/攻击/移动，参考护驾冲锋帧驱动）
+        unit._retreatCharging = true;
+        unit._retreatRemain = 105;
+        unit._retreatDirX = -dirX;   // 与前进方向相反
+        unit._retreatDirY = -dirY;
+        // ✨ 金色电磁弹buff：后撤后4秒内，电磁弹变亮金色、飞行距离500、命中眩晕1s（update.js 帧循环衰减）
+        unit._goldBallTimer = 4;
+        // 释放特效：蓝色文字「后撤！」（0.8s淡出）
+        game.spellEffects.push({
+            type: 'jessieRetreat', x: unit.x, y: unit.y, team: unit.team,
+            char: '后撤！', size: 13, color: '#7ecbff',
+            timer: 0.8, maxTimer: 0.8,
+        });
     } else if (skill.id === 'goblin_bless') {
         // 🛕 神赐：费用已按减费动态计算（castActiveSkill 按 blessCost 扣费并重置11），
         //    释放金色祈祷文「Maglubiyet grash!」+ 神庙上方一缕金光向下照亮（0.8s）
@@ -1632,5 +1850,21 @@ function applyActiveSkill(unit, skill) {
                 game.entities.push(createSummon(bs.tpl, bs.cardId, unit.x, unit.y, unit.team, { spread: 'circle', radius: 40 }));
             }
         }
+    } else if (skill.id === 'yomi_realm') {
+        // 🌑 界域：施法0.6s（原地站桩：0~0.2s前摇，0.2~0.6s扩散圈0→105黑白化，纯特效）；
+        //    完成后在黄泉脚下展开固定领域（位置锁定不随黄泉移动）105范围、持续7s；
+        //    领域内除黄泉外所有单位（敌我皆算，后来进入的同样）持续冰冻；黄泉阵亡→领域渐消失
+        unit._holdMove = 0.6;   // 复用护驾暂停移动机制：施法期间站桩（moveToward 统一拦截）
+        unit._realmTimer = 0.6; // 施法计时（update.js 递减，归零展开领域）
+        unit._stealthed = true; // 🌫️ 技能期间黄泉隐身：敌方索敌/锁定全部无效，防止圈外单位捣乱（不变透明，只加状态）
+        game.realmCasts.push({
+            x: unit.x, y: unit.y, team: unit.team, ownerId: unit.id,
+            timer: 0.6, maxTimer: 0.6,
+        });
+        game.spellEffects.push({
+            type: 'yomiRealm', x: unit.x, y: unit.y, team: unit.team,
+            char: '界域', size: 15, color: '#b388ff',
+            timer: 0.8, maxTimer: 0.8,
+        });
     }
 }

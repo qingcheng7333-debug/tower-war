@@ -31,9 +31,21 @@ let NET_CB_ON_GAME_START = null;
 let NET_CB_ON_DISCONNECT = null;
 
 // ---- Lockstep 指令队列 ----
-const NET_SYNC_DELAY_TICKS = 10;   // ≈333ms 延迟缓冲
+const NET_SYNC_DELAY_TICKS = 18;   // ≈600ms 延迟缓冲（联机两端一致性的核心：给对手指令留足到达时间）
 let NET_CMD_SEQ = 0;
 let NET_PENDING_EXEC = [];
+
+// ---- Lockstep 等待/校验（防画面分叉）----
+let NET_REMOTE_TICK = -1;          // 对手最新已确认逻辑帧（SYNC 心跳携带；-1 = 尚未收到）
+let NET_LAST_CMD_TICK = -1;        // 对手最新已下达指令的 genTick（远端无指令时判断「对手已确认到此帧」的依据）
+const NET_FREEZE_TIMEOUT_MS = 3000; // 连续冻结超 3 秒（真实时间）无对手进展 → 判定失联（冻结期逻辑帧不推进，不能用帧计数计时）
+const NET_SYNC_MS = 900;           // 每 900ms 真实时间互发一次 SYNC 心跳（与逻辑帧解耦：冻结期也能发）
+const NET_HASH_TICKS = 120;        // 每 120 逻辑帧（4s）记录一次状态哈希，用于分叉检测
+let NET_FREEZE_SINCE_MS = 0;       // 本轮连续冻结起始时刻（0=未冻结）；对手 SYNC 有进展即归零
+let NET_LAST_SYNC_MS = 0;          // 上次发送 SYNC 心跳的真实时间
+let NET_HASH_LOG = new Map();      // 本端哈希日志 tick → hash（收到对手哈希时比对）
+let NET_OPP_HASH = new Map();      // 对手最近哈希缓存 tick → hash（本端滞后时，等本端记到同 tick 再比对）
+let NET_DESYNC_WARNED = false;     // 分叉告警只提示一次，避免刷屏
 let NET_REMOTE_SEQ = new Set();
 
 // ==================================================================
@@ -96,6 +108,13 @@ function resetSessionState() {
     NET_OPP_DECK = [];
     NET_PENDING_EXEC = [];
     NET_REMOTE_SEQ = new Set();
+    NET_REMOTE_TICK = -1;
+    NET_LAST_CMD_TICK = -1;
+    NET_FREEZE_SINCE_MS = 0;
+    NET_LAST_SYNC_MS = 0;
+    NET_HASH_LOG = new Map();
+    NET_OPP_HASH = new Map();
+    NET_DESYNC_WARNED = false;
     stopHelloRetry();
 }
 
@@ -226,6 +245,7 @@ function onNetMessage(data, fromPeerId) {
         case 'LOBBY_READY': onNetLobbyReady(data); break;
         case 'GAME_START':  onNetGameStart(data); break;
         case 'CMD':         onRemoteCommand(data); break;
+        case 'SYNC':        onNetSync(data); break;
         case 'LEAVE':       onNetPeerLost('对方已离开房间'); break;
         default: break;
     }
@@ -338,6 +358,13 @@ function beginOnlineBattle(msg, isHost) {
     NET_CMD_SEQ = 0;
     NET_PENDING_EXEC = [];
     NET_REMOTE_SEQ = new Set();
+    NET_REMOTE_TICK = -1;
+    NET_LAST_CMD_TICK = -1;
+    NET_FREEZE_SINCE_MS = 0;
+    NET_LAST_SYNC_MS = 0;
+    NET_HASH_LOG = new Map();
+    NET_OPP_HASH = new Map();
+    NET_DESYNC_WARNED = false;
     if (NET_CB_ON_GAME_START) {
         NET_CB_ON_GAME_START(NET_SEED, [...NET_MY_DECK], [...NET_OPP_DECK], NET_MY_NAME, NET_OPP_NAME, NET_MODE);
     }
@@ -387,6 +414,7 @@ function onRemoteCommand(data) {
     const genTick = Number.isInteger(data.genTick) ? data.genTick : -1;
     if (genTick < 0 || genTick > game.tick + 600) return;
     NET_REMOTE_SEQ.add(seq);
+    if (genTick > NET_LAST_CMD_TICK) NET_LAST_CMD_TICK = genTick;
     scheduleNetExec(data.cmd, genTick + NET_SYNC_DELAY_TICKS, seq, team);
 }
 
@@ -434,7 +462,134 @@ function executeNetCmd(cmd) {
 
 function setNetworkEnabled(v) { NET_ENABLED = !!v; }
 function isOnlineMode() { return NET_ENABLED && game.gameMode === 'online'; }
-function canAdvanceTick() { return true; }
+
+/* ================================================================
+ * 🔒 Lockstep 门控：canAdvanceTick()
+ * 本帧是否允许推进逻辑（main.js 主循环每 tick 调用一次）。
+ * 原理：只要「本端 tick 还没超过对手已确认的进展帧」，就安全。
+ *   - 有远端指令排程时：需 tick < 队列中最早 execTick（该指令前的帧不受它影响）；
+ *   - 无远端指令时：需 tick <= NET_REMOTE_TICK + 缓冲（心跳确认对手已推进到此）。
+ * 若对手断线/卡死 3 秒无任何进展 → 放弃等待，按断线处理。
+ * 单机模式恒 true。
+ * ================================================================ */
+function canAdvanceTick() {
+    if (!isOnlineMode()) return true;
+    // 开局前 10 帧不设卡（等待双方 resetGame 完成与首轮 SYNC 交换）
+    if (game.tick < 10) return true;
+
+    // 1) 队列中有「对手阵营」的指令到期未执行 → 冻结等待（本地指令本地立即执行，无需等待）
+    //    若对手消息迟迟不到（卡死/掉线），累计冻结 3 秒 → 断线处理
+    const firstRemote = NET_PENDING_EXEC.find(e => e.team === oppOnlineTeam());
+    if (firstRemote && game.tick >= firstRemote.execTick) {
+        if (NET_FREEZE_SINCE_MS === 0) NET_FREEZE_SINCE_MS = Date.now();
+        else if (Date.now() - NET_FREEZE_SINCE_MS >= NET_FREEZE_TIMEOUT_MS) {
+            NET_FREEZE_SINCE_MS = 0;
+            const cb = NET_CB_ON_DISCONNECT;
+            cleanupNetSession(false);
+            if (cb) cb('等待对手超时，连接已断开');
+        }
+        return false;
+    }
+
+    // 2) 无对手指令排程：看对手心跳确认的进展
+    //    对手已推进到 NET_REMOTE_TICK，再给 NET_SYNC_DELAY_TICKS 缓冲帧
+    const remoteLimit = NET_REMOTE_TICK + NET_SYNC_DELAY_TICKS;
+    if (game.tick <= remoteLimit) return true;
+
+    // 3) 超出对手确认进展+缓冲：冻结等待心跳。累计 3 秒无进展 → 断线处理
+    if (NET_FREEZE_SINCE_MS === 0) NET_FREEZE_SINCE_MS = Date.now();
+    else if (Date.now() - NET_FREEZE_SINCE_MS >= NET_FREEZE_TIMEOUT_MS) {
+        NET_FREEZE_SINCE_MS = 0;
+        const cb = NET_CB_ON_DISCONNECT;
+        cleanupNetSession(false);
+        if (cb) cb('等待对手超时，连接已断开');
+    }
+    return false;
+}
+
+/** 主循环每帧调用（rAF 驱动，与逻辑帧解耦）：每 900ms 真实时间互发 SYNC 心跳 + 最近哈希 */
+function onLogicTick() {
+    if (!isOnlineMode()) return;
+    // 1) 哈希日志：每 NET_HASH_TICKS 帧记录一份（冻结期 tick 不变不会重复记录）
+    if (game.tick > 0 && game.tick % NET_HASH_TICKS === 0 && !NET_HASH_LOG.has(game.tick)) {
+        NET_HASH_LOG.set(game.tick, computeStateHash());
+        // 反向比对：对手心跳先到（本端滞后）时，此刻补上延迟的比对
+        const oppHash = NET_OPP_HASH.get(game.tick);
+        if (oppHash !== undefined && oppHash !== NET_HASH_LOG.get(game.tick) && !NET_DESYNC_WARNED) {
+            NET_DESYNC_WARNED = true;
+            console.warn('[NET] 状态哈希分叉 @tick', game.tick, '我方', NET_HASH_LOG.get(game.tick), '对方', oppHash);
+            showGameTip('⚠️ 检测到两端画面不一致，建议双方刷新后重开一局');
+        }
+        // 日志只留最近 8 条，防内存增长
+        if (NET_HASH_LOG.size > 8) {
+            const oldest = NET_HASH_LOG.keys().next().value;
+            NET_HASH_LOG.delete(oldest);
+        }
+    }
+    // 2) 心跳：真实时间驱动（冻结等待期也能发出，避免双方互相冻死）
+    const now = Date.now();
+    if (now - NET_LAST_SYNC_MS < NET_SYNC_MS) return;
+    NET_LAST_SYNC_MS = now;
+    const msg = { type: 'SYNC', tick: game.tick, lastCmdTick: NET_LAST_CMD_TICK };
+    // 附带最近 2 份哈希（[tick,hash] 数组）：覆盖两端推进速度差一档（落后一方）的情况
+    if (NET_HASH_LOG.size > 0) {
+        msg.hashes = [...NET_HASH_LOG.entries()].slice(-2);
+    }
+    sendNet(msg);
+}
+
+/** 对手 SYNC 心跳/哈希到达 */
+function onNetSync(data) {
+    if (!isOnlineMode() || !Number.isInteger(data.tick)) return;
+    // 哈希校验：对手 hashes=[[tick,hash],...] 与本端日志同 tick 比对；本端滞后的先缓存，等本端记到同 tick 再反向比对
+    if (Array.isArray(data.hashes) && !NET_DESYNC_WARNED) {
+        for (const [hTick, hVal] of data.hashes) {
+            if (!Number.isInteger(hTick) || !Number.isInteger(hVal)) continue;
+            NET_OPP_HASH.set(hTick, hVal);
+            if (NET_OPP_HASH.size > 8) {
+                const oldestOpp = NET_OPP_HASH.keys().next().value;
+                NET_OPP_HASH.delete(oldestOpp);
+            }
+            const myHash = NET_HASH_LOG.get(hTick);
+            if (myHash !== undefined && myHash !== hVal) {
+                NET_DESYNC_WARNED = true;
+                console.warn('[NET] 状态哈希分叉 @tick', hTick, '我方', myHash, '对方', hVal);
+                showGameTip('⚠️ 检测到两端画面不一致，建议双方刷新后重开一局');
+                break;
+            }
+        }
+    }
+    if (data.tick > NET_REMOTE_TICK) {
+        NET_REMOTE_TICK = data.tick;
+        NET_FREEZE_SINCE_MS = 0;
+    }
+    if (Number.isInteger(data.lastCmdTick) && data.lastCmdTick > NET_LAST_CMD_TICK) {
+        NET_LAST_CMD_TICK = data.lastCmdTick;
+    }
+}
+
+/** 状态哈希：遍历实体/弹道/掉落物，轻量折叠成 32 位整数（联机分叉检测用） */
+function computeStateHash() {
+    let h = 2166136261 >>> 0;
+    const mix = (n) => {
+        h = (Math.imul(h, 16777619) ^ (n | 0)) >>> 0;
+    };
+    mix(game.tick);
+    mix(Math.round(game.elixir.player * 10));
+    mix(Math.round(game.elixir.ai * 10));
+    if (Array.isArray(game.entities)) {
+        for (const e of game.entities) {
+            mix(e.id); mix(e.hp); mix(Math.round(e.x)); mix(Math.round(e.y));
+        }
+    }
+    if (Array.isArray(game.projectiles)) {
+        for (const pr of game.projectiles) {
+            mix(pr.x !== undefined ? Math.round(pr.x * 10) : 0);
+            mix(pr.y !== undefined ? Math.round(pr.y * 10) : 0);
+        }
+    }
+    return h >>> 0;
+}
 
 /** 🔗 当前玩家的阵营：Host=蓝方(player)，Client=红方(ai)；未联机时返回 null */
 function myOnlineTeam() {

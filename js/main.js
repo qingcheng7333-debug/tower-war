@@ -930,16 +930,23 @@ function gameLoop(ts) {
         tickAccumulator += Math.min(0.1, (ts - lastTimestamp) / 1000);
         lastTimestamp = ts;
 
-        // 逻辑帧推进：固定步长 FIXED_DELTA；联机同步由延迟缓冲保证（指令按 execTick 对齐，canAdvanceTick 恒 true，见 network.js）
+        // 逻辑帧推进：固定步长 FIXED_DELTA；联机同步由延迟缓冲保证（指令按 execTick 对齐，canAdvanceTick 见 network.js）
         // +1e-9 容差：消除浮点累积到 1/30 边界时偶尔卡一帧的抖动（Fixed Timestep 经典问题）
         let steps = 0;
+        let froze = false;
         while (tickAccumulator + 1e-9 >= FIXED_DELTA && steps < MAX_STEPS_PER_FRAME) {
-            if (!canAdvanceTick()) break;   // 恒 true（联机延迟缓冲方案，见 network.js）
+            if (!canAdvanceTick()) {
+                froze = true;
+                // 🔗 Lockstep 冻结等待对手：丢弃累计时间，防止解冻后多步追帧造成错位/顿挫
+                tickAccumulator = 0;
+                break;
+            }
             update(FIXED_DELTA);            // ⭐ 恒定步长，不再传变长 delta
             tickAccumulator -= FIXED_DELTA;
             steps++;
         }
         if (steps >= MAX_STEPS_PER_FRAME) tickAccumulator = 0; // 防螺旋死亡（卡顿后不追帧）
+        if (steps > 0 || froze) onLogicTick();  // 🔗 本逻辑帧推进后（或冻结期间）由 network.js 决定是否发 SYNC 心跳/哈希
 
         // 渲染插值：alpha ∈ [0,1)，距上一逻辑帧的进度（render.js draw 内做坐标投影）
         draw(Math.min(1, tickAccumulator / FIXED_DELTA));  // draw() 内部末尾已自动调用 drawHoverUI()
