@@ -56,6 +56,17 @@ body {
 }
 .menu-title-gap { margin-top: 26px; }
 
+/* ---- 主页：「更多后续（测试）」子菜单（按钮展开/收起，子项占位 disabled）---- */
+.menu-sublist {
+    display: flex; flex-direction: column; align-items: center; gap: 10px;
+}
+.menu-btn-sub {
+    width: 190px; padding: 10px 0; font-size: 15px; letter-spacing: 1px;
+    background: #252538; box-shadow: 0 4px 0 #0f0f1a;
+}
+.menu-btn-sub:hover { background: #33334e; }
+.menu-btn-sub:active { box-shadow: 0 2px 0 #0f0f1a; }
+
 /* ---- 弹窗通用 ---- */
 .modal-overlay {
     position: fixed; top:0; left:0; width:100%; height:100%;

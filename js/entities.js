@@ -10,6 +10,50 @@ function createEntity(base) {
     return entity;
 }
 
+/** 汉拔尼吞噬快照：吞入后不再保留被吞单位实体，只保存可用于独立重建的单位数据。 */
+function cloneHannibalValue(value) {
+    if (value instanceof Set) return new Set(value);
+    if (Array.isArray(value)) return value.map(cloneHannibalValue);
+    if (value && typeof value === 'object') {
+        const out = {};
+        for (const [k, v] of Object.entries(value)) out[k] = cloneHannibalValue(v);
+        return out;
+    }
+    return value;
+}
+
+function createHannibalSnapshot(unit) {
+    const snapshot = cloneHannibalValue(unit);
+    delete snapshot.id;
+    delete snapshot.prevX;
+    delete snapshot.prevY;
+    snapshot._swallowedSnapshot = null;
+    snapshot._gulping = false;
+    snapshot._gulpTargetId = null;
+    snapshot._gulpLineId = null;
+    return snapshot;
+}
+
+/** 从快照创建全新实体；释放出的单位与原单位/其他汉拔尼快照没有对象引用关系。 */
+function createEntityFromHannibalSnapshot(snapshot, x, y) {
+    if (!snapshot) return null;
+    const base = cloneHannibalValue(snapshot);
+    delete base.id;
+    base.x = Math.min(W - 30, Math.max(30, x));
+    base.y = Math.min(H - 30, Math.max(30, y));
+    base.prevX = base.x;
+    base.prevY = base.y;
+    base.targetId = null;
+    base._swallowedSnapshot = null;
+    base._gulping = false;
+    base._gulpTargetId = null;
+    base._gulpLineId = null;
+    base._digesting = false;
+    base._digestTimer = 0;
+    base.atkCooldown = 0;
+    return createEntity(base);
+}
+
 /** 可被硬控打断的状态注册表：机制只注册取消动作，控制系统不认识具体卡牌。 */
 function registerInterruptibleState(entity, cancel) {
     if (!entity._interruptibleStates) entity._interruptibleStates = [];
@@ -177,7 +221,9 @@ function deploy(cardId, team, x, y) {
             }
         }
         // 检查部署位置（使用原始卡牌的规则）
-        if (!canDeployHere(lastId, team, x, y, game.entities, game.bastionsLost.ai, game.bastionsLost.player)) {
+        if (!canDeployHere(lastId, team, x, y, game.entities, game.bastionsLost.ai, game.bastionsLost.player,
+            game.shrink220 ? MODE_TEST_RIVER_LEFT : RIVER_LEFT, game.shrink220 ? MODE_TEST_RIVER_RIGHT : RIVER_RIGHT,
+            game.shrink220 ? MODE_TEST_AI_BASTION_TOP.x : AI_BASTION_TOP.x)) { // 🧪测试双人：河道减半+整图缩窄（shrink220 地图类 gate；模板1 标准图走标准值）
             game.uiState.deployFailReason = 'position';
             return false;
         }
@@ -364,7 +410,9 @@ function deploy(cardId, team, x, y) {
         }
     }
 
-    if (!canDeployHere(cardId, team, x, y, game.entities, game.bastionsLost.ai, game.bastionsLost.player)) {
+    if (!canDeployHere(cardId, team, x, y, game.entities, game.bastionsLost.ai, game.bastionsLost.player,
+        game.shrink220 ? MODE_TEST_RIVER_LEFT : RIVER_LEFT, game.shrink220 ? MODE_TEST_RIVER_RIGHT : RIVER_RIGHT,
+        game.shrink220 ? MODE_TEST_AI_BASTION_TOP.x : AI_BASTION_TOP.x)) { // 🧪测试双人：河道减半+整图缩窄（shrink220 地图类 gate；模板1 标准图走标准值）
         game.uiState.deployFailReason = 'position';
         return false;
     }
@@ -847,6 +895,18 @@ function finishDeployItem(item) {
                 entity._eggPulseTimer = 0;
                 entity._hasRegen = true;  // ❤️‍🩹 常驻自回buff
             }
+            // 🦄 独角兽：出场半血沉睡（满血苏醒，参考巨龙蛋机制）+ ❤️‍🩹沉睡期自回 + ⚡蓄力冲刺状态
+            if (item.cardId === 'unicorn') {
+                entity.hp = entity.maxHp / 2;   // 出场半血
+                entity._isSleeping = true;      // 沉睡：不移动不攻击（update.js 帧驱动满血苏醒）
+                entity._hasRegen = true;        // ❤️‍🩹 自回buff（healRate:20，仅沉睡期；满血苏醒时由 update.js 移除）
+                entity._uniCharging = false; entity._uniTimer = 0;              // ⚡ 蓄力状态
+                entity._uniDashing = false; entity._uniRemain = 0; entity._uniDirX = 0; entity._uniDirY = 0; entity._uniHit = null; // 💥 冲刺状态
+                registerInterruptibleState(entity, en => {  // 眩晕/冰冻打断蓄力与冲刺（参考超骑）
+                    en._uniCharging = false; en._uniTimer = 0;
+                    en._uniDashing = false; en._uniRemain = 0; en._uniHit = null;
+                });
+            }
             // 战斗天使：登场时触发持续1.2秒治疗（每0.3秒一次共4次，每次20；绿色光环仅治疗期间显示）
             if (item.cardId === 'battle_angel') {
                 entity._healActive = card.healDuration || 1.2;    // 治疗光环持续窗口
@@ -1095,12 +1155,14 @@ function createPhoenix(x, y, team, opts) {
     });
 }
 
-/** 创建凤凰蛋（凤凰死亡时原地留下：3.8s 后孵化出 80% 凤凰；蛋生命固定 160，可被打碎阻止孵化） */
-function createPhoenixEgg(x, y, team) {
+/** 创建凤凰蛋（凤凰死亡时原地留下：3.8s 后孵化出 80% 凤凰；蛋基础生命 CARDS.phoenix.eggHp=160，支持传入衰减后的 maxHp 实现连续衰减，可被打碎阻止孵化） */
+function createPhoenixEgg(x, y, team, opts) {
+    opts = opts || {};
+    const eggMaxHp = (opts.maxHp !== undefined) ? opts.maxHp : CARDS.phoenix.eggHp;
     return createEntity({
         type: 'troop', team: team, cardId: 'phoenix_egg',
         x: x, y: y,
-        hp: 160, maxHp: 160,
+        hp: eggMaxHp, maxHp: eggMaxHp,
         atk: 0, atkSpeed: 0, atkCooldown: 0,
         moveSpeed: 0, range: 0, splash: 0,
         targetMode: 'none', targetId: null,
@@ -1253,6 +1315,8 @@ function applySpellDamage(cardId, casterTeam, x, y) {
         for (const e of targets) {
             // 浅拷贝本体全部属性（攻击/移速/射程/技能等特性完全一致），再重置战斗状态为"刚部署"
             const copy = { ...e };
+            // 汉拔尼的消化快照必须深复制：本体与复制体各自持有独立的被吞单位数据。
+            if (e._swallowedSnapshot) copy._swallowedSnapshot = cloneHannibalValue(e._swallowedSnapshot);
             copy.id = entityIdCounter++;
             copy.hp = 1;
             copy.maxHp = 1;
@@ -1298,6 +1362,8 @@ function applySpellDamage(cardId, casterTeam, x, y) {
             if (copy.cardId === 'ghost') { copy._stealthed = true; copy._stealthTimer = 0; }
             // 矿工复制体：直接破土现身（潜伏期无实体可复制，且前面已重置 _stealthed=false）
             if (copy.cardId === 'dragon_egg') copy._isEgg = true;
+            // 🦄 独角兽复制体：1血=满血（等同已苏醒），不继承沉睡/自回，也不继承蓄力冲刺状态
+            if (copy.cardId === 'unicorn') { copy._isSleeping = false; copy._hasRegen = false; copy._uniCharging = false; copy._uniDashing = false; copy._uniHit = null; }
             if (copy.cardId === 'electro_cannon') { copy._chargeTimer = 0; }
             game.entities.push(copy);
         }
@@ -1433,6 +1499,40 @@ function applySpellDamage(cardId, casterTeam, x, y) {
         return;
     }
 
+    // ---- 🤢 毒药法术：橙红毒雾领域（持续8秒，每秒对圈内所有敌人造成45伤害 + 减速15%）----
+    if (cardId === 'poison_spell') {
+        const radius = card.radius || 85;
+        game.poisonZones.push({
+            x, y,
+            radius: radius,
+            timer: card.duration || 8,
+            maxTimer: card.duration || 8,
+            team: casterTeam,
+            dps: card.dps || 18,
+            slowFactor: card.slowFactor || 0.85,
+            slowDuration: card.slowDuration || 1.0,
+            towerDmgMul: card.towerDmgMul || 0.5,
+            tickTimer: 0,
+            bubbleTimer: 0.2, // 首个气泡更快冒出
+            bubbles: [],
+        });
+        // ✨ 小红圈持续到法术结束：静态环 timer 延长至毒雾领域结束
+        const ring = game.deployEffects[game.deployEffects.length - 1];
+        if (ring && ring.static) { ring.timer = card.duration || 8; ring.maxTimer = card.duration || 8; }
+        // 部署提示特效：橙红脉冲 + 多个小气泡粒子
+        game.spellEffects.push({ x, y, char: '🤢', size: 44, timer: 0.8, maxTimer: 0.8, isPulse: true });
+        for (let i = 0; i < 14; i++) {
+            game.spellEffects.push({
+                x: x + (rand() - 0.5) * radius * 2,
+                y: y + (rand() - 0.5) * radius * 2,
+                char: '🫧', size: 8 + rand() * 6,
+                timer: 0.4 + rand() * 0.5,
+                maxTimer: 0.9,
+            });
+        }
+        return;
+    }
+
     // ---- 飓风法术：1.5秒飓风领域——持续向中心牵引圈内敌人，每0.5秒一跳8伤害（共3跳24，不影响建筑）----
     if (cardId === 'hurricane') {
         const radius = card.radius || 105;
@@ -1557,9 +1657,9 @@ function applySpellDamage(cardId, casterTeam, x, y) {
     // ---- 大雷电：锁定范围内生命值最高的3名敌方单位，每0.5秒劈下一道雷 ----
     if (cardId === 'thunder_spell') {
         const radius = card.radius || 48;
-        // 收集范围内敌方单位（不锁定隐身单位，排除已死亡/隐藏单位）
+        // 收集范围内敌方单位（不锁定隐身单位，排除已死亡/隐藏单位；界域隐身同样不可锁定）
         const candidates = game.entities.filter(e =>
-            e.team !== casterTeam && e.hp > 0 && !e._headHidden && !e._stealthed
+            e.team !== casterTeam && e.hp > 0 && !e._headHidden && !e._stealthed && !e._realmHidden
             && dist(e, { x, y }) <= radius
         );
         // 按生命值降序取前3名

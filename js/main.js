@@ -9,6 +9,14 @@ const ctx = canvas.getContext('2d');
 window.canvas = canvas;
 window.ctx = ctx;
 
+// ---- 画布尺寸同步：逻辑地图宽 W 开局被 resetGame 切换（🧪测试双人=1400，其余=1600），canvas 缓冲随之重设 ----
+// canvas 无固定 CSS 宽（style.css 仅 display/margin），改 width 属性后显示尺寸与 getBoundingClientRect 自动跟随，
+// ui.js 鼠标坐标映射（W/rect.width）保持正确；开局重设会清空画布，随后 draw() 全量重绘无残留
+function syncCanvasSize() {
+    canvas.width = W;
+    canvas.height = H;
+}
+
 // ---- 页面切换：主页 → 全领对战（全部卡牌可用）----
 document.getElementById('startGameBtn').addEventListener('click', () => {
     game.gameMode = 'classic';
@@ -17,6 +25,7 @@ document.getElementById('startGameBtn').addEventListener('click', () => {
     document.querySelector('.top-bar span:last-child').textContent = '🤖 人机（全卡）';
     renderCardPanel('classic'); // 全部卡牌
     resetGame();
+    syncCanvasSize();
 });
 
 // ---- 页面切换：主页 → 卡组对战（仅卡组内的牌可用）----
@@ -33,6 +42,7 @@ document.getElementById('deckBattleBtn').addEventListener('click', () => {
     document.querySelector('.top-bar span:last-child').textContent = '🤖 人机（卡组）';
     renderCardPanel('deck'); // 只显示卡组中的牌
     resetGame();
+    syncCanvasSize();
 });
 
 // ---- 页面切换：主页 → AI对战（直接使用当前激活预设）----
@@ -84,6 +94,60 @@ document.getElementById('localMultiBtn').addEventListener('click', () => {
     renderCardPanel('classic');    // 下方蓝方
     renderTopCardPanel('classic'); // 上方红方
     resetGame();
+    syncCanvasSize();
+});
+
+// ---- 页面切换：主页 → 🧪 测试双人（本机）——gameMode 复用 'local_multi'（自动继承跳过AI/双面板/圣水冷却刷新等全部行为），
+//      唯一差异：detect220=true → 发现锁敌收窄到220（config MODE_TEST_DETECT_R），圈外无敌原地待机 ----
+document.getElementById('testLocalMultiBtn').addEventListener('click', () => {
+    game.gameMode = 'local_multi';
+    homePage.style.display = 'none';
+    gamePage.style.display = 'flex';
+    document.querySelector('.top-bar span:last-child').textContent = '🧪 测试双人（本机）';
+
+    // 显示上方红方 UI
+    document.getElementById('topElixirBar').style.display = 'flex';
+    document.getElementById('topCardPanel').style.display = 'flex';
+    document.getElementById('topCardPanel').innerHTML = '';
+
+    // 下方圣水标签改为蓝方
+    document.getElementById('rightElixirLabel').innerHTML = '🔵 蓝方 圣水 <span id="aiElixirDisplay">5.0</span>';
+
+    renderCardPanel('classic');    // 下方蓝方
+    renderTopCardPanel('classic'); // 上方红方
+    resetGame(undefined, true);  // 🧪 测试双人：detect220 标记 + 整图缩窄（W=1400）由开局统一传入（工厂重建会重置字段，resetGame 内持久化）
+    syncCanvasSize();
+});
+
+// ---- 页面切换：主页 → 🧪 测试模板1——照抄经典双人（本机）全套（标准图1600/标准河道/无桥无行军），仅两点差异：
+//      ① detect220=true → 发现锁敌收窄 220/440（findTarget/火豆/出圈弃锁三处索敌 gate；圈内无敌原地待机，无行军兜底）
+//      ② noBastion=true → 开局不创建四个堡垒（堡垒虚线同步不画；丢堡推进线因丢堡数恒0天然失效）----
+document.getElementById('testTemplate1Btn').addEventListener('click', () => {
+    game.gameMode = 'local_multi';
+    homePage.style.display = 'none';
+    gamePage.style.display = 'flex';
+    document.querySelector('.top-bar span:last-child').textContent = '🧪 测试模板1';
+
+    // 显示上方红方 UI
+    document.getElementById('topElixirBar').style.display = 'flex';
+    document.getElementById('topCardPanel').style.display = 'flex';
+    document.getElementById('topCardPanel').innerHTML = '';
+
+    // 下方圣水标签改为蓝方
+    document.getElementById('rightElixirLabel').innerHTML = '🔵 蓝方 圣水 <span id="aiElixirDisplay">5.0</span>';
+
+    renderCardPanel('classic');    // 下方蓝方
+    renderTopCardPanel('classic'); // 上方红方
+    resetGame(undefined, true, true);  // 🧪 模板1：detect220（索敌220/440）+ noBastion（无堡垒）；shrink220=false → 标准图
+    syncCanvasSize();
+});
+
+// ---- 主页：「更多后续（测试）」子菜单展开/收起（子项为占位，测试模板内容后续填充）----
+document.getElementById('moreTestsBtn').addEventListener('click', () => {
+    const list = document.getElementById('moreTestsList');
+    const show = list.style.display === 'none';
+    list.style.display = show ? 'flex' : 'none';
+    document.getElementById('moreTestsBtn').textContent = (show ? '▼' : '▶') + ' 更多后续（测试）';
 });
 
 // ==================== 🔗 双人联机入口（全卡 / 卡组） ====================
@@ -339,6 +403,7 @@ function startOnlineBattle(seed, myDeck, oppDeck, myName, oppName, onlineMode) {
         document.getElementById('topCardPanel').style.display = 'none'; // 对方（红方）卡牌面板不显示
     }
     resetGame(seed);
+    syncCanvasSize();
     showGameTip('⚔️ 对决开始！');
 }
 
@@ -930,15 +995,16 @@ function gameLoop(ts) {
         tickAccumulator += Math.min(0.1, (ts - lastTimestamp) / 1000);
         lastTimestamp = ts;
 
-        // 逻辑帧推进：固定步长 FIXED_DELTA；联机同步由延迟缓冲保证（指令按 execTick 对齐，canAdvanceTick 见 network.js）
+        // 逻辑帧推进：固定步长 FIXED_DELTA；联机只在已到期远程输入缺失时等待
         // +1e-9 容差：消除浮点累积到 1/30 边界时偶尔卡一帧的抖动（Fixed Timestep 经典问题）
         let steps = 0;
         let froze = false;
         while (tickAccumulator + 1e-9 >= FIXED_DELTA && steps < MAX_STEPS_PER_FRAME) {
             if (!canAdvanceTick()) {
                 froze = true;
-                // 🔗 Lockstep 冻结等待对手：丢弃累计时间，防止解冻后多步追帧造成错位/顿挫
-                tickAccumulator = 0;
+                // 🔗 Lockstep 等待远程输入：保留累积时间，恢复后只消费必要的逻辑步。
+                // 设为一个逻辑步以内，避免网络恢复后出现追帧，同时保留插值连续性。
+                tickAccumulator = Math.min(tickAccumulator, FIXED_DELTA);
                 break;
             }
             update(FIXED_DELTA);            // ⭐ 恒定步长，不再传变长 delta

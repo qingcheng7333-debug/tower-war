@@ -1,9 +1,12 @@
 /* ===== gameState.js — 游戏运行时状态管理 ===== */
 
 /** 创建全新游戏状态对象（game 初始定义与 resetGame 共用同一工厂，避免字段写两遍） */
-function createGameState(gameMode) {
+function createGameState(gameMode, detect220Flag, noBastionFlag) {
     return {
-        gameMode: gameMode || 'classic',      // 'classic' | 'api' —— 经典AI vs API AI
+        gameMode: gameMode || 'classic',      // 'classic' | 'deck' | 'api' | 'local_multi' | 'online'
+        detect220: !!detect220Flag,           // 🧪 索敌收窄标记：true=发现锁敌收窄 220/飞行440（update.js 索敌类三处 gate：findTarget/火豆/出圈弃锁；由 resetGame(seed, true[, , true]) 传入；工厂重建后无法保留，必须开局显式传参）
+        shrink220: !!detect220Flag && !noBastionFlag,  // 🧪 整图缩窄标记：true=测试双人（本机）缩窄图全套（W1400/窄河/桥/行军/排斥/改道/落水，地图类 gate 统一用它）；🧪测试模板1=索敌收窄但标准图 → false
+        noBastion: !!noBastionFlag,           // 🧪 测试模板1：true=开局不创建四个堡垒（render 同步不画堡垒虚线；丢堡推进线因丢堡数恒0天然失效）
         // ── 阵营对称数据（联机前置：按 team 键索引；单机时 'ai' 键交给本地 AI 托管）──
         elixir: { player: 5.0, ai: 5.0 },          // 原 playerElixir/aiElixir
         maxElixir: 10,
@@ -60,6 +63,8 @@ function createGameState(gameMode) {
         freezeZones: [], // { x, y, radius, timer, maxTimer }
         // ---- 🧪 哥布林魔咒诅咒领域 ----
         curseZones: [],  // { x, y, radius, timer, maxTimer, team, dps, tickTimer, bubbleTimer, bubbles[] }
+        // ---- 🤢 毒药法术·毒雾领域 ----
+        poisonZones: [], // { x, y, radius, timer, maxTimer, team, dps, slowFactor, slowDuration, tickTimer, bubbleTimer, bubbles[] }
         hurricaneZones: [],  // { x, y, radius, timer, maxTimer, tickTimer, tickInterval, pullAndDamage } 飓风领域（持续牵引+每0.5s一跳伤害）
         // ---- 🧭 烟引法术：pending 待放烟 + 活跃引导 ----
         // smokePending 与 mirrorSmokePending 分开，防止镜像烟引影响原烟引
@@ -181,15 +186,21 @@ function nextMirrorDeployToken() {
     return game.mirrorDeploySeq;
 }
 
-function resetGame(seed) {
+function resetGame(seed, detect220Flag, noBastionFlag) {
+    const d220 = !!detect220Flag;   // 🧪索敌收窄（测试双人/模板1）；无参=false（与原工厂默认语义一致）
+    const t1 = !!noBastionFlag;     // 🧪测试模板1：无堡垒
+    const shrink = d220 && !t1;     // 🧪整图缩窄：仅测试双人变体（模板1 索敌收窄但用标准图1600）
+    W = shrink ? MODE_TEST_W : W_STAND;  // 🧪 测试双人：整图缩窄至1400（右岸缩200），其余模式恒=标准1600；必须在创建实体前设定（逻辑边界/渲染/画布全跟随）
     setRandomSeed(seed !== undefined ? seed : (Date.now() >>> 0));  // 联机前置：开局同步种子（单机用时间戳）
-    game = createGameState(game.gameMode);  // 保留当前模式
+    game = createGameState(game.gameMode, d220, t1);  // 保留当前模式
     entityIdCounter = 1;
 
     // ---- 开局创建双方主塔（建筑，不可被治疗）----
+    // 🧪 测试双人：AI 主塔取缩窄坐标 MODE_TEST_AI_TOWER(1300)，其余模式标准 AI_TOWER(1500)
+    const aiTowerDef = shrink ? MODE_TEST_AI_TOWER : AI_TOWER;
     const mainTowerSpawns = [
         { t: 'player', x: PLAYER_TOWER.x, y: PLAYER_TOWER.y },
-        { t: 'ai',     x: AI_TOWER.x,     y: AI_TOWER.y },
+        { t: 'ai',     x: aiTowerDef.x,   y: aiTowerDef.y },
     ];
     for (const s of mainTowerSpawns) {
         game.entities.push(createEntity({
@@ -203,22 +214,27 @@ function resetGame(seed) {
         }));
     }
 
-    // ---- 开局创建双方的堡垒（每边两个）----
-    const bastionSpawns = [
-        { t: 'player', x: PLAYER_BASTION_TOP.x,    y: PLAYER_BASTION_TOP.y },
-        { t: 'player', x: PLAYER_BASTION_BOTTOM.x, y: PLAYER_BASTION_BOTTOM.y },
-        { t: 'ai',     x: AI_BASTION_TOP.x,        y: AI_BASTION_TOP.y },
-        { t: 'ai',     x: AI_BASTION_BOTTOM.x,     y: AI_BASTION_BOTTOM.y },
-    ];
-    for (const s of bastionSpawns) {
-        game.entities.push(createEntity({
-            type: 'bastion', team: s.t, cardId: 'bastion', fortification: true,
-            x: s.x, y: s.y,
-            hp: BASTION_STATS.hp, maxHp: BASTION_STATS.hp,
-            atk: BASTION_STATS.atk, atkSpeed: BASTION_STATS.atkSpeed, atkCooldown: 0,
-            range: BASTION_STATS.range,
-            hitRadius: 28,  // 受击半径（匹配圆形视觉半径r=28，贴边即可攻击）
-        }));
+    // ---- 开局创建双方的堡垒（每边两个）——🧪测试模板1（noBastion）整段跳过：全场无堡垒 ----
+    // 🧪 测试双人：AI 堡垒取缩窄坐标 MODE_TEST_AI_BASTION_*(1000)，其余模式标准(1200)
+    if (!t1) {
+        const aiBastionTopDef    = shrink ? MODE_TEST_AI_BASTION_TOP    : AI_BASTION_TOP;
+        const aiBastionBottomDef = shrink ? MODE_TEST_AI_BASTION_BOTTOM : AI_BASTION_BOTTOM;
+        const bastionSpawns = [
+            { t: 'player', x: PLAYER_BASTION_TOP.x,    y: PLAYER_BASTION_TOP.y },
+            { t: 'player', x: PLAYER_BASTION_BOTTOM.x, y: PLAYER_BASTION_BOTTOM.y },
+            { t: 'ai',     x: aiBastionTopDef.x,       y: aiBastionTopDef.y },
+            { t: 'ai',     x: aiBastionBottomDef.x,    y: aiBastionBottomDef.y },
+        ];
+        for (const s of bastionSpawns) {
+            game.entities.push(createEntity({
+                type: 'bastion', team: s.t, cardId: 'bastion', fortification: true,
+                x: s.x, y: s.y,
+                hp: BASTION_STATS.hp, maxHp: BASTION_STATS.hp,
+                atk: BASTION_STATS.atk, atkSpeed: BASTION_STATS.atkSpeed, atkCooldown: 0,
+                range: BASTION_STATS.range,
+                hitRadius: 28,  // 受击半径（匹配圆形视觉半径r=28，贴边即可攻击）
+            }));
+        }
     }
 
     // 清除卡牌选中状态（上下都清）——DOM 操作归 ui.js（基础框架第6条）
@@ -256,6 +272,7 @@ function getBattleStateSnapshot() {
         deployEffects: g.deployEffects, pierceArrows: g.pierceArrows,
         speedZones: g.speedZones, rageZones: g.rageZones, freezeZones: g.freezeZones,
         curseZones: g.curseZones, smokeGuides: g.smokeGuides,
+        poisonZones: g.poisonZones,
         arrowRainStrikes: g.arrowRainStrikes, fireballFlights: g.fireballFlights,
         rocketFlights: g.rocketFlights, logRolls: g.logRolls,
         earthquakeStrikes: g.earthquakeStrikes, thunderStrikes: g.thunderStrikes,

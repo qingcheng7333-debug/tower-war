@@ -1,19 +1,49 @@
 // ---- 地图尺寸 ----
-const W = 1600;
+const W_STAND = 1600;            // 标准地图总宽
+let W = W_STAND;                 // 当前逻辑地图宽：resetGame 开局按 detect220 切换（仅🧪测试双人变体=1400，其余恒=W_STAND；画布尺寸由 main.js syncCanvasSize 同步）
 const H = 700;
 const HALF = H / 2;
 const BUFFER_HEIGHT = 40;        // 顶部底部不可部署区域高度
 const BUFFER_WIDTH = 300;        // 左右不可部署区域宽度
 const RIVER_LEFT = 650;          // 河道区域(650~950)河宽300
 const RIVER_RIGHT = 950;
+// 🧪 测试双人（本机）专属：整图缩窄——河道收窄省出的 200px 直接从地图总宽去掉（1600→1400），不再留在两岸：
+// 左岸0~650 / 河650~750（河宽100） / 右岸750~1400；其余模式仍用 RIVER_LEFT/RIVER_RIGHT 与 W_STAND
+const MODE_TEST_W = 1400;                            // 🧪 测试双人：地图总宽（resetGame 切给 W）
+const MODE_TEST_RIVER_LEFT = RIVER_LEFT;             // =650 左岸不缩
+const MODE_TEST_RIVER_RIGHT = RIVER_RIGHT - 200;     // =750 右岸整体左移200（河宽300→100）
 
 // ---- 逻辑帧（Fixed Timestep）：逻辑固定 30Hz tick；渲染 rAF + 插值（见 main.js gameLoop）----
 const TICK_RATE = 30;              // 逻辑帧率（次/秒）
 const FIXED_DELTA = 1 / TICK_RATE; // 固定逻辑步长（秒）≈ 0.0333
 const TICK_INTERVAL_MS = 1000 / TICK_RATE; // 逻辑帧间隔（毫秒，联机同步锚点参考）
 const MAX_STEPS_PER_FRAME = 5;     // 单渲染帧最多推进的逻辑步数（防螺旋死亡）
+// ---- 联机 INPUT 帧窗口（协议常量统一放在 config.js）----
+const NET_INPUT_PAST_TICKS = 2;     // 允许少量网络乱序/处理延迟
+const NET_INPUT_FUTURE_TICKS = 600; // 拒绝异常远期帧，避免缓存膨胀
+const NET_INPUT_KEEP_TICKS = 120;   // 已确认帧的保留窗口
+
+// ---- 模式专属常量 ----
+const MODE_TEST_DETECT_R = 220;    // 🧪 测试双人（本机220）模式：发现锁敌半径——覆盖全图索敌，圈外敌人视而不见（无目标=原地待机，移动保持纯锁敌驱动）
+const MODE_TEST_DETECT_R_FLY = 440;  // 🧪 飞行单位（flying 搜索者）索敌半径：空中视野翻倍；地面单位仍用 MODE_TEST_DETECT_R（三处 gate 经 update.js detectR220Of() 统一取值）
+
+// ---- 🧪 测试双人（本机）：行军路线（waypoint 折线，detect220 下索敌圈内无敌时沿路走向敌方主塔）----
+// 蓝方(player)视角，红方(ai)反向复用同一条路；路径离堡垒/主塔中心 ≥70px（建筑碰撞半宽28+单位半径15=43），不会被卡住
+// 🧪 整图缩窄版：x>800 的 waypoint 全部左移200（过河中点700=窄河中心，右段1065，终点1300=MODE_TEST_AI_TOWER）
+const MODE_TEST_ROUTES = {
+    up:   [ { x: 100,  y: 350 }, { x: 335, y: 115 }, { x: 700, y: 115 }, { x: 1065, y: 115 }, { x: 1300, y: 350 } ],
+    down: [ { x: 100,  y: 350 }, { x: 335, y: 585 }, { x: 700, y: 585 }, { x: 1065, y: 585 }, { x: 1300, y: 350 } ],
+};
+
+// ---- 🧪 测试双人（本机）：河道通行（detect220 专属）——地面单位不可泅渡，只能走两座行军桥；空中单位（flying）与无移速单位豁免 ----
+const MODE_TEST_BRIDGE_YS = [MODE_TEST_ROUTES.up[2].y, MODE_TEST_ROUTES.down[2].y]; // 两座桥中心线 y（=走廊 waypoint 115/585）
+const MODE_TEST_BRIDGE_HALF = 40;   // 桥走廊半宽（比行军走廊 ±30 宽10：桥开口更好走；岸边排斥框在桥开口处豁免、落水豁免、桥面渲染宽度均跟随此值）
+const MODE_TEST_RIVER_GUARD = 22;   // 岸边排斥框厚度：河道两侧各 [岸线-22, 岸线+22]，地面单位进框被推回；穿过整条框带=落水
+const MODE_TEST_RIVER_PUSH = 150;   // 排斥推力 px/s（向岸；约为普通移速 2.5~5 倍，正常走位推不穿——落水只来自钩拉/击退/挤压等位移）
+const MODE_TEST_SPLASH_T = 0.55;    // 水花特效时长（秒）
 
 // 地图布局：左界(0~100) + 主塔x=100 + 堡垒x=400 + 河道(650~950) + 堡垒x=1200 + 主塔x=1500 + 右界(1500~1600)
+// 🧪 测试双人布局：左界不变 + 主塔x=100 + 堡垒x=400 + 河(650~750) + 堡垒x=1000 + 主塔x=1300 + 右界(1300~1400)，总宽1400
 
 // ---- 阵营坐标 ----
 const PLAYER_TOWER = { x: 100, y: H / 2 };
@@ -25,6 +55,12 @@ const PLAYER_BASTIONS = [
 const AI_BASTIONS = [
     { x: 1200, y: 185 },
     { x: 1200, y: 515 }
+];
+// 🧪 测试双人（本机）：AI 侧建筑随整图缩窄左移200（玩家侧不缩不动；resetGame 创建 AI 主塔/堡垒时按 detect220 选用）
+const MODE_TEST_AI_TOWER = { x: 1300, y: H / 2 };
+const MODE_TEST_AI_BASTIONS = [
+    { x: 1000, y: 185 },
+    { x: 1000, y: 515 }
 ];
 const HALF_CENTER = { x: 800, y: 350 };
 
@@ -117,8 +153,8 @@ const DRAGON_STATS = { atk: 135, atkSpeed: 1.2, moveSpeed: 22, range: 75, target
 const CARDS = {
     // ==================== 军队 ====================
     swordman: {
-        type: 'troop', name: '剑士', cost: 3, hp: 950, atk: 40,
-        atkSpeed: 1.2, moveSpeed: 22, range: 25, targetMode: 'all', icon: '⚔️',
+        type: 'troop', name: '剑士', cost: 3, hp: 880, atk: 40,
+        atkSpeed: 1.2, moveSpeed: 28, range: 25, targetMode: 'all', icon: '⚔️',
         deployDelay: 1.5, cooldown: 6
     },
     strong_barbarian: {
@@ -240,6 +276,19 @@ const CARDS = {
         deathBoomRadius: 75, deathBoomDmg: 50,
         desc: '🛡️ 肉盾：HP极高、攻击力高，只攻击建筑（同野猪/熔岩猎犬），攻速慢(2.0s)；死亡时爆炸（周围75px内所有敌方单位50伤害）'
     },
+    hannibal: {
+        type: 'troop', name: '汉尼拔', cost: 7, hp: 2400, atk: 24,
+        atkSpeed: 1.2, moveSpeed: 34, range: 25, targetMode: 'all', icon: '🐘',
+        deployDelay: 1.5, cooldown: 15,
+        gutRadius: 75,        // 吞噬触发范围
+        gulpTime: 0.5,        // 拉取停止时间
+        gulpPullSpeed: 260,   // 拉取拖拽速度（同渔夫收线）
+        digestTick: 0.4,      // 消化间隔
+        digestEnemyDmg: 16,   // 每次消化对被吞敌人造成的伤害
+        digestSelfDmg: 20,    // 每次消化汉拔尼自身受到的伤害
+        digestSpeed: 16,      // 消化中移速
+        desc: '🐘 7费重型近战单位：生命2400、攻击24、攻速1.2s。75px内有非建筑敌军→停0.5s拉过来吞掉！消化中：身体×1.2、移速16、只锁建筑、每0.4s敌人-16血且自身-20血（头上蓄力条=敌人血量）；消化完恢复原状；死亡时未消化完的敌人被放出'
+    },
     anti_armor_giant: {
         type: 'troop', name: '反甲巨人', cost: 7, hp: 2000, atk: 65,
         atkSpeed: 1.8, moveSpeed: 16, range: 25, targetMode: 'buildings', icon: '🦔',
@@ -259,6 +308,7 @@ const CARDS = {
         flying: true, canHitAir: true, // 飞行单位、近战可对空（同大苍蝇）
         deployDelay: 1.5, cooldown: 7.5,
         deathBoomRadius: 45, deathBoomDmg: 80, deathBoomKnockback: 15,
+        eggHp: 160, // 🥚 凤凰蛋基础生命：下蛋时随凤凰衰减链同步递减（每次重复下蛋血量 -20%）
         desc: '🔥 4费飞行近战凤凰：生命520、攻击44、攻速1s、移速28，可对空。死亡时烈焰爆发：45px范围内80伤害并击退15px'
     },
     lightning_dragon: {
@@ -285,7 +335,7 @@ const CARDS = {
         desc: '🐕 飞行坦克：HP极高、攻击力低，只攻击建筑（同巨人/野猪），射程同暗夜女巫(75)；死亡时爆炸（75px内所有敌方单位50伤害）并召唤6只猎犬幼崽'
     },
     night_witch: {
-        type: 'troop', name: '暗夜女巫', cost: 4, hp: 350, atk: 30,
+        type: 'troop', name: '暗夜女巫', cost: 4, hp: 440, atk: 43,
         atkSpeed: 1.3, moveSpeed: 22, range: 75, targetMode: 'all', icon: '🧛',
         deployDelay: 1.5, cooldown: 7.5,
         spawnInterval: 5.0, spawnCount: 2, spawnUnit: 'bat', deathSpawnCount: 1
@@ -394,7 +444,7 @@ const CARDS = {
     },
     knight: {
         type: 'troop', name: '骑士', cost: 5, hp: 1200, atk: 78,
-        atkSpeed: 1.4, moveSpeed: 28, range: 25, targetMode: 'all', icon: '🐴',
+        atkSpeed: 1.4, moveSpeed: 28, range: 30, targetMode: 'all', icon: '🐴',
         deployDelay: 1.5, cooldown: 10,
         desc: '🐴冲锋移速300%+🗡️伤害400%+单体攻击'
     },
@@ -486,6 +536,23 @@ const CARDS = {
         desc: '🪓 5费远程单体：生命640、攻击35、攻速2.4s、移速28、攻击索敌135、移动索敌105（可对空）。黑蓝配色胖虎，抡起飞斧远程砍人'
     },
 
+    unicorn: {
+        type: 'troop', name: '独角兽', cost: 5, hp: 1600, atk: 44,
+        atkSpeed: 1.0, moveSpeed: 34, range: 105, targetMode: 'all', icon: '🦄',
+        deployDelay: 1.0, cooldown: 10,
+        groundOnly: true,  // 🐎 不攻击飞行单位（索敌排除空中，冲刺沿途也不结算飞行）
+        healRate: 20,   // ❤️‍🩹 每秒自回20（仅沉睡期生效，苏醒即移除；走 _hasRegen 通用buff模块）
+        // ⚡ 蓄力冲刺（参考超骑蓄力+护驾冲锋）：105内出现敌人→蓄力0.8s（开始瞬间锁定方向，之后敌人死活/隐身/跑出射程均不影响）→朝锁定方向直线冲刺135px（不转弯）
+        dashCharge: 0.8,      // 蓄力时长（秒）
+        dashDistance: 135,    // 冲刺距离（px，直线不转弯；可超出105索敌范围）
+        dashSpeedMul: 8,      // 冲刺速度=移速×8（参考护驾冲锋）
+        dashHitRadius: 40,    // 沿途碰撞判定半径（参考护驾冲锋）
+        dashKnockback: 20,    // 沿途敌人击退（px）
+        dashRecoil: 30,       // 撞建筑反作用：独角兽自身被弹回（px）
+        dashBuildingMul: 4,   // 撞建筑伤害倍率（44×4=176）；自身眩晕1s+击退，冲锋终止
+        desc: '🦄 5费对地单体：生命1600、冲锋伤害44、移速34、触程105。出场沉睡（半血800）：头顶飘💤、每秒自动回复20血（可被治疗兵加速），满血后苏醒（参考巨龙蛋机制），苏醒后移除自回。苏醒后105内出现敌人→蓄力0.8s（开始瞬间锁定方向，敌人死活/隐身/跑出射程均不影响）→直线冲刺135px（不转弯）：沿途敌人受44伤害+击退20px；撞到建筑造成4倍伤害(176)，独角兽自己被眩晕1秒并沿冲刺反方向弹回30px，冲锋终止'
+    },
+
     // ==================== 精锐 ====================
     hades: {
         type: 'troop', category: 'elite', name: '冥王', cost: 6, hp: 350, atk: 25,
@@ -518,7 +585,7 @@ const CARDS = {
         // 🌀 精英主动技能（占位）：部署后卡牌变为「界域」（3费）；效果待定，暂无实际作用
         activeSkill: {
             id: 'yomi_realm', name: '界域', icon: '🌀', cost: 3, cooldown: 30,
-            desc: '界域（3费·30s冷却）：施法0.6s后展开105范围界域、持续7s；界域内除黄泉外所有单位（敌我）冰冻+隐身（普通索敌看不见），黄泉无视隐身、索敌仅限界域内、伤害=5+敌人最大生命值33%、刀变纯红；黄泉阵亡则界域消散'
+            desc: '界域（3费·30s冷却）：施法0.6s后展开105范围界域、持续7s；界域内除黄泉外所有单位（敌我）冰冻+隐身（所有索敌不可见，AOE/溅射仍可波及），黄泉无视隐身、索敌仅限界域内、伤害=5+敌人最大生命值33%、刀变纯红；黄泉阵亡则界域消散'
         },
         desc: '🌑 7费精锐近战单体：生命900、攻击48+目标当前生命值22%、攻速1.1s、移速28、近战范围35（同剑仙）。🌀主动技能·界域（3费·占位待定）'
     },
@@ -776,6 +843,13 @@ const CARDS = {
         deployDelay: 0.8, cooldown: 12,
         desc: '🌪️ 3费法术：105px范围持续1.5秒的飓风领域，持续向中心牵引圈内敌人，每0.5秒造成8点伤害（共3跳24伤害，不影响建筑）'
     },
+    poison_spell: {
+        type: 'spell', name: '毒药', cost: 4,
+        radius: 85, icon: '🤢',
+        deployDelay: 0.8, cooldown: 15,
+        duration: 8, dps: 18, slowFactor: 0.85, slowDuration: 1.0, towerDmgMul: 0.5,
+        desc: '🤢 4费法术：85px范围（同极速法术）形成橙红毒雾领域8秒，每0.4秒对圈内所有敌人造成18点伤害并减速15%（对主塔/堡垒伤害减半）'
+    },
     speed_spell: {
         type: 'spell', name: '极速法术', cost: 2,
         radius: 85, zoneDuration: 8.0, speedBoost: 2.0, boostDuration: 1.0,
@@ -826,6 +900,8 @@ const PLAYER_BASTION_TOP    = PLAYER_BASTIONS[0];
 const PLAYER_BASTION_BOTTOM = PLAYER_BASTIONS[1];
 const AI_BASTION_TOP        = AI_BASTIONS[0];
 const AI_BASTION_BOTTOM     = AI_BASTIONS[1];
+const MODE_TEST_AI_BASTION_TOP    = MODE_TEST_AI_BASTIONS[0];   // 🧪 测试双人别名（与标准对称：isInHalf/render 部署边界引用）
+const MODE_TEST_AI_BASTION_BOTTOM = MODE_TEST_AI_BASTIONS[1];
 
 const BASE_UNITS = {
     bat: BAT_TEMPLATE,

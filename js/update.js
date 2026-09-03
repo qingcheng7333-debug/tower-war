@@ -307,7 +307,7 @@ const PROJECTILE_HANDLERS = {
             const dE = Math.hypot(dxE, dyE);
             if (dE < 5) {
                 if (p.damage !== undefined && !p.hit) {
-                    const tgtE = game.entities.find(en => en.id === p.targetId && en.hp > 0 && !en._headHidden && !en._stealthed);
+                    const tgtE = game.entities.find(en => en.id === p.targetId && en.hp > 0 && !en._headHidden && !en._stealthed && !en._realmHidden);
                     // 目标还活着且仍在落点附近才算命中；目标已死亡/跑远则落空（不扣血）
                     if (tgtE && Math.hypot(tgtE.x - p.tx, tgtE.y - p.ty) < 18) {
                         const atkEnt = game.entities.find(en => en.id === p.ownerId) || null;
@@ -470,8 +470,8 @@ const PROJECTILE_HANDLERS = {
     // ── 🎯 通用追踪弹：目标存活则每帧追踪其当前位置，贴近受击半径即命中（有目标必中）──
     tracking: {
         update(p, deltaSec) {
-            // 查找目标（存活且未隐身/未露头）
-            const tgt = game.entities.find(en => en.id === p.targetId && en.hp > 0 && !en._headHidden && !en._stealthed);
+            // 查找目标（存活且未隐身/未露头/未被界域隐身）
+            const tgt = game.entities.find(en => en.id === p.targetId && en.hp > 0 && !en._headHidden && !en._stealthed && !en._realmHidden);
             if (tgt) {
                 // 追踪：持续刷新落点为目标当前位置（子弹拐弯追目标）
                 p.tx = tgt.x;
@@ -1060,8 +1060,10 @@ const DEATH_RESOLVERS = [
         match: e => e.hp <= 0 && e.cardId === 'phoenix' && !e._eggDropped,
         handler: e => {
             e._eggDropped = true;
-            const egg = createPhoenixEgg(e.x, e.y, e.team);
-            // 🐣 衰减链：孵化出的凤凰 = 当前凤凰的 80%（蛋本身生命固定 160，衰减记在蛋上）
+            // 🥚 蛋血量同走衰减链：基础 eggHp × 当前凤凰/原凤凰比例（每次重复下蛋血量 -20%）
+            const eggHpRatio = (e.maxHp || e.hp) / CARDS.phoenix.hp;
+            const egg = createPhoenixEgg(e.x, e.y, e.team, { maxHp: Math.round(CARDS.phoenix.eggHp * eggHpRatio) });
+            // 🐣 衰减链：孵化出的凤凰 = 当前凤凰的 80%（衰减记在蛋上）
             egg._hatchMaxHp = Math.round((e.maxHp || e.hp) * 0.8);
             egg._hatchAtk = Math.round(e.atk * 0.8);
             // 🔷 复制体凤凰留下的蛋也继承复制特性：1滴血、护盾随父体、亮蓝幻影
@@ -1156,6 +1158,55 @@ const DEATH_RESOLVERS = [
             e._soulCounted = true;
         },
     },
+    // ---- 🐘 汉拔尼：死亡时释放未完成的消化快照/拉取目标 ----
+    {
+        match: e => e.hp <= 0 && e.cardId === 'hannibal' && (e._swallowedSnapshot || e._gulping),
+        handler: e => {
+            let snapshot = e._swallowedSnapshot;
+            let prey = null;
+            if (!snapshot && e._gulping) {
+                prey = game.entities.find(en => en.id === e._gulpTargetId);
+                if (prey && prey.hp > 0) snapshot = createHannibalSnapshot(prey);
+            }
+            if (snapshot && snapshot.hp > 0) {
+                const releaseRadius = 22;
+                const releaseAngle = rand() * Math.PI * 2;
+                const releaseDistance = Math.sqrt(rand()) * releaseRadius;
+                const releaseX = e.x + Math.cos(releaseAngle) * releaseDistance;
+                const releaseY = e.y + Math.sin(releaseAngle) * releaseDistance;
+                const released = createEntityFromHannibalSnapshot(snapshot, releaseX, releaseY);
+                if (released) {
+                    // 复制体及其释放物遵循复制法术的1血规则；本体释放物保留消化后的血量。
+                    if (e.isCopy) {
+                        released.isCopy = true;
+                        released.hp = 1;
+                        released.maxHp = 1;
+                        released.shield = (released.maxShield || 0) > 0 ? 1 : 0;
+                        released.maxShield = released.shield;
+                    }
+                    game.entities.push(released);
+                    game.deployEffects.push({
+                        x: e.x, y: e.y, radius: releaseRadius,
+                        timer: 0.35, maxTimer: 0.35,
+                        color: '180, 120, 220',
+                    });
+                }
+            }
+            // 拉取中目标尚未转成快照，汉拔尼死亡时销毁旧拉取对象；消化中目标本来已不在 entities。
+            if (prey) {
+                const idx = game.entities.indexOf(prey);
+                if (idx >= 0) game.entities.splice(idx, 1);
+            }
+            e._swallowedSnapshot = null;
+            e._digesting = false;
+            e._gulping = false;
+            e._gulpTargetId = null;
+            if (game.fishingLines && e._gulpLineId) {
+                game.fishingLines = game.fishingLines.filter(l => l.id !== e._gulpLineId);
+            }
+            e._gulpLineId = null;
+        },
+    },
 ];
 
 /** 执行死亡结算（必须在死亡清理之前调用） */
@@ -1187,7 +1238,7 @@ function updateInfernoBeam(entity, deltaSec, currentTarget, options) {
     if (entity._beamTargetId) {
         const lockedTarget = game.entities.find(
             en => en.id === entity._beamTargetId && en.hp > 0 &&
-                  !en._stealthed && dist(entity, en) <= entity.range
+                  !en._stealthed && !en._realmHidden && dist(entity, en) <= entity.range
         );
         if (lockedTarget) {
             currentTarget = lockedTarget;
@@ -1531,15 +1582,91 @@ function update(deltaSec) {
         }
     }
 
+    // ---- 🤢 毒药法术·毒雾领域（持续8秒，每0.4秒对圈内所有敌人造成18伤害 + 减速15%由🤢本身提供；气泡密集细小上浮）----
+    for (let i = game.poisonZones.length - 1; i >= 0; i--) {
+        const zone = game.poisonZones[i];
+        zone.timer -= deltaSec;
+        if (zone.timer <= 0) {
+            game.poisonZones.splice(i, 1);
+            continue;
+        }
+        // 伤害 tick：0.4秒一次
+        zone.tickTimer -= deltaSec;
+        if (zone.tickTimer <= 0) {
+            zone.tickTimer = 0.4;
+            for (let e of game.entities) {
+                if (e.hp <= 0 || e.team === zone.team || e._headHidden) continue;
+                if (dist(e, zone) <= zone.radius) {
+                    const dmg = calcActualDmg(e.fortification ? zone.dps * (zone.towerDmgMul || 0.5) : zone.dps, null, e);
+                    e.hp -= dmg;
+                    spawnDmgNum(e.x, e.y - 20, dmg);
+                }
+            }
+        }
+        // 🤢 领域减速：圈内敌军持续减速15%（减速由🤢buff本身提供，走出领域后1秒内恢复）
+        for (let e of game.entities) {
+            if (e.hp <= 0 || e.team === zone.team || e._headHidden) continue;
+            if (dist(e, zone) <= zone.radius) {
+                // 🤢 中毒 buff 标记（减速15%由🤢本身提供，伤害由领域tick独立结算）
+                e._poisonSpellTimer = zone.slowDuration;
+            }
+        }
+        // 气泡生成：更小更密集（每0.3~0.6秒一个，寿命约1秒，半径3px）
+        zone.bubbleTimer -= deltaSec;
+        if (zone.bubbleTimer <= 0) {
+            zone.bubbleTimer = 0.3 + rand() * 0.3;
+            zone.bubbles.push({
+                x: zone.x + (rand() - 0.5) * zone.radius * 1.8,
+                y: zone.y + (rand() - 0.5) * zone.radius * 1.8,
+                timer: 0.8 + rand() * 0.4, maxTimer: 1.2,
+                vy: -(12 + rand() * 18), // 缓慢上浮
+            });
+        }
+        for (let b = zone.bubbles.length - 1; b >= 0; b--) {
+            const bubble = zone.bubbles[b];
+            bubble.timer -= deltaSec;
+            bubble.y += bubble.vy * deltaSec;
+            if (bubble.timer <= 0) {
+                zone.bubbles.splice(b, 1);
+            }
+        }
+    }
+
     // ---- 遍历所有实体 ----
     for (let e of game.entities) {
         if (e.hp <= 0) continue;
-
+        // 🌊 测试双人（本机）落水判定（shrink220 缩窄图专属）：地面单位身处水域核心 → 溺亡+水花（冻结单位同样判定，在河里冻着也是在水里）
+        checkRiverDrown(e);
+        if (e.hp <= 0) continue;   // 溺亡 → 立即按死亡处理（本帧行动跳过，交由统一死亡清理收尾）
         // --- ❄️ 冰冻状态：暂停一切行动（不能移动/攻击/蓄力/召唤/生产等，如同按下暂停键）---
         if (e.freezeTimer > 0) {
             e.freezeTimer -= deltaSec;
             if (e.freezeTimer <= 0) e.freezeTimer = 0;
             continue;   // 冻结期间跳过所有行动逻辑（仍可被攻击，伤害由攻击方结算）
+        }
+
+        // --- 🐘 汉拔尼：消化 tick（独立于索敌/移动，吞掉后每0.4s敌人-16且自身-20；消化完恢复原状）---
+        if (e.cardId === 'hannibal' && e._digesting && e._swallowedSnapshot) {
+            e._digestTimer = (e._digestTimer || 0) + deltaSec;
+            const tick = CARDS.hannibal.digestTick || 0.4;
+            const enemyDmg = CARDS.hannibal.digestEnemyDmg || 16;
+            const selfDmg = CARDS.hannibal.digestSelfDmg || 20;
+            while (e._digestTimer >= tick) {
+                e._digestTimer -= tick;
+                e._swallowedSnapshot.hp -= enemyDmg;
+                e.hp -= selfDmg;
+                if (e._swallowedSnapshot.hp <= 0) {
+                    // ✅ 消化完成：快照单位死亡，汉拔尼恢复原状
+                    e._swallowedSnapshot = null;
+                    e._digesting = false;
+                    e.moveSpeed = e._digestOrigSpeed;
+                    e.targetMode = e._digestOrigTargetMode;
+                    game.spellEffects.push({ x: e.x, y: e.y - 20, char: '💨', size: 26, timer: 0.5, maxTimer: 0.5 });
+                    break;
+                }
+                // 汉拔尼在本次 tick 中死亡：停止本帧后续消化，交由死亡结算放出目标
+                if (e.hp <= 0) break;
+            }
         }
 
         // --- 🌀 飓风拉拢：独立于移动逻辑，对所有单位统一生效（含暂时不移动/待命/眩晕单位）---
@@ -1643,6 +1770,12 @@ function update(deltaSec) {
             }
         }
 
+        // --- 🤢 毒药法术中毒 buff 计时衰减（🤢减速15% + 头顶图标，伤害由领域tick独立结算）---
+        if (e._poisonSpellTimer > 0) {
+            e._poisonSpellTimer -= deltaSec;
+            if (e._poisonSpellTimer <= 0) e._poisonSpellTimer = 0;
+        }
+
         // --- 兵营生产（spawnUnit 驱动 + tickSpawner 统一循环；建筑产兵不继承复制特性）---
         if (e.type === 'barrack') {
             if (e.cardId === 'barbarian_hut') {
@@ -1742,7 +1875,7 @@ function update(deltaSec) {
             let currentTarget = null;
             if (e.type === 'bastion') {
                 const enemies = game.entities.filter(
-                    e2 => e2.team !== e.team && e2.hp > 0 && !e2._stealthed && dist(e, e2) <= e.range
+                    e2 => e2.team !== e.team && e2.hp > 0 && !e2._stealthed && !e2._realmHidden && dist(e, e2) <= e.range
                 );
                 currentTarget = enemies.sort((a, b) => dist(e, a) - dist(e, b))[0] || null;
             } else {
@@ -1754,7 +1887,7 @@ function update(deltaSec) {
             if (e.cardId === 'goblin_hut') {
                 e.hp -= (CARDS.goblin_hut.burnPerSec || 14) * deltaSec; // 自流血
                 const hutRange = CARDS.goblin_hut.spawnRange || 125;
-                const hasEnemy = game.entities.some(en => en.team !== e.team && en.hp > 0 && !en._stealthed && dist(e, en) <= hutRange);
+                const hasEnemy = game.entities.some(en => en.team !== e.team && en.hp > 0 && !en._stealthed && !en._realmHidden && dist(e, en) <= hutRange);
                 if (hasEnemy) {
                     e._spawnTimer = (e._spawnTimer || 0) + deltaSec;
                     const hutInterval = CARDS.goblin_hut.spawnInterval || 2.2;
@@ -2014,10 +2147,10 @@ function update(deltaSec) {
                     e._patrolX = undefined; e._patrolY = undefined; e._patrolDir = undefined;
                     e._patrolR = undefined;
                 }
-                // 寻找最近的敌方单位（不锁定隐身单位，如隐身幽灵🌫️）
-                let nearest = null, minDist = Infinity;
+                // 寻找最近的敌方单位（不锁定隐身单位，如隐身幽灵🌫️）；🧪测试双人（detect220）：未收编时索敌同步收窄（地面220/飞行440，圈外不理会）
+                let nearest = null, minDist = game.detect220 ? detectR220Of(e) : Infinity;
                 for (let en of game.entities) {
-                    if (en.team === e.team || en.hp <= 0 || en._stealthed) continue;
+                    if (en.team === e.team || en.hp <= 0 || en._stealthed || en._realmHidden) continue;
                     if (camp && Math.hypot(en.x - camp.x, en.y - camp.y) > (CARDS.camp.campDetectR || 200)) continue; // 收编：圈外敌人不理会
                     const d = Math.hypot(e.x - en.x, e.y - en.y);
                     if (d < minDist) { minDist = d; nearest = en; }
@@ -2047,6 +2180,9 @@ function update(deltaSec) {
                 } else if (camp) {
                     // 圈内无敌 → 绕营巡逻
                     patrolOrbit(e, deltaSec);
+                } else if (game.shrink220) {
+                    // 🧪 测试双人：圈内无敌且未收编 → 沿路行军（走到敌堆里自爆；模板1 无行军→原地待机）
+                    marchFallback(e, deltaSec);
                 }
                 continue; // 火豆跳过其他兵种行为
             }
@@ -2132,6 +2268,20 @@ function update(deltaSec) {
                 }
                 
                 continue;   // 蛋不移动不攻击
+            }
+
+            // ---- 🦄 独角兽：沉睡中不移动不攻击（可被攻击/治疗）+ 满血自动苏醒（参考巨龙蛋机制）----
+            if (e._isSleeping) {
+                // ❤️‍🩹 回血已由通用 buff 模块处理（含治疗兵加速），此处只做苏醒检测
+                if (e.hp >= e.maxHp) {
+                    e.hp = e.maxHp;
+                    e._isSleeping = false;
+                    e._hasRegen = false;  // 💤 苏醒后移除❤️‍🩹自回（仅沉睡期回血）
+                    // 苏醒特效
+                    game.spellEffects.push({ x: e.x, y: e.y, char: '✨', size: 30, timer: 0.6, maxTimer: 0.6 });
+                    game.spellEffects.push({ x: e.x, y: e.y, char: '🦄', size: 26, timer: 0.5, maxTimer: 0.5 });
+                }
+                continue;   // 沉睡中：不索敌不攻击不移动
             }
 
             // ---- 凤凰蛋：跳动动画计时 + 孵化倒计时（3.8s 后孵化出 80% 凤凰；蛋被打碎即消失不孵化）----
@@ -2450,7 +2600,7 @@ function update(deltaSec) {
                         }
                     } else {
                         for (const en of game.entities) {
-                            if (en.team === e.team || en.hp <= 0 || en._stealthed) continue;
+                            if (en.team === e.team || en.hp <= 0 || en._stealthed || en._realmHidden) continue;
                             if (!canTargetFlying(e) && en.flying) continue;
                             // 只打建筑的兵种（如巨人）：营地索敌同样只认建筑
                             if (e.targetMode === 'buildings') {
@@ -2496,7 +2646,7 @@ function update(deltaSec) {
                 // 索敌：巡逻中心圈内 / 自身攻击范围 e.range 内（双判定，任一命中即出击；targetMode=all，建筑/兵种都打）
                 let nearest = null, minDist = detectR;
                 for (const en of game.entities) {
-                    if (en.team === e.team || en.hp <= 0 || en._stealthed) continue;
+                    if (en.team === e.team || en.hp <= 0 || en._stealthed || en._realmHidden) continue;
                     if (!canTargetFlying(e) && en.flying) continue;
                     const dC = Math.hypot(en.x - e._patrolX, en.y - e._patrolY);
                     const dS = Math.hypot(en.x - e.x, en.y - e.y);
@@ -2517,7 +2667,7 @@ function update(deltaSec) {
                     const dx = e.x - e._patrolX, dy = e.y - e._patrolY;
                     const distC = Math.hypot(dx, dy) || 1;
                     // 巡逻速度与通用移动一致：吃减速/极速/狂暴因子（守卫仅巡逻行为与索敌范围特殊，其余与普通兵种一致）
-                    const speed = e.moveSpeed * (e.slowFactor || 1.0) * (e._poisonTimer > 0 ? 0.6 : 1.0) * (e._speedBoosted ? 2.0 : 1.0) * (e._charging ? (e.cardId === 'barbarian_battering_ram' ? 2.0 : 3.0) : 1.0) * rageMult(e);
+                    const speed = e.moveSpeed * (e.slowFactor || 1.0) * (e._poisonTimer > 0 ? 0.6 : 1.0) * (e._poisonSpellTimer > 0 ? 0.85 : 1.0) * (e._speedBoosted ? 2.0 : 1.0) * (e._charging ? (e.cardId === 'barbarian_battering_ram' ? 2.0 : 3.0) : 1.0) * rageMult(e);
                     const step = speed * deltaSec;
                     const rx = dx / distC, ry = dy / distC;                    // 径向单位向量（中心→守卫）
                     const tx = -ry * e._patrolDir, ty = rx * e._patrolDir;     // 切线单位向量（绕圈方向）
@@ -2528,6 +2678,8 @@ function update(deltaSec) {
                     // 边界限制（同 moveToward）
                     e.x = Math.min(W - 25, Math.max(25, e.x));
                     e.y = Math.min(H - 25, Math.max(25, e.y));
+                    // 🌊 岸边排斥框（缩窄图）：守卫巡逻绕圈与通用移动同待遇（主塔离河远，兜底收口）
+                    if (game.shrink220 && !e.flying && e.moveSpeed) riverGuardPush(e, deltaSec);
                     continue; // 巡逻中不执行下方通用索敌/攻击
                 }
             }
@@ -2572,7 +2724,7 @@ function update(deltaSec) {
                 // 3) 索敌200（以剑仙为圆心，飞剑可对空）：有敌 → 全部飞剑直线射出
                 let nearestS = null, minDistS = 200;
                 for (const en of game.entities) {
-                    if (en.team === e.team || en.hp <= 0 || en._headHidden || en._stealthed) continue;
+                    if (en.team === e.team || en.hp <= 0 || en._headHidden || en._stealthed || en._realmHidden) continue;
                     const d = Math.hypot(en.x - e.x, en.y - e.y);
                     if (d <= minDistS) { minDistS = d; nearestS = en; }
                 }
@@ -2606,12 +2758,12 @@ function update(deltaSec) {
                 if (e._stabTimer > 0) e._stabTimer -= deltaSec;
                 let aimTarget = null;
                 if (e.targetId) {
-                    const t = game.entities.find(en => en.id === e.targetId && en.hp > 0 && !en._headHidden && !en._stealthed);
+                    const t = game.entities.find(en => en.id === e.targetId && en.hp > 0 && !en._headHidden && !en._stealthed && !en._realmHidden);
                     if (t && dist(e, t) - getHitRadius(t) <= (e.range || 35)) aimTarget = t;
                 }
                 if (!aimTarget) {
                     for (const en of game.entities) {
-                        if (en.team === e.team || en.hp <= 0 || en._headHidden || en._stealthed) continue;
+                        if (en.team === e.team || en.hp <= 0 || en._headHidden || en._stealthed || en._realmHidden) continue;
                         if (Math.hypot(en.x - e.x, en.y - e.y) <= 50) { aimTarget = en; break; }
                     }
                 }
@@ -2684,7 +2836,11 @@ function update(deltaSec) {
                     }
                 } else {
                     const moveTarget = findTarget(e);
-                    if (moveTarget) moveToward(e, moveTarget.x, moveTarget.y, deltaSec);
+                    if (moveTarget) {
+                        moveToward(e, moveTarget.x, moveTarget.y, deltaSec);
+                    } else if (game.shrink220) {
+                        marchFallback(e, deltaSec); // 🧪 测试双人：索敌圈内无敌 → 沿路行军
+                    }
                 }
                 continue;
             }
@@ -2710,7 +2866,11 @@ function update(deltaSec) {
                 } else {
                     // 无锁定目标：用通用寻敌驱动正常前进（射程内锁定不限制移动索敌，像普通部队一样推进）
                     const moveTarget = findTarget(e);
-                    if (moveTarget) moveToward(e, moveTarget.x, moveTarget.y, deltaSec);
+                    if (moveTarget) {
+                        moveToward(e, moveTarget.x, moveTarget.y, deltaSec);
+                    } else if (game.shrink220) {
+                        marchFallback(e, deltaSec); // 🧪 测试双人：索敌圈内无敌 → 沿路行军
+                    }
                 }
                 continue;
             }
@@ -2724,16 +2884,23 @@ function update(deltaSec) {
                 // 🌑 黄泉·界域：无视隐身（含领域隐身目标），锁定不因隐身放弃
                 if (!t) {
                     e.targetId = null;  // 🚨 只有目标死亡或隐身才放弃！绝不因距离远放弃！
+                    clearChargeStates(e); // 🧹 同步清蓄力/突袭标记（防状态机滞留卡死）
+                } else if (game.detect220 && dist(e, t) > detectR220Of(e) && !e._detourBridge) {
+                    // 🧪 测试双人（本机）唯一例外：目标跑出索敌圈（地面220/飞行440）→ 放弃锁定（营地式"超出就不追"），圈内无敌则原地待机
+                    //    🌉 河道改道中豁免：正绕桥赶往对岸目标，出圈不弃锁（否则 220 圈边界反复弃锁/重锁震荡）
+                    e.targetId = null;
+                    clearChargeStates(e); // 🧹 蓄力中目标出圈 → 取消蓄力（超骑/暗影/独角兽/渔夫/汉拔尼拉取）
                 } else if (t.flying && !canTargetFlying(e)) {
                     // 🕊️ 目标已升空（如剑仙御剑）且本兵不能对空 → 解除锁定重新索敌（否则会继续追着空中的剑仙打）
                     e.targetId = null;
+                    clearChargeStates(e);
                 } else {
                     // 🌑 黄泉·界域：目标已走出界域 → 放弃锁定（索敌仅限圈内，不留恋圈外目标）
                     if (e.cardId === 'yomi' && e._realmActive) {
                         const realm = (game.yomiRealms || []).find(r => r.ownerId === e.id && !r.fading);
                         if (realm) {
                             const rdx = t.x - realm.x, rdy = t.y - realm.y;
-                            if (rdx * rdx + rdy * rdy > realm.r * realm.r) e.targetId = null;
+                            if (rdx * rdx + rdy * rdy > realm.r * realm.r) { e.targetId = null; clearChargeStates(e); }
                         }
                     }
                     // 主动重评估（优化）：防路过建筑不回头
@@ -2750,6 +2917,9 @@ function update(deltaSec) {
                 const newTarget = findTarget(e);
                 if (newTarget) {
                     e.targetId = newTarget.id;
+                } else if (game.shrink220 && e.type !== 'healer') {
+                    // 🧪 测试双人：索敌圈内无敌 → 沿路行军（优先级最低：一旦索到敌人走正常锁定/追击；治疗兵走自己的行军分支）
+                    marchFallback(e, deltaSec);
                 } else {
                     // 🚨 【终极排查器】如果真的找不到目标，把真凶打印出来！
                     const enemyTower = game.entities.find(en => en.type === 'main_tower' && en.team !== e.team);
@@ -2811,6 +2981,65 @@ function update(deltaSec) {
                     e._escortHit = null;
                 }
                 continue; // ⛔ 冲锋中，跳过后续索敌/攻击/移动
+            }
+// ---- 🦄 独角兽：蓄力冲刺中 → 沿锁定方向直线冲刺105px（不转弯），沿途敌人44伤害+击退20px；
+//      撞到建筑→4倍伤害(176)+眩晕建筑1秒+冲锋终止（参考护驾冲锋沿途结算/暗影刺客冲刺），不普攻不移动 ----
+            if (e.cardId === 'unicorn' && e._uniDashing) {
+                const uCard = CARDS.unicorn || {};
+                const dashSpeed = (e.moveSpeed || 34) * (uCard.dashSpeedMul || 8); // 💨 冲刺速度=移速×8（参考护驾）
+                const step = Math.min(dashSpeed * deltaSec, e._uniRemain);
+                if (step > 0) {
+                    e.x += (e._uniDirX || 0) * step;
+                    e.y += (e._uniDirY || 0) * step;
+                    e._uniRemain -= step;
+                    // 沿途碰撞结算（参考护驾冲锋：半径40去重命中；🕊️只对地——飞行单位不结算）
+                    const hitR = uCard.dashHitRadius || 40;
+                    for (const e2 of game.entities) {
+                        if (e2.team === e.team || e2.hp <= 0 || e2._headHidden || e2._stealthed) continue;
+                        if (e2.flying) continue; // 🕊️ 冲刺不打空中
+                        if (e._uniHit[e2.id]) continue;
+                        if (dist(e2, e) > hitR) continue;
+                        const isBuilding = e2.fortification || e2.type === 'main_tower' || e2.type === 'bastion'
+                            || e2.type === 'tower' || e2.type === 'barrack' || e2.type === 'collector';
+                        if (isBuilding) {
+                            // 🏰 撞建筑：4倍伤害(176) + 冲锋终止（撞墙停下）；反作用：独角兽自身眩晕1秒💫 + 沿冲刺反方向弹回30px
+                            e._uniHit[e2.id] = true;
+                            const dmgB = calcActualDmg(e.atk * (uCard.dashBuildingMul || 4), e, e2);
+                            e2.hp -= dmgB;
+                            spawnDmgNum(e2.x, e2.y - 20, dmgB);
+                            applyHardControl(e, 'stun', 1); // 💫 撞墙反作用：独角兽自己被眩晕1秒（interruptible 回调同步终止冲刺）
+                            if (e.moveSpeed !== undefined) { // 沿冲刺反方向弹回30px（位移式击退：标记剩余位移向量，帧驱动渐进滑动）
+                                e._kbX = -(e._uniDirX || 0) * (uCard.dashRecoil || 30);
+                                e._kbY = -(e._uniDirY || 0) * (uCard.dashRecoil || 30);
+                            }
+                            game.spellEffects.push({ x: e.x, y: e.y, char: '💥', size: 28, timer: 0.25, maxTimer: 0.25 });
+                            game.spellEffects.push({ x: e.x, y: e.y - 20, char: '💫', size: 20, timer: 0.4, maxTimer: 0.4 });
+                            e._uniRemain = 0; // ⛔ 冲锋终止
+                            break;
+                        } else {
+                            // 🐎 沿途敌人：44伤害 + 击退20px（位移式击退：标记剩余位移向量，帧驱动渐进滑动，仅兵种）
+                            e._uniHit[e2.id] = true;
+                            const dmg = calcActualDmg(e.atk, e, e2);
+                            e2.hp -= dmg;
+                            spawnDmgNum(e2.x, e2.y - 20, dmg);
+                            if (e2.moveSpeed !== undefined && !e2.fortification) {
+                                const angle = Math.atan2(e2.y - e.y, e2.x - e.x);
+                                e2._kbX = Math.cos(angle) * (uCard.dashKnockback || 20);
+                                e2._kbY = Math.sin(angle) * (uCard.dashKnockback || 20);
+                            }
+                            game.spellEffects.push({ x: e2.x, y: e2.y, char: '💥', size: 22, timer: 0.25, maxTimer: 0.25 });
+                        }
+                    }
+                }
+                e.x = Math.min(W - 30, Math.max(30, e.x));
+                e.y = Math.min(H - 30, Math.max(30, e.y));
+                if (e._uniRemain <= 0) {
+                    // ✅ 冲刺结束（冲满105px或撞建筑终止）：恢复正常行为，重置攻击节奏（atkSpeed=两轮冲刺间隔）
+                    e._uniDashing = false;
+                    e._uniHit = null;
+                    e.atkCooldown = e.atkSpeed; // 参考暗影刺客：冲刺后重置攻击节奏
+                }
+                continue; // ⛔ 冲刺中，跳过后续索敌/攻击/移动
             }
             if (e.targetId) {
                 const target = game.entities.find(en => en.id === e.targetId);
@@ -2893,6 +3122,23 @@ function update(deltaSec) {
                         continue; // ⛔ 蓄力中，跳过后续攻击/移动
                     }
                 }
+                // ---- 🦄 独角兽：蓄力中 → 不攻击不移动；蓄力开始瞬间已锁定方向（非敌人），
+                //      目标死亡/隐身/升空/跑出射程均不取消，蓄满照冲（自身被眩晕/冰冻由 applyHardControl 打断）----
+                if (e.cardId === 'unicorn' && e._uniCharging) {
+                    // ✅ 蓄力继续，原地罚站（前蹄刨地蓄势）
+                    e._uniTimer -= deltaSec * rageMult(e);
+                    if (e._uniTimer <= 0) {
+                        // 💥 起跑！朝蓄力开始时锁定的方向直线冲刺135px（冲刺中不转弯）
+                        const uCard = CARDS.unicorn || {};
+                        e._uniDashing = true;
+                        e._uniRemain = uCard.dashDistance || 135;
+                        e._uniHit = {};
+                        e._uniCharging = false;
+                        e._uniTimer = 0;
+                        game.spellEffects.push({ x: e.x, y: e.y, char: '⚡', size: 22, timer: 0.25, maxTimer: 0.25 });
+                    }
+                    continue; // ⛔ 独角兽蓄力中，跳过后续攻击/移动
+                }
                 // ---- 暗影刺客：突袭蓄力/冲刺中 → 短暂隐身（不可被锁定），不普攻 ----
                 if (e.cardId === 'shadow_assassin' && e._assaultCharging) {
                     const atkTarget = game.entities.find(en => en.id === e._assaultTargetId);
@@ -2939,6 +3185,92 @@ function update(deltaSec) {
                             }
                         }
                         continue; // ⛔ 突袭中，跳过后续攻击/移动
+                    }
+                }
+                // ---- 🐘 汉拔尼：吞噬机制（75px内非建筑敌军→停0.5s拉过来吞掉；消化中：身体×1.2、移速16、只锁建筑、每0.4s敌我各-18）----
+                if (e.cardId === 'hannibal') {
+                    // ① 拉取中：0.5s 内把敌人拖到面前，贴脸即吞
+                    if (e._gulping) {
+                        const gulpTarget = game.entities.find(en => en.id === e._gulpTargetId);
+                        // 钩子索敌独立于普通攻击：已钩住的空中单位仍可被拉取并吞噬。
+                        const shouldCancel = !gulpTarget || gulpTarget.hp <= 0 || gulpTarget._stealthed || (e._stunTimer > 0);
+                        if (shouldCancel) {
+                            // ❌ 取消拉取，随后走正常攻击/移动逻辑
+                            e._gulping = false;
+                            e._gulpTimer = 0;
+                            e._gulpTargetId = null;
+                            if (game.fishingLines && e._gulpLineId) {
+                                game.fishingLines = game.fishingLines.filter(l => l.id !== e._gulpLineId);
+                            }
+                            e._gulpLineId = null;
+                        } else {
+                            e._gulpTimer -= deltaSec;
+                            // 🪝 收线拖拽：把敌人拉向汉拔尼（复用渔夫收线速度）
+                            const pullSpeed = CARDS.hannibal.gulpPullSpeed || 260;
+                            const step = pullSpeed * deltaSec;
+                            const dd = dist(e, gulpTarget);
+                            if (dd > 0) {
+                                gulpTarget.x += (e.x - gulpTarget.x) / dd * step;
+                                gulpTarget.y += (e.y - gulpTarget.y) / dd * step;
+                            }
+                            // 贴脸（进入攻击范围）或 0.5s 到 → 吞掉！
+                            if (dd - getHitRadius(gulpTarget) <= e.range + 5 || e._gulpTimer <= 0) {
+                                // 🐘 吞掉！敌人消失（移出战场），汉拔尼进入消化状态
+                                // 吞入即转为独立快照：被吞单位不再作为隐藏实体存在。
+                                e._swallowedSnapshot = createHannibalSnapshot(gulpTarget);
+                                const gulpIndex = game.entities.indexOf(gulpTarget);
+                                if (gulpIndex >= 0) game.entities.splice(gulpIndex, 1);
+                                e._digesting = true;
+                                e._digestTimer = 0;
+                                e._digestOrigSpeed = e.moveSpeed;
+                                e._digestOrigTargetMode = e.targetMode;
+                                e.moveSpeed = CARDS.hannibal.digestSpeed || 16;   // 消化中移速16
+                                e.targetMode = 'buildings';                        // 消化中只锁建筑
+                                e._gulping = false;
+                                e._gulpTimer = 0;
+                                e._gulpTargetId = null;
+                                if (game.fishingLines && e._gulpLineId) {
+                                    game.fishingLines = game.fishingLines.filter(l => l.id !== e._gulpLineId);
+                                }
+                                e._gulpLineId = null;
+                                game.spellEffects.push({ x: e.x, y: e.y - 24, char: '😋', size: 28, timer: 0.5, maxTimer: 0.5 });
+                            }
+                        }
+                        continue; // ⛔ 拉取中，跳过后续攻击/移动
+                    }
+                    // ③ 未消化：探测 75px 内非建筑敌军 → 停0.5s拉过来吞
+                    //    （消化 tick 已在主循环顶部独立处理，不受目标有无影响）
+                    if (!e._digesting && (e._stunTimer || 0) <= 0) {
+                        const gutR = CARDS.hannibal.gutRadius || 75;
+                        let prey = null, preyD = Infinity;
+                        for (const en of game.entities) {
+                            if (en.team === e.team || en.hp <= 0 || en._stealthed || en._realmHidden) continue;
+                            // 钩子允许对空；汉拔尼的普通攻击仍由通用索敌规则限制对空能力。
+                            const isBuilding = en.type === 'main_tower' || en.type === 'bastion'
+                                || en.type === 'tower' || en.type === 'barrack' || en.type === 'collector';
+                            if (isBuilding) continue; // 建筑不吞（正常攻击）
+                            const d = dist(e, en);
+                            if (d <= gutR && d < preyD) { prey = en; preyD = d; }
+                        }
+                        if (prey) {
+                            // 🪝 触发拉取：停0.5s + 甩钩（复用渔夫鱼线渲染）
+                            e._gulping = true;
+                            e._gulpTimer = CARDS.hannibal.gulpTime || 0.5;
+                            e._gulpTargetId = prey.id;
+                            // 创建鱼线（pulling 模式直接拖拽，钩头连目标）
+                            game.fishingLines = game.fishingLines || [];
+                            game._fishingLineSeq = (game._fishingLineSeq || 0) + 1;
+                            game.fishingLines.push({
+                                id: game._fishingLineSeq,
+                                ownerId: e.id,
+                                targetId: prey.id,
+                                x: e.x, y: e.y - 16,
+                                dx: 0, dy: 0, traveled: 0, speed: 0,
+                                lineLen: 60, pulling: true,
+                            });
+                            e._gulpLineId = game._fishingLineSeq;
+                            continue; // ⛔ 触发拉取帧：跳过后续攻击/移动（下一帧进入①拉取中）
+                        }
                     }
                 }
                 // ---- 渔夫：钩子三阶段（蓄力 → 甩钩飞行 → 收线拖拽），期间不移动不普攻 ----
@@ -3064,13 +3396,13 @@ function update(deltaSec) {
                         const lockedId = e[bag.tgt];
                         if (lockedId != null) {
                             const en = game.entities.find(x => x.id === lockedId);
-                            if (en && en.team !== e.team && en.hp > 0 && !en._stealthed
+                            if (en && en.team !== e.team && en.hp > 0 && !en._stealthed && !en._realmHidden
                                 && dist(e, en) - getHitRadius(en) <= tRange) t2 = en;
                         }
                         if (!t2) {
                             // 随机锁敌：从射程内所有有效敌人中随机挑一个锁定（两个投矛手各锁各的）
                             const candidates = game.entities.filter(en =>
-                                en.team !== e.team && en.hp > 0 && !en._stealthed
+                                en.team !== e.team && en.hp > 0 && !en._stealthed && !en._realmHidden
                                 && dist(e, en) - getHitRadius(en) <= tRange);
                             if (candidates.length) t2 = candidates[Math.floor(rand() * candidates.length)];
                         }
@@ -3094,8 +3426,19 @@ function update(deltaSec) {
                     }
                 }
                 if (target && dist(e, target) - getHitRadius(target) <= e.range) {
-                    // ---- 电磁炮：满蓄时发射（蓄能已在持续模块处理）----
-                    if (e.cardId === 'electro_cannon') {
+                    // ---- 🦄 独角兽：攻击范围内出现敌人 → 蓄力0.8秒（替代普攻；蓄满直线冲刺，处理见上方蓄力段）----
+                    if (e.cardId === 'unicorn') {
+                        if (e.atkCooldown > 0) e.atkCooldown -= deltaSec * rageMult(e);
+                        if ((e._stunTimer || 0) <= 0 && !e._uniCharging && e.atkCooldown <= 0) {
+                            // ⚡ 锁定的是方向而非敌人：蓄力开始瞬间记下朝向目标的方向，之后敌人死活/隐身/升空/跑出射程均不影响，
+                            //    蓄满后朝该方向直线冲刺135px（参考超骑蓄力；atkSpeed=1.0 作为两轮冲刺的间隔）
+                            e._uniCharging = true;
+                            e._uniTimer = CARDS.unicorn.dashCharge || 0.8;
+                            const uniAng = Math.atan2(target.y - e.y, target.x - e.x);
+                            e._uniDirX = Math.cos(uniAng);
+                            e._uniDirY = Math.sin(uniAng);
+                        }
+                    } else if (e.cardId === 'electro_cannon') {
                         if (e._chargeTimer >= e._chargeMax) {
                             e._chargeTimer = 0;
                             // ── 弹道：白色电磁团（命中时才结算35px范围伤害） ──
@@ -3276,6 +3619,8 @@ function update(deltaSec) {
             // 🧭 烟引引导中（无目标时）：持续朝烟点赶路
             if (!e.targetId && e._guideX !== undefined && e._guideY !== undefined) {
                 moveToward(e, e._guideX, e._guideY, deltaSec);
+            } else if (!e.targetId && game.shrink220) {
+                marchFallback(e, deltaSec); // 🧪 测试双人：无治疗对象 → 沿路行军（跟部队前进）
             }
         }
     }
@@ -3315,11 +3660,12 @@ function update(deltaSec) {
     }
     game.pierceArrows = game.pierceArrows.filter(a => a.traveled < a.maxTravel);
 
-    // ---- 清理渔夫鱼线：关联渔夫已死或钩子已结束则移除 ----
+    // ---- 清理渔夫/汉拔尼鱼线：关联单位已死或拉取已结束则移除 ----
     if (game.fishingLines && game.fishingLines.length) {
         game.fishingLines = game.fishingLines.filter(l => {
             const owner = game.entities.find(en => en.id === l.ownerId);
-            return owner && owner.cardId === 'fisherman' && (owner._hookFlying || owner._hookPulling);
+            return owner && ((owner.cardId === 'fisherman' && (owner._hookFlying || owner._hookPulling))
+                || (owner.cardId === 'hannibal' && owner._gulping));
         });
     }
 
@@ -3332,6 +3678,14 @@ function update(deltaSec) {
         for (let i = game.clawEffects.length - 1; i >= 0; i--) {
             game.clawEffects[i].timer -= deltaSec;
             if (game.clawEffects[i].timer <= 0) game.clawEffects.splice(i, 1);
+        }
+    }
+
+    // ---- 🌊 更新落水水花特效（全局特效层，render 只读绘制；detect220 变体落水时生成）----
+    if (game.splashFX && game.splashFX.length) {
+        for (let i = game.splashFX.length - 1; i >= 0; i--) {
+            game.splashFX[i].timer -= deltaSec;
+            if (game.splashFX[i].timer <= 0) game.splashFX.splice(i, 1);
         }
     }
 
@@ -3736,6 +4090,8 @@ function update(deltaSec) {
         if (e.cardId === 'berserker' && e._berserkTimer > 0 && e.hp <= 0) e.hp = 1;
     }
 
+    // ---- 🐘 汉拔尼：吞入目标已在吞入瞬间转为快照并移除，无隐藏实体需要过滤 ----
+
     // ---- 死亡结算（配置驱动 DEATH_RESOLVERS，见文件顶部；必须在死亡清理之前）----
     resolveDeaths();
 
@@ -3915,10 +4271,93 @@ function canTargetFlying(entity) {
     if (entity.groundOnly) return false;                // 炮车：只对地
     if (entity.type === 'bastion') return true;            // 堡垒对空对地
     if (entity.type === 'tower' && entity.cardId !== 'mage_tower' && entity.cardId !== 'inferno_tower' && entity.cardId !== 'tesla_tower') return false; // 炮塔默认只能对地，法师塔/地狱塔/电磁塔可对空
-    if (entity.range <= 30) return false;       // 近战不能打飞行
-    // 🕊️ 剑仙：地面近战不能对空；御剑升空（flying）后可对空
-    if (entity.cardId === 'sword_immortal' && !entity.flying) return false;
+    // 🕊️ 剑仙御剑升空后可对空（须在近战拦截之前放行）
+    if (entity.cardId === 'sword_immortal' && entity.flying) return true;
+    // 🌑 黄泉·界域：大招激活期间可对空（须在近战拦截之前放行）
+    if (entity.cardId === 'yomi' && entity._realmActive) return true;
+    if (entity.range <= 50) return false;       // 近战不能打飞行
     return true;                                 // 远程可以打飞行
+}
+
+/**
+ * 🧹 目标丢失时同步清掉"依赖目标驱动"的蓄力/突袭状态（目标失效清理处调用）
+ * 超骑跃击/暗影突袭/独角兽蓄力/渔夫钩子/汉拔尼拉取的状态机都挂在「有目标」分支内驱动，
+ * 目标丢失（死亡/隐身/220出圈/升空/出界域）后分支被跳过 → 标记滞留 → 单位永久罚站且 marchFallback 豁免挡住兜底行军。
+ */
+function clearChargeStates(e) {
+    if (e._leapCharging) { e._leapCharging = false; e._leapTimer = 0; e._leapTargetId = null; }
+    if (e._assaultCharging) {
+        e._assaultCharging = false; e._assaultTimer = 0; e._assaultTargetId = null;
+        if (e.cardId === 'shadow_assassin') e._stealthed = false; // 🥷 突袭隐身同步解除（防隐身滞留）
+    }
+    if (e._uniCharging) { e._uniCharging = false; e._uniTimer = 0; }
+    if (e._hookCharging) { e._hookCharging = false; e._hookTimer = 0; e._hookTargetId = null; }
+    if (e._gulping) {  // 🐘 拉取失败：取消+清鱼线（与拉取分支 shouldCancel 同款清理）
+        e._gulping = false; e._gulpTimer = 0; e._gulpTargetId = null;
+        if (game.fishingLines && e._gulpLineId) game.fishingLines = game.fishingLines.filter(l => l.id !== e._gulpLineId);
+        e._gulpLineId = null;
+    }
+    e._detourBridge = null; e._detourTargetId = null;  // 🌉 河道改道记忆随目标失效清除（detect220 变体字段，其他模式为 undefined 无害）
+}
+
+/** 🧪 行军走廊：段 a→b 上 t(0~1) 位置沿法向偏移 offset 的目标点（offset 正=段方向左侧） */
+function marchOffsetPoint(ax, ay, bx, by, t, offset) {
+    const len = Math.hypot(bx - ax, by - ay) || 1;
+    const nx = -(by - ay) / len, ny = (bx - ax) / len;
+    return { x: ax + (bx - ax) * t + nx * offset, y: ay + (by - ay) * t + ny * offset };
+}
+
+/**
+ * 🧪 测试双人（本机）：无目标行军（detect220 专属，优先级最低）
+ * 索敌圈（220）内无敌时沿 MODE_TEST_ROUTES 行军走向敌方主塔；一旦索到敌人，调用方分支不再进入本函数（去追杀）。
+ * 路径选择：按 y<H/2 选上/下路，按 team 定方向（player 正序向右 / ai 反序向左）；每帧对折线做最近线段投影——
+ * 部署在路中间时直接切入不回头路，战斗被拉离路线后自动重新吸附。终点=敌方主塔（半途必被220圈锁定转入战斗）。
+ * 走廊：路线扩宽 ±30px，每单位 rand() 分配一次固定横向偏移（_marchOffset），队伍散布走廊内不全挤一条线。
+ */
+function marchFallback(e, deltaSec) {
+    // 特殊状态豁免：冲锋/蓄力/拉取中不接管移动（保持自身行为）；消化中【不豁免】——消化移速16本就设计为边消化边推进
+    if (e._retreatCharging || e._escortCharging || e._uniDashing || e._uniCharging
+        || e._leapCharging || e._assaultCharging || e._hookCharging || e._gulping) return;
+
+    // 🚶 走廊偏移：每单位固定横向偏移 ±30px（rand() 逻辑随机，分配一次终身不变，战斗后队形依旧）
+    if (e._marchOffset === undefined) e._marchOffset = (rand() - 0.5) * 60;
+
+    const base = e.y < H / 2 ? MODE_TEST_ROUTES.up : MODE_TEST_ROUTES.down;
+    const pts = e.team === 'player' ? base : [...base].reverse();
+
+    // 最近线段投影（点到各段取全局最近；目标点=投影点+段法向×走廊偏移，即"带偏移的平行线"）
+    let bestSeg = 0, bestD = Infinity, bestPt = pts[0];
+    for (let i = 0; i < pts.length - 1; i++) {
+        const a = pts[i], b = pts[i + 1];
+        const dx = b.x - a.x, dy = b.y - a.y;
+        const t = Math.max(0, Math.min(1, ((e.x - a.x) * dx + (e.y - a.y) * dy) / (dx * dx + dy * dy || 1)));
+        const target = marchOffsetPoint(a.x, a.y, b.x, b.y, t, e._marchOffset);
+        const d = Math.hypot(e.x - target.x, e.y - target.y);
+        if (d < bestD) { bestD = d; bestSeg = i; bestPt = target; }
+    }
+
+    // 偏离走廊（>15px，如刚打完架/刚部署在路外）→ 先汇入带偏移投影点；贴线（≤15px）→ 直接沿 waypoint 前进
+    if (!e._marchJoined || bestD > 15) {
+        e._marchJoined = false;
+        moveToward(e, bestPt.x, bestPt.y, deltaSec);
+        if (bestD < 6) e._marchJoined = true;
+        return;
+    }
+    e._marchJoined = true;
+
+    // 沿 waypoint 前进：目标=当前段终点(带走廊偏移)；到达(≤10px)推进下一段；最后段终点=敌方主塔（不推进，走到半途必锁塔）
+    let next = marchOffsetPoint(pts[bestSeg].x, pts[bestSeg].y, pts[bestSeg + 1].x, pts[bestSeg + 1].y, 1, e._marchOffset);
+    if (bestSeg + 1 < pts.length - 1 && Math.hypot(e.x - next.x, e.y - next.y) < 10) {
+        bestSeg++;
+        next = marchOffsetPoint(pts[bestSeg].x, pts[bestSeg].y, pts[bestSeg + 1].x, pts[bestSeg + 1].y, 1, e._marchOffset);
+    }
+    moveToward(e, next.x, next.y, deltaSec);
+}
+
+/** 🧪 测试双人（本机）：索敌圈半径（detect220 专属 gate）——飞行搜索者（flying）440（MODE_TEST_DETECT_R_FLY，空中视野翻倍）/
+ *  地面 220（MODE_TEST_DETECT_R）；findTarget 过滤、火豆寻敌、目标超圈弃锁三处共用，保证三处半径判定一致（弃锁圈=发现圈防边界震荡） */
+function detectR220Of(entity) {
+    return entity.flying ? MODE_TEST_DETECT_R_FLY : MODE_TEST_DETECT_R;
 }
 
 /** 通用寻敌：索最近敌人（三类通吃），巨人只索建筑，飞行免疫保留，且跳过隐身幽灵 */
@@ -3928,6 +4367,13 @@ function findTarget(entity) {
     let enemies = game.entities.filter(e =>
         e.team !== entity.team && e.hp > 0 && !e._stealthed && !e._realmHidden
     );
+
+    // 🧪 测试双人（本机）：发现锁敌收窄到索敌圈（地面220=MODE_TEST_DETECT_R / 飞行搜索者440=MODE_TEST_DETECT_R_FLY）——圈外敌人一律视而不见，
+    //    圈内无敌→返回null→原地待机（不加推进兜底，移动保持纯锁敌驱动）；塔类/营地成员/守卫/治疗兵不走本函数，天然不受影响
+    if (game.detect220) {
+        const detectR = detectR220Of(entity);
+        enemies = enemies.filter(e => dist(entity, e) <= detectR);
+    }
 
     // 🌑 黄泉·界域：技能持续期间索敌仅限界域内，且无视隐身（领域隐身/幽灵隐身都看得见）
     if (entity.cardId === 'yomi' && entity._realmActive) {
@@ -3958,7 +4404,7 @@ function findTarget(entity) {
 /** 防御塔寻敌（与通用逻辑一致），跳过隐身幽灵；支持 minRange 最小射程（太近打不到，如迫击炮） */
 function findTargetInRangeForTower(tower, range) {
     const enemies = game.entities.filter(e =>
-        e.team !== tower.team && e.hp > 0 && !e._stealthed && dist(tower, e) <= range
+        e.team !== tower.team && e.hp > 0 && !e._stealthed && !e._realmHidden && dist(tower, e) <= range
         && !(tower.minRange && dist(tower, e) < tower.minRange)
     );
     const valid = canTargetFlying(tower) ? enemies : enemies.filter(e => !e.flying);
@@ -4620,7 +5066,7 @@ function patrolOrbit(e, deltaSec) {
     const dx = e.x - e._patrolX, dy = e.y - e._patrolY;
     const distC = Math.hypot(dx, dy) || 1;
     // 巡逻速度与通用移动一致：吃减速/极速/狂暴因子
-    const speed = e.moveSpeed * (e.slowFactor || 1.0) * (e._poisonTimer > 0 ? 0.6 : 1.0) * (e._speedBoosted ? 2.0 : 1.0) * (e._charging ? (e.cardId === 'barbarian_battering_ram' ? 2.0 : 3.0) : 1.0) * rageMult(e);
+    const speed = e.moveSpeed * (e.slowFactor || 1.0) * (e._poisonTimer > 0 ? 0.6 : 1.0) * (e._poisonSpellTimer > 0 ? 0.85 : 1.0) * (e._speedBoosted ? 2.0 : 1.0) * (e._charging ? (e.cardId === 'barbarian_battering_ram' ? 2.0 : 3.0) : 1.0) * rageMult(e);
     const step = speed * deltaSec;
     const rx = dx / distC, ry = dy / distC;                    // 径向单位向量（中心→成员）
     const tx = -ry * e._patrolDir, ty = rx * e._patrolDir;     // 切线单位向量（绕圈方向）
@@ -4631,6 +5077,8 @@ function patrolOrbit(e, deltaSec) {
     // 边界限制（同 moveToward）
     e.x = Math.min(W - 25, Math.max(25, e.x));
     e.y = Math.min(H - 25, Math.max(25, e.y));
+    // 🌊 岸边排斥框（缩窄图）：营地贴河部署时巡逻轨道压水段同样被推回陆地/桥（与 moveToward 收口一致）
+    if (game.shrink220 && !e.flying && e.moveSpeed) riverGuardPush(e, deltaSec);
 }
 
 function applyPoison(target) {
@@ -4658,6 +5106,13 @@ function moveToward(entity, tx, ty, deltaSec, opts) {
         ty = entity._guideY;
     }
 
+    // 🌉 测试双人（本机）河道通行（detect220）：地面单位不可泅渡——跨河目的地改道走最近的桥（空中/无移速豁免；
+    //    烟引引导优先级更高，引导目的地在对岸时同样被改道引上桥）。tx/ty 替换模式与上方烟引引导一致
+    if (game.shrink220 && !entity.flying && entity.moveSpeed) {
+        const det = riverDetourTarget(entity, tx, ty);
+        if (det) { tx = det.x; ty = det.y; }
+    }
+
     const dx = tx - entity.x, dy = ty - entity.y;
     const len = Math.hypot(dx, dy);
 
@@ -4670,7 +5125,7 @@ function moveToward(entity, tx, ty, deltaSec, opts) {
     let speed = (entity.cardId === 'berserker' && entity._berserkTimer > 0)
         || (entity.cardId === 'sword_immortal' && entity._rideSword) ? 40 : entity.moveSpeed;
     if (!(opts && opts.pureSpeed)) {
-        speed = speed * (entity.slowFactor || 1.0) * (entity._poisonTimer > 0 ? 0.6 : 1.0) * (entity._speedBoosted ? 2.0 : 1.0) * (entity._charging ? (entity.cardId === 'barbarian_battering_ram' ? 2.0 : 3.0) : 1.0) * rageMult(entity);
+        speed = speed * (entity.slowFactor || 1.0) * (entity._poisonTimer > 0 ? 0.6 : 1.0) * (entity._poisonSpellTimer > 0 ? 0.85 : 1.0) * (entity._speedBoosted ? 2.0 : 1.0) * (entity._charging ? (entity.cardId === 'barbarian_battering_ram' ? 2.0 : 3.0) : 1.0) * rageMult(entity);
     }
     const step = speed * deltaSec;
 
@@ -4681,6 +5136,83 @@ function moveToward(entity, tx, ty, deltaSec, opts) {
     // 边界限制
     entity.x = Math.min(W - 25, Math.max(25, entity.x));
     entity.y = Math.min(H - 25, Math.max(25, entity.y));
+
+    // 🌊 岸边排斥框 + 桥面约束（缩窄图）：框带内向岸推（推回陆地），桥面 y 夹紧防挤落水
+    if (game.shrink220 && !entity.flying && entity.moveSpeed) {
+        riverGuardPush(entity, deltaSec);
+    }
+}
+
+/** 🌉 测试双人（本机）河道改道（detect220）：地面单位与移动目的地分处减半河道两侧 → 改道走最近的桥
+ *  - 目的地在河道带内（空中单位悬停河上）不算跨河——走近岸即可，不做无限改道
+ *  - 桥选择=最近桥，记忆 _detourBridge/_detourTargetId（防 y≈350 两桥等距时目标微动来回翻转）；换目标自动重选
+ *  - 过河（与目的地同侧）记忆即清；目标失效由 clearChargeStates 兜底清理
+ *  - 纯几何判定零随机（Lockstep 确定）；返回 null=不改道 */
+function riverDetourTarget(entity, tx, ty) {
+    const L = MODE_TEST_RIVER_LEFT, R = MODE_TEST_RIVER_RIGHT;
+    const inBand = tx >= L && tx <= R;                        // 目的地悬在河道带内（空中单位）
+    const cross = (entity.x < L && tx > R && !inBand)         // 我在左岸，目的地在对岸
+               || (entity.x > R && tx < L && !inBand);        // 我在右岸，目的地在对岸
+    if (!cross) {
+        if (entity._detourBridge) { entity._detourBridge = null; entity._detourTargetId = null; }  // 已同侧 → 改道结束
+        return null;
+    }
+    if (entity._detourBridge && entity._detourTargetId !== entity.targetId) {
+        entity._detourBridge = null;   // 目标已更换 → 重选最近桥（防翻转记忆仅对同一目标有效）
+    }
+    if (!entity._detourBridge) {
+        entity._detourBridge = (Math.abs(entity.y - MODE_TEST_BRIDGE_YS[0]) <= Math.abs(entity.y - MODE_TEST_BRIDGE_YS[1]))
+            ? MODE_TEST_BRIDGE_YS[0] : MODE_TEST_BRIDGE_YS[1];
+        entity._detourTargetId = entity.targetId;
+    }
+    return { x: entity.x < L ? R + 25 : L - 25, y: entity._detourBridge };  // 对岸桥头稍出岸：一过河界改道条件即消失
+}
+
+/** 🌊 测试双人（本机）岸边排斥框+桥面约束（detect220）：地面单位进入河道两侧框带（岸线±22）→ 向岸推回；
+ *  桥面走廊内 y 向中心线夹紧（防 applySeparation 挤桥时把队友挤偏落水）。穿过整条框带落入水域核心的
+ *  （只可能来自钩拉/击退/挤压等不经 moveToward 的位移）由主循环 checkRiverDrown 溺亡 */
+function riverGuardPush(entity, deltaSec) {
+    const L = MODE_TEST_RIVER_LEFT, R = MODE_TEST_RIVER_RIGHT, G = MODE_TEST_RIVER_GUARD;
+    const onBridge = MODE_TEST_BRIDGE_YS.some(by => Math.abs(entity.y - by) <= MODE_TEST_BRIDGE_HALF);
+    if (!onBridge) {
+        if (entity.x >= L - G && entity.x <= L + G) {
+            entity.x -= MODE_TEST_RIVER_PUSH * deltaSec;      // 左框带 → 推回西岸
+        } else if (entity.x >= R - G && entity.x <= R + G) {
+            entity.x += MODE_TEST_RIVER_PUSH * deltaSec;      // 右框带 → 推回东岸
+        }
+    }
+    // 桥面约束：桥段 x 范围内、贴近桥走廊（|y-桥心|≤44）的单位 y 夹紧到 ±28（走廊30内，视觉走在桥面上）
+    if (entity.x > L - 12 && entity.x < R + 12) {
+        for (const by of MODE_TEST_BRIDGE_YS) {
+            if (Math.abs(entity.y - by) <= MODE_TEST_BRIDGE_HALF + 14) {
+                entity.y = Math.max(by - 28, Math.min(by + 28, entity.y));
+                break;
+            }
+        }
+    }
+}
+
+/** 🌊 测试双人（本机）落水判定（detect220，主循环每帧、冻结判定前）：地面单位身处水域核心（穿过整条排斥框带）
+ *  → 溺亡：hp=0 走统一死亡清理（亡语/死亡召唤/灵魂升级照常，与其他死法一致）+ 水花飞溅特效。
+ *  无视护盾（落水非伤害）；冻结单位同样判定（在河里冻着也是在水里）；空中/非部队豁免 */
+function checkRiverDrown(e) {
+    if (!game.shrink220 || e.flying || e.type !== 'troop') return;
+    const L = MODE_TEST_RIVER_LEFT, R = MODE_TEST_RIVER_RIGHT, G = MODE_TEST_RIVER_GUARD;
+    if (e.x > L + G && e.x < R - G
+        && MODE_TEST_BRIDGE_YS.every(by => Math.abs(e.y - by) > MODE_TEST_BRIDGE_HALF)) {
+        e.hp = 0;
+        spawnWaterSplash(e.x, e.y);
+    }
+}
+
+/** 🌊 水花飞溅特效（落水溺亡；clawEffects 同款模式：update 生成+衰减，render 只读绘制）。
+ *  水滴参数确定性生成（零随机，联机两端一致） */
+function spawnWaterSplash(x, y) {
+    const drops = [];
+    for (let i = 0; i < 7; i++) {
+        drops.push({ a: -Math.PI / 2 + (i - 3) * 0.42, sp: 80 + (i % 3) * 30 });
+    }
+    (game.splashFX = game.splashFX || []).push({ x, y, timer: MODE_TEST_SPLASH_T, maxTimer: MODE_TEST_SPLASH_T, drops });
 }
 
 /** 🦔 反甲：攻击者在75px范围内攻击反甲巨人时，受到35伤害并眩晕0.5秒 */

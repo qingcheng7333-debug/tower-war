@@ -35,6 +35,18 @@ const NET_SYNC_DELAY_TICKS = 18;   // ≈600ms 延迟缓冲（联机两端一致
 let NET_CMD_SEQ = 0;
 let NET_PENDING_EXEC = [];
 
+// ---- INPUT 帧兼容层（第一阶段只确认/诊断，不执行 commands）----
+let NET_LOCAL_INPUTS = new Map();
+let NET_REMOTE_INPUTS = new Map();
+let NET_INPUT_SEQ = 0;
+let NET_REMOTE_INPUT_SEQ = new Set();
+let NET_MAX_REMOTE_INPUT_SEQ = 0;
+let NET_LAST_INPUT_TICK = -1;
+let NET_REMOTE_INPUT_TICK = -1;
+let NET_CONFIRMED_TICK = -1;
+let NET_REMOTE_CONFIRMED_TICK = -1;
+
+
 // ---- Lockstep 等待/校验（防画面分叉）----
 let NET_REMOTE_TICK = -1;          // 对手最新已确认逻辑帧（SYNC 心跳携带；-1 = 尚未收到）
 let NET_LAST_CMD_TICK = -1;        // 对手最新已下达指令的 genTick（远端无指令时判断「对手已确认到此帧」的依据）
@@ -108,6 +120,15 @@ function resetSessionState() {
     NET_OPP_DECK = [];
     NET_PENDING_EXEC = [];
     NET_REMOTE_SEQ = new Set();
+    NET_LOCAL_INPUTS = new Map();
+    NET_REMOTE_INPUTS = new Map();
+    NET_INPUT_SEQ = 0;
+    NET_REMOTE_INPUT_SEQ = new Set();
+    NET_LAST_INPUT_TICK = -1;
+    NET_REMOTE_INPUT_TICK = -1;
+    NET_CONFIRMED_TICK = -1;
+    NET_REMOTE_CONFIRMED_TICK = -1;
+    NET_MAX_REMOTE_INPUT_SEQ = 0;
     NET_REMOTE_TICK = -1;
     NET_LAST_CMD_TICK = -1;
     NET_FREEZE_SINCE_MS = 0;
@@ -245,6 +266,7 @@ function onNetMessage(data, fromPeerId) {
         case 'LOBBY_READY': onNetLobbyReady(data); break;
         case 'GAME_START':  onNetGameStart(data); break;
         case 'CMD':         onRemoteCommand(data); break;
+        case 'INPUT':       onRemoteInput(data); break;
         case 'SYNC':        onNetSync(data); break;
         case 'LEAVE':       onNetPeerLost('对方已离开房间'); break;
         default: break;
@@ -358,6 +380,15 @@ function beginOnlineBattle(msg, isHost) {
     NET_CMD_SEQ = 0;
     NET_PENDING_EXEC = [];
     NET_REMOTE_SEQ = new Set();
+    NET_LOCAL_INPUTS = new Map();
+    NET_REMOTE_INPUTS = new Map();
+    NET_INPUT_SEQ = 0;
+    NET_REMOTE_INPUT_SEQ = new Set();
+    NET_LAST_INPUT_TICK = -1;
+    NET_REMOTE_INPUT_TICK = -1;
+    NET_CONFIRMED_TICK = -1;
+    NET_REMOTE_CONFIRMED_TICK = -1;
+    NET_MAX_REMOTE_INPUT_SEQ = 0;
     NET_REMOTE_TICK = -1;
     NET_LAST_CMD_TICK = -1;
     NET_FREEZE_SINCE_MS = 0;
@@ -391,6 +422,7 @@ function queueCommand(cmd) {
     const seq = ++NET_CMD_SEQ;
     const fullCmd = { ...cmd, team };
     scheduleNetExec(fullCmd, genTick + NET_SYNC_DELAY_TICKS, seq, team);
+    recordLocalInputCommand(genTick, fullCmd);
     sendNet({ type: 'CMD', genTick, seq, cmd: fullCmd });
     return true;
 }
@@ -416,6 +448,102 @@ function onRemoteCommand(data) {
     NET_REMOTE_SEQ.add(seq);
     if (genTick > NET_LAST_CMD_TICK) NET_LAST_CMD_TICK = genTick;
     scheduleNetExec(data.cmd, genTick + NET_SYNC_DELAY_TICKS, seq, team);
+}
+
+function isValidInputCommand(cmd, team) {
+    if (!cmd || typeof cmd !== 'object' || typeof cmd.type !== 'string') return false;
+    if (cmd.team !== team) return false;
+    if (cmd.type === 'DEPLOY') {
+        return typeof cmd.cardId === 'string' && Number.isFinite(cmd.x) && Number.isFinite(cmd.y);
+    }
+    if (cmd.type === 'SKILL') return typeof cmd.skillKey === 'string';
+    return false;
+}
+
+function pruneInputFrames() {
+    // confirmed 未锚定时（-1）没有 prune 下限，用当前 tick 兜底，防止 Map 无界增长
+    const minTick = Math.max(
+        NET_CONFIRMED_TICK - NET_INPUT_KEEP_TICKS,
+        game.tick - (NET_INPUT_KEEP_TICKS + NET_INPUT_FUTURE_TICKS),
+        0
+    );
+    for (const tick of NET_LOCAL_INPUTS.keys()) if (tick < minTick) NET_LOCAL_INPUTS.delete(tick);
+    for (const tick of NET_REMOTE_INPUTS.keys()) if (tick < minTick) NET_REMOTE_INPUTS.delete(tick);
+    if (NET_REMOTE_INPUT_SEQ.size > 2048) {
+        // seq 集合属于远端命名空间，用远端已见最大 seq 兜底裁剪（不能错用本地 NET_INPUT_SEQ）
+        const keepFrom = Math.max(0, NET_MAX_REMOTE_INPUT_SEQ - 2048);
+        NET_REMOTE_INPUT_SEQ = new Set([...NET_REMOTE_INPUT_SEQ].filter(seq => seq >= keepFrom));
+    }
+}
+
+function updateConfirmedInputTick() {
+    // 锚定：confirmed 从 -1 起步时，取双方都存在的最早 tick 作为确认起点。
+    // 应对重连/中途重置后起步 tick 非 0 的情况，确认进度不再卡死在 -1。
+    if (NET_CONFIRMED_TICK < 0) {
+        for (const t of NET_LOCAL_INPUTS.keys()) {
+            if (NET_REMOTE_INPUTS.has(t)) { NET_CONFIRMED_TICK = t - 1; break; }
+        }
+    }
+    while (NET_LOCAL_INPUTS.has(NET_CONFIRMED_TICK + 1) &&
+           NET_REMOTE_INPUTS.has(NET_CONFIRMED_TICK + 1)) {
+        NET_CONFIRMED_TICK++;
+    }
+    pruneInputFrames();
+}
+
+// ---- 本地 INPUT 帧生命周期：记录 → 封存（唯一发送点）----
+// 记录阶段只写本地 Map，不发送、不定 seq；flushLocalInputFrame 在 canAdvanceTick()
+// 推进前封存：分配唯一 seq、一次性发送，之后该帧不可变。
+// 这样「同 tick 多条指令 / 空帧」都恰好发出一帧，远端无需「同 tick 替换」语义。
+
+/** 记录本 tick 的一条本地指令（由 queueCommand 调用；只记录，不发送） */
+function recordLocalInputCommand(tick, cmd) {
+    if (!isOnlineMode() || !Number.isInteger(tick) || tick < 0) return;
+    if (!isValidInputCommand(cmd, myOnlineTeam())) return;
+    let frame = NET_LOCAL_INPUTS.get(tick);
+    if (!frame) {
+        frame = { type: 'INPUT', tick, seq: 0, commands: [], sent: false };
+        NET_LOCAL_INPUTS.set(tick, frame);
+    }
+    if (frame.sent) return;                  // 异常路径：帧已封存则不追加，保证已发帧不可变
+    if (frame.commands.length >= 32) return; // 与远端校验上限一致
+    frame.commands.push({ ...cmd, team: myOnlineTeam() });
+}
+
+/** 封存并提交 tick 的本地 INPUT 帧（含空帧）；每 tick 只发送一次 */
+function flushLocalInputFrame(tick) {
+    if (!isOnlineMode() || !Number.isInteger(tick) || tick < 0) return;
+    let frame = NET_LOCAL_INPUTS.get(tick);
+    if (!frame) {
+        frame = { type: 'INPUT', tick, seq: 0, commands: [], sent: false };
+        NET_LOCAL_INPUTS.set(tick, frame);
+    }
+    if (frame.sent) return;
+    frame.sent = true;
+    frame.seq = ++NET_INPUT_SEQ;             // 封存时才分配 seq：每次传输必有唯一 seq
+    NET_LAST_INPUT_TICK = Math.max(NET_LAST_INPUT_TICK, tick);
+    sendNet({ type: 'INPUT', tick: frame.tick, seq: frame.seq, commands: frame.commands });
+    updateConfirmedInputTick();
+}
+
+/** 远端 INPUT 帧到达：校验 + 去重 + 记录（第一阶段只做确认/诊断，不执行 commands） */
+function onRemoteInput(data) {
+    if (!isOnlineMode() || !Number.isInteger(data.tick) || !Number.isInteger(data.seq) ||
+        data.seq <= 0 || !Array.isArray(data.commands)) return;
+    const minTick = Math.max(0, game.tick - NET_INPUT_PAST_TICKS); // 允许 tick 0，确认链从开局对称推进
+    if (data.tick < minTick || data.tick > game.tick + NET_INPUT_FUTURE_TICKS ||
+        NET_REMOTE_INPUT_SEQ.has(data.seq) || NET_REMOTE_INPUTS.has(data.tick)) return;
+    const team = oppOnlineTeam();
+    if (!team || data.commands.length > 32 ||
+        data.commands.some(cmd => !isValidInputCommand(cmd, team))) return;
+    NET_REMOTE_INPUT_SEQ.add(data.seq);
+    if (data.seq > NET_MAX_REMOTE_INPUT_SEQ) NET_MAX_REMOTE_INPUT_SEQ = data.seq;
+    NET_REMOTE_INPUTS.set(data.tick, {
+        type: 'INPUT', tick: data.tick, seq: data.seq,
+        commands: data.commands.map(cmd => ({ ...cmd, team }))
+    });
+    NET_REMOTE_INPUT_TICK = Math.max(NET_REMOTE_INPUT_TICK, data.tick);
+    updateConfirmedInputTick();
 }
 
 function scheduleNetExec(cmd, execTick, seq, team) {
@@ -466,14 +594,18 @@ function isOnlineMode() { return NET_ENABLED && game.gameMode === 'online'; }
 /* ================================================================
  * 🔒 Lockstep 门控：canAdvanceTick()
  * 本帧是否允许推进逻辑（main.js 主循环每 tick 调用一次）。
- * 原理：只要「本端 tick 还没超过对手已确认的进展帧」，就安全。
+ * 原理：正常情况下按固定输入延迟推进；只有已知的远程指令到期仍未到达时等待。
  *   - 有远端指令排程时：需 tick < 队列中最早 execTick（该指令前的帧不受它影响）；
- *   - 无远端指令时：需 tick <= NET_REMOTE_TICK + 缓冲（心跳确认对手已推进到此）。
- * 若对手断线/卡死 3 秒无任何进展 → 放弃等待，按断线处理。
+ *   - 无远端指令时：允许继续推进，SYNC 不参与正常推进门控。
+ * 若远程指令到期后 3 秒仍未到达 → 放弃等待，按断线处理。
  * 单机模式恒 true。
  * ================================================================ */
 function canAdvanceTick() {
     if (!isOnlineMode()) return true;
+    // INPUT 帧封存点：即将推进本 tick，本地输入不再变化 → 在此统一提交（含空帧）。
+    // 只作观测/确认数据，不参与执行路径；放在 tick<10 早退之前，保证从 tick 0 起每帧都有 INPUT。
+    flushLocalInputFrame(game.tick);
+
     // 开局前 10 帧不设卡（等待双方 resetGame 完成与首轮 SYNC 交换）
     if (game.tick < 10) return true;
 
@@ -490,21 +622,9 @@ function canAdvanceTick() {
         }
         return false;
     }
-
-    // 2) 无对手指令排程：看对手心跳确认的进展
-    //    对手已推进到 NET_REMOTE_TICK，再给 NET_SYNC_DELAY_TICKS 缓冲帧
-    const remoteLimit = NET_REMOTE_TICK + NET_SYNC_DELAY_TICKS;
-    if (game.tick <= remoteLimit) return true;
-
-    // 3) 超出对手确认进展+缓冲：冻结等待心跳。累计 3 秒无进展 → 断线处理
-    if (NET_FREEZE_SINCE_MS === 0) NET_FREEZE_SINCE_MS = Date.now();
-    else if (Date.now() - NET_FREEZE_SINCE_MS >= NET_FREEZE_TIMEOUT_MS) {
-        NET_FREEZE_SINCE_MS = 0;
-        const cb = NET_CB_ON_DISCONNECT;
-        cleanupNetSession(false);
-        if (cb) cb('等待对手超时，连接已断开');
-    }
-    return false;
+    // 2) 没有到期的远程指令时，不再用 SYNC tick 限制正常推进。
+    //    SYNC 只负责连接监控/哈希校验；以心跳到达间隔作为推进门控会造成周期性卡顿。
+    return true;
 }
 
 /** 主循环每帧调用（rAF 驱动，与逻辑帧解耦）：每 900ms 真实时间互发 SYNC 心跳 + 最近哈希 */
@@ -530,7 +650,13 @@ function onLogicTick() {
     const now = Date.now();
     if (now - NET_LAST_SYNC_MS < NET_SYNC_MS) return;
     NET_LAST_SYNC_MS = now;
-    const msg = { type: 'SYNC', tick: game.tick, lastCmdTick: NET_LAST_CMD_TICK };
+    const msg = {
+        type: 'SYNC',
+        tick: game.tick,
+        confirmedTick: NET_CONFIRMED_TICK,
+        lastInputTick: NET_LAST_INPUT_TICK,
+        lastCmdTick: NET_LAST_CMD_TICK
+    };
     // 附带最近 2 份哈希（[tick,hash] 数组）：覆盖两端推进速度差一档（落后一方）的情况
     if (NET_HASH_LOG.size > 0) {
         msg.hashes = [...NET_HASH_LOG.entries()].slice(-2);
@@ -562,6 +688,12 @@ function onNetSync(data) {
     if (data.tick > NET_REMOTE_TICK) {
         NET_REMOTE_TICK = data.tick;
         NET_FREEZE_SINCE_MS = 0;
+    }
+    if (Number.isInteger(data.confirmedTick) && data.confirmedTick > NET_REMOTE_CONFIRMED_TICK) {
+        NET_REMOTE_CONFIRMED_TICK = data.confirmedTick;
+    }
+    if (Number.isInteger(data.lastInputTick) && data.lastInputTick > NET_REMOTE_INPUT_TICK) {
+        NET_REMOTE_INPUT_TICK = data.lastInputTick;
     }
     if (Number.isInteger(data.lastCmdTick) && data.lastCmdTick > NET_LAST_CMD_TICK) {
         NET_LAST_CMD_TICK = data.lastCmdTick;
