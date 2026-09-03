@@ -67,24 +67,26 @@ function isFriendlyTroop(e, team) {
  *  - 默认0: 不扩展，仅己方半场
  *  - ≥1: 扩展到河界对岸
  *  - ≥2: 扩展到敌方堡垒虚线
+ *  - riverL/riverR: 河道左右边界（可选，默认标准河道；🧪测试双人（本机）传入缩窄河道 MODE_TEST_RIVER_*）
+ *  - aiBastionTopX: 敌方(AI)堡垒线 x（可选，默认标准 1200；🧪测试双人传入 MODE_TEST_AI_BASTION_TOP.x=1050，随整图缩窄）
  */
-function isInHalf(x, y, isPlayer, aiBastionsLost = 0, playerBastionsLost = 0) {
+function isInHalf(x, y, isPlayer, aiBastionsLost = 0, playerBastionsLost = 0, riverL = RIVER_LEFT, riverR = RIVER_RIGHT, aiBastionTopX = AI_BASTION_TOP.x) {
     if (x < 30 || x > W - 30 || y < 30 || y > H - 30) return false;
 
     if (isPlayer) {
-        let rightBoundary = RIVER_LEFT;
-        if (aiBastionsLost >= 2) rightBoundary = AI_BASTION_TOP.x;
-        else if (aiBastionsLost >= 1) rightBoundary = RIVER_RIGHT;
+        let rightBoundary = riverL;
+        if (aiBastionsLost >= 2) rightBoundary = aiBastionTopX;
+        else if (aiBastionsLost >= 1) rightBoundary = riverR;
 
         // 河道仅在边界未扩展过河时保持不可部署
-        if (rightBoundary <= RIVER_LEFT && x > RIVER_LEFT && x < RIVER_RIGHT) return false;
+        if (rightBoundary <= riverL && x > riverL && x < riverR) return false;
         return x < rightBoundary;
     } else {
-        let leftBoundary = RIVER_RIGHT;
+        let leftBoundary = riverR;
         if (playerBastionsLost >= 2) leftBoundary = PLAYER_BASTION_TOP.x;
-        else if (playerBastionsLost >= 1) leftBoundary = RIVER_LEFT;
+        else if (playerBastionsLost >= 1) leftBoundary = riverL;
 
-        if (leftBoundary >= RIVER_RIGHT && x > RIVER_LEFT && x < RIVER_RIGHT) return false;
+        if (leftBoundary >= riverR && x > riverL && x < riverR) return false;
         return x > leftBoundary;
     }
 }
@@ -92,9 +94,11 @@ function isInHalf(x, y, isPlayer, aiBastionsLost = 0, playerBastionsLost = 0) {
 /** 检查部署合法性（纯函数：所有可变状态均由调用方传入，不读写 game）
  *  - entities：实体列表（建筑重叠检测用），由调用方传入（如 game.entities）
  *  - aiBastionsLost / playerBastionsLost：堡垒摧毁数，决定可部署区边界扩展（默认 0=未丢堡）
+ *  - riverL/riverR：河道左右边界（可选，默认标准河道；🧪测试双人（本机）传入缩窄河道，透传给 isInHalf）
+ *  - aiBastionTopX：敌方(AI)堡垒线 x（可选，默认标准；🧪测试双人传入缩窄坐标，透传给 isInHalf）
  *  - 建筑类部署时额外检查：不能与其他已有建筑/堡垒/主塔重叠
  */
-function canDeployHere(cardId, team, x, y, entities, aiBastionsLost = 0, playerBastionsLost = 0) {
+function canDeployHere(cardId, team, x, y, entities, aiBastionsLost = 0, playerBastionsLost = 0, riverL = RIVER_LEFT, riverR = RIVER_RIGHT, aiBastionTopX = AI_BASTION_TOP.x) {
     const card = CARDS[cardId];
     if (!card) return false;
     if (x < 30 || x > W - 30 || y < 30 || y > H - 30) return false;
@@ -107,7 +111,7 @@ function canDeployHere(cardId, team, x, y, entities, aiBastionsLost = 0, playerB
         return true;
     }
     // 堡垒摧毁数由调用方传入，决定可部署区的边界扩展
-    if (!isInHalf(x, y, team === 'player', aiBastionsLost, playerBastionsLost)) return false;
+    if (!isInHalf(x, y, team === 'player', aiBastionsLost, playerBastionsLost, riverL, riverR, aiBastionTopX)) return false;
 
     // ★ 建筑类部署：检查是否与已有建筑/堡垒/主塔重叠
     if (card.type === 'tower' || card.type === 'barrack' || card.type === 'collector'

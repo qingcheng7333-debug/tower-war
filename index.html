@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
     <title>嘗試ゲーム · 双人塔防</title>
-        <link rel="stylesheet" href="css/style.css?v=20260831a1">
+        <link rel="stylesheet" href="css/style.css?v=20260903a01">
 </head>
 <body>
 <!-- ===== 主页 ===== -->
@@ -18,11 +18,18 @@
                 <button class="menu-btn" id="startGameBtn">🤖 经典人机（全卡）</button>
                 <button class="menu-btn" id="localMultiBtn">🎮 经典双人（本机）</button>
                 <button class="menu-btn" id="aiApiBtn">🤖 经典AI（LLM驱动）</button>
+                <button class="menu-btn" id="moreTestsBtn">▶ 更多后续（测试）</button>
+                <div class="menu-sublist" id="moreTestsList" style="display:none;">
+                    <button class="menu-btn menu-btn-sub" id="testTemplate1Btn" title="照抄经典双人（本机）：索敌收窄220/440 + 去除四个堡垒">🧪 测试模板1</button>
+                    <button class="menu-btn menu-btn-sub" disabled title="占位：测试模板后续填充">🧪 测试模板2</button>
+                    <button class="menu-btn menu-btn-sub" disabled title="占位：测试模板后续填充">🧪 测试模板3</button>
+                </div>
             </div>
             <div class="menu-column">
                 <div class="menu-column-title">✨ 创意模式</div>
-                <button class="menu-btn" id="bigMapBtn" disabled>🗺️ 大地图人机（全卡）</button>
-                <button class="menu-btn" id="siegeBtn" disabled>💣 攻城人机（全卡）</button>
+                <button class="menu-btn" id="bigMapBtn" disabled>🗺️ 大地图人机</button>
+                <button class="menu-btn" id="siegeBtn" disabled>💣 攻城人机</button>
+                <button class="menu-btn" id="testLocalMultiBtn" title="本机双人：索敌收窄220/440 + 整图缩窄河道地图（木桥行军）">🌊 河道地图</button>
                 <div class="menu-column-title menu-title-gap">🔗 联机模式</div>
                 <button class="menu-btn" id="multiplayerBtn">🔗 双人联机（全卡）</button>
                 <button class="menu-btn" id="multiplayerDeckBtn">🔗 双人联机（卡组）</button>
@@ -270,23 +277,23 @@
 </div>
 <!-- ===== JS 按依赖顺序加载 ===== -->
 <script src="https://vibe.lumigrav.space/sdk/v3/vibehub.js"></script>
-<script src="js/vibehubAdapter.js?v=20260831a1"></script>
-<script src="js/config.js?v=20260831a1"></script>
-<script src="個人データ.js?v=20260831a1"></script>
-<script src="js/gameState.js?v=20260831a1"></script>
-<script src="js/network.js?v=20260831a1"></script>
-<script src="js/utils.js?v=20260831a1"></script>
-<script src="js/entities.js?v=20260831a1"></script>
-<script src="js/ai配置/ai测试组.js?v=20260831a1"></script>
-<script src="js/ai配置/ai哥布林组.js?v=20260831a1"></script>
-<script src="js/ai配置/aiGEMINI组.js?v=20260831a1"></script>
-<script src="js/aiSelector.js?v=20260831a1"></script>
-<script src="js/apiAI.js?v=20260831a1"></script>
-<script src="js/update.js?v=20260831a1"></script>
-<script src="js/render.js?v=20260831a1"></script>
-<script src="js/ui.js?v=20260831a1"></script>
-<script src="js/deckManager.js?v=20260831a1"></script>
-<script src="js/main.js?v=20260831a1"></script>
+<script src="js/vibehubAdapter.js?v=20260903a01"></script>
+<script src="js/config.js?v=20260903a01"></script>
+<script src="個人データ.js?v=20260903a01"></script>
+<script src="js/gameState.js?v=20260903a01"></script>
+<script src="js/network.js?v=20260903a01"></script>
+<script src="js/utils.js?v=20260903a01"></script>
+<script src="js/entities.js?v=20260903a01"></script>
+<script src="js/ai配置/ai测试组.js?v=20260903a01"></script>
+<script src="js/ai配置/ai哥布林组.js?v=20260903a01"></script>
+<script src="js/ai配置/aiGEMINI组.js?v=20260903a01"></script>
+<script src="js/aiSelector.js?v=20260903a01"></script>
+<script src="js/apiAI.js?v=20260903a01"></script>
+<script src="js/update.js?v=20260903a01"></script>
+<script src="js/render.js?v=20260903a01"></script>
+<script src="js/ui.js?v=20260903a01"></script>
+<script src="js/deckManager.js?v=20260903a01"></script>
+<script src="js/main.js?v=20260903a01"></script>
 <!-- ===== 导出确认子界面（防止误触）===== -->
 </body>
 </html>
