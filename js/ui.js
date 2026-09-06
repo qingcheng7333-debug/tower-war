@@ -12,6 +12,13 @@ function clearCardSelection() {
     document.querySelectorAll('#topCardPanel .card-btn').forEach(b => b.classList.remove('selected'));
 }
 
+/** 清除指定队伍卡牌面板的选中高亮（player=下方面板，ai=上方面板）。
+ *  供烟引超时等非点击场景由 update.js 调用——新增 DOM 操作必须放 ui.js（基础框架 4.7：圣水 DOM 是唯一历史特例，不构成先例） */
+function clearCardPanelSelection(team) {
+    const panelSel = team === 'player' ? '#cardPanel .card-btn' : '#topCardPanel .card-btn';
+    document.querySelectorAll(panelSel).forEach(b => b.classList.remove('selected'));
+}
+
 /** 解析技能卡当前状态（镜像/精英）：返回 { mode, skill, cardName, cdLeft, skillKey, mirror } 或 null */
 function resolveSkillState(team, id) {
     const skills = team === 'ai' ? (game.eliteSkills.ai || {}) : (game.eliteSkills.player || {});
@@ -36,15 +43,16 @@ function isSkillCardState(team, id) {
     return !!(s && (s.mode === 'skill' || s.mode === 'used'));
 }
 
-/** 技能卡统一交互：单击=选中/取消（可取消，根治"失灵"），300ms内双击=释放技能；释放失败保留选中 */
-function handleSkillCardClick(id, btn, team, isDbl) {
+/** 技能卡统一交互（🕊️ 法术释放模式）：单击=选中/取消；选中后点击战场任意位置释放（handleMapDeployClick 分发到 castSelectedSkill）；
+ *  释放失败保留选中（可重试，或再单击卡牌取消） */
+function handleSkillCardClick(id, btn, team) {
     if (!canOperateTeam(team)) return; // 🔗 联机：只能操作己方阵营
     const s = resolveSkillState(team, id);
     if (!s) return;
     const selKey = team === 'ai' ? 'selectedCardId2' : 'selectedCardId';
     const panelSel = team === 'ai' ? '#topCardPanel .card-btn' : '#cardPanel .card-btn';
 
-    // 已释放：单击即提示（不进入选中/双击，保持原交互），同时清掉可能的残留选中
+    // 已释放：单击即提示（不进入选中），同时清掉可能的残留选中
     if (s.mode === 'used') {
         game.uiState._lastClick = null;
         if (game.uiState[selKey]) {
@@ -58,48 +66,64 @@ function handleSkillCardClick(id, btn, team, isDbl) {
     }
     if (s.mode !== 'skill') return;
 
-    // 双击 → 释放技能
-    if (isDbl) {
-        game.uiState._lastClick = null; // 无论成败都重置双击窗口，后续"再单击"即为取消
-        // 本体在场检查（部署延迟中/刚阵亡槽未恢复 → 准确提示，不误报圣水不足）
-        const unit = game.entities.find(e => e.cardId === (s.mirror ? s.skillKey.slice(7) : id)
-            && e.team === team && e.hp > 0 && !e.isCopy && (s.mirror ? e.isMirrored : !e.isMirrored));
-        if (!unit) {
-            showGameTip(`『${s.cardName}』尚未就绪…`);
-            return; // 保留选中
-        }
-        if (dispatchCommand({ type: 'SKILL', skillKey: s.skillKey, team })) {
-            // 释放成功：清除选中
-            game.uiState[selKey] = null;
-            document.querySelectorAll(panelSel).forEach(b => b.classList.remove('selected'));
-        } else if (s.cdLeft > 0) {
-            showGameTip(`『${s.skill.name}』冷却中 ${Math.ceil(s.cdLeft)}s`);
-        } else {
-            showGameTip(`圣水不足，无法释放『${s.skill.name}』`);
-        }
-        // 释放失败：保留选中（可再单击取消）
-        return;
-    }
-
     // 单击 → 选中 / 取消（两侧选中统一管理，杜绝"预览取消不掉"）
     if (game.uiState[selKey] === id) {
-        game.uiState._lastClick = null; // 取消后重置双击窗口
+        game.uiState._lastClick = null; // 取消后重置判定窗口
         game.uiState[selKey] = null;
         document.querySelectorAll(panelSel).forEach(b => b.classList.remove('selected'));
-        // ★ 引导提示：该技能卡靠"双击"释放（与全局黄色提示同款）
-        showGameTip('双击释放技能哦');
+        showGameTip('已取消技能选中');
     } else {
         game.uiState.selectedCardId = null;
         game.uiState.selectedCardId2 = null;
         document.querySelectorAll('#cardPanel .card-btn, #topCardPanel .card-btn').forEach(b => b.classList.remove('selected'));
         game.uiState[selKey] = id;
         btn.classList.add('selected');
+        // ★ 引导提示：技能卡已改为法术式交互（点战场任意位置释放，预览带全屏白框+⚠️）
+        showGameTip(`⚠️ 点击战场任意位置释放『${s.skill.name}』`);
     }
 }
 
-/** 根据模式渲染卡牌面板（全领=全部卡牌，卡组=只显示卡组中的牌） */
-function renderCardPanel(mode, deckCards) {
-    const panel = document.getElementById('cardPanel');
+/** 🕊️ 释放当前选中的技能卡（点战场任意位置触发，见 handleMapDeployClick）；失败保留选中可重试 */
+function castSelectedSkill(team, id, selKey, panelSel) {
+    const s = resolveSkillState(team, id);
+    if (!s) return;
+    game.uiState._lastClick = null;
+    if (s.mode === 'used') {
+        // 已用态残留选中：直接清掉
+        game.uiState[selKey] = null;
+        document.querySelectorAll(panelSel).forEach(b => b.classList.remove('selected'));
+        return;
+    }
+    if (s.mode !== 'skill') {
+        // 📖 精英在选中期间死亡 → 槽已恢复 deploy 态：清掉选中，避免残留成普通部署预览
+        game.uiState[selKey] = null;
+        document.querySelectorAll(panelSel).forEach(b => b.classList.remove('selected'));
+        return;
+    }
+    // 本体在场检查（部署延迟中/刚阵亡槽未恢复 → 准确提示，不误报圣水不足；📖靈克隆体不算真身）
+    const unit = game.entities.find(e => e.cardId === (s.mirror ? s.skillKey.slice(7) : id)
+        && e.team === team && e.hp > 0 && !e.isCopy && !e._spiritClone && (s.mirror ? e.isMirrored : !e.isMirrored));
+    if (!unit) {
+        showGameTip(`『${s.cardName}』尚未就绪…`);
+        return; // 保留选中
+    }
+    if (dispatchCommand({ type: 'SKILL', skillKey: s.skillKey, team })) {
+        // 释放成功：清除选中
+        game.uiState[selKey] = null;
+        document.querySelectorAll(panelSel).forEach(b => b.classList.remove('selected'));
+    } else if (s.cdLeft > 0) {
+        showGameTip(`『${s.skill.name}』冷却中 ${Math.ceil(s.cdLeft)}s`);
+    } else {
+        showGameTip(`圣水不足，无法释放『${s.skill.name}』`);
+    }
+}
+
+/** 按队伍渲染卡牌面板（team='player' 下方面板 / 'ai' 上方面板；mode：全领=全部卡牌，卡组=只显示卡组中的牌）。
+ *  ★ 原 renderCardPanel / renderTopCardPanel 是两份 ~95 行手抄面板，曾因不同步产生选中残留 bug（本机双人"隐形部署"），
+ *    现收敛为本函数，原函数名保留为单队包装（调用点零改动） */
+function renderCardPanelForTeam(team, mode, deckCards) {
+    const panel = document.getElementById(team === 'ai' ? 'topCardPanel' : 'cardPanel');
+    if (!panel) return;
     panel.innerHTML = '';
 
     // 决定显示哪些卡牌 ID
@@ -115,8 +139,13 @@ function renderCardPanel(mode, deckCards) {
         cardIds = getActiveDeckCards();
     }
 
+    const selKey = team === 'ai' ? 'selectedCardId2' : 'selectedCardId';       // 本队选中态键
+    const oppSelKey = team === 'ai' ? 'selectedCardId' : 'selectedCardId2';    // 对队选中态键
+    const ownPanelSel = team === 'ai' ? '#topCardPanel .card-btn' : '#cardPanel .card-btn';
+    const oppPanelSel = team === 'ai' ? '#cardPanel .card-btn' : '#topCardPanel .card-btn';
+
     // ★ 布局由CSS统一控制（flex-wrap + max-width放15张），不干预
-    
+
     cardIds.forEach(id => {
         const card = CARDS[id];
         if (!card) return; // 容错
@@ -145,51 +174,52 @@ function renderCardPanel(mode, deckCards) {
 
         btn.addEventListener('click', () => {
             if (game.gameOver) return;
-            if (!canOperateTeam('player')) return; // 🔗 联机：蓝方仅房主可操作
+            if (!canOperateTeam(team)) return; // 🔗 联机：只能操作己方阵营
 
-            // ★ 统一记录"上次点击"（技能卡双击判定用；点过其他卡/地图会覆盖，避免误判双击）
-            const now = Date.now();
-            const prev = game.uiState._lastClick;
-            game.uiState._lastClick = { id, isSkill: isSkillCardState('player', id), time: now };
-            const isDbl = !!(prev && prev.isSkill && prev.id === id && now - prev.time <= 300);
+            // ★ 统一记录"上次点击"（地图点击会打断判定窗口）
+            game.uiState._lastClick = { id, isSkill: isSkillCardState(team, id), time: Date.now() };
 
-            // 🕊️🪞 技能卡统一交互：单击=选中（可再单击取消），300ms内双击=释放技能
+            // 🕊️🪞 技能卡统一交互（法术释放模式）：单击=选中/取消，点战场任意位置释放
             //    （🧭 烟引 pending 中选技能卡：只收预览，pending 后台继续计时）
-            if (isSkillCardState('player', id)) {
-                handleSkillCardClick(id, btn, 'player', isDbl);
+            if (isSkillCardState(team, id)) {
+                handleSkillCardClick(id, btn, team);
                 return;
             }
 
             // ★ 冷却中的卡牌不可选中（镜像法术冷却来源特殊=继承被复制卡冷却，点击时给出提示避免"没反应"）
-            const cd = id === 'mirror' ? getMirrorCooldown('player') : ((game.cardCooldowns.player || {})[id] || 0);
+            const cd = id === 'mirror' ? getMirrorCooldown(team) : ((game.cardCooldowns[team] || {})[id] || 0);
             if (cd > 0) {
                 if (id === 'mirror') showGameTip(`镜像法术冷却中 ${Math.ceil(cd)}s`);
                 return;
             }
 
             // 🧭 烟引/镜像烟引 pending 中：点烟引卡或镜像卡 = 普通法术式 toggle（已选中时再点=放弃选中；pending 后台继续计时）
-            const pendingPlayer = id === 'mirror' ? getSmokePending('player', true) : getSmokePending('player', false);
-            if ((id === 'smoke_guide' || id === 'mirror') && pendingPlayer) {
-                if (game.uiState.selectedCardId === id) {
-                    game.uiState.selectedCardId = null;
-                    document.querySelectorAll('.card-btn').forEach(b => b.classList.remove('selected'));
+            const pending = id === 'mirror' ? getSmokePending(team, true) : getSmokePending(team, false);
+            if ((id === 'smoke_guide' || id === 'mirror') && pending) {
+                if (game.uiState[selKey] === id) {
+                    // 取消选中：只清本队面板视觉
+                    game.uiState[selKey] = null;
+                    document.querySelectorAll(ownPanelSel).forEach(b => b.classList.remove('selected'));
                 } else {
-                    game.uiState.selectedCardId = id;
-                    document.querySelectorAll('.card-btn').forEach(b => b.classList.remove('selected'));
+                    // 选中本队卡牌 → 取消对队选中（状态+视觉双向清空，防残留导致"隐形部署"）
+                    game.uiState[oppSelKey] = null;
+                    document.querySelectorAll(ownPanelSel + ',' + oppPanelSel).forEach(b => b.classList.remove('selected'));
+                    game.uiState[selKey] = id;
                     btn.classList.add('selected');
                 }
-                showGameTip(`🧭 烟引待放烟中（${Math.ceil(pendingPlayer.timer)}s），点击地图放烟`);
+                showGameTip(`🧭 烟引待放烟中（${Math.ceil(pending.timer)}s），点击地图放烟`);
                 return;
             }
 
-            if (game.uiState.selectedCardId === id) {
-                // 取消选中
-                game.uiState.selectedCardId = null;
-                document.querySelectorAll('.card-btn').forEach(b => b.classList.remove('selected'));
+            if (game.uiState[selKey] === id) {
+                // 取消选中：只清本队面板视觉
+                game.uiState[selKey] = null;
+                document.querySelectorAll(ownPanelSel).forEach(b => b.classList.remove('selected'));
             } else {
-                // 选中新卡牌（pending 中选其他卡：只收预览、pending 后台继续计时）
-                game.uiState.selectedCardId = id;
-                document.querySelectorAll('.card-btn').forEach(b => b.classList.remove('selected'));
+                // 选中新卡牌 → 取消对队选中（状态+视觉双向清空，与对队选卡分支对称）
+                game.uiState[oppSelKey] = null;
+                document.querySelectorAll(ownPanelSel + ',' + oppPanelSel).forEach(b => b.classList.remove('selected'));
+                game.uiState[selKey] = id;
                 btn.classList.add('selected');
             }
         });
@@ -198,102 +228,61 @@ function renderCardPanel(mode, deckCards) {
     });
 }
 
-/** 渲染上方（红方）卡牌面板 */
+/** 根据模式渲染卡牌面板（全领=全部卡牌，卡组=只显示卡组中的牌）——蓝方（下方面板） */
+function renderCardPanel(mode, deckCards) {
+    renderCardPanelForTeam('player', mode, deckCards);
+}
+
+/** 渲染上方（红方）卡牌面板——renderCardPanelForTeam 的红方包装 */
 function renderTopCardPanel(mode, deckCards) {
-    const panel = document.getElementById('topCardPanel');
-    if (!panel) return;
-    panel.innerHTML = '';
+    renderCardPanelForTeam('ai', mode, deckCards);
+}
 
-    let cardIds;
-    if (mode === 'classic') cardIds = CARD_IDS;
-    else if (Array.isArray(deckCards) && deckCards.length) cardIds = deckCards; // 🔗 联机：精确显示该方卡组
-    else cardIds = getActiveDeckCards();
+/** 🗺️ 地图点击部署：选中卡落子 / 烟引二段放烟 / 技能卡取消选中——蓝红两份手抄分支收敛于此。
+ *  team='player' 走 selectedCardId/#cardPanel，'ai' 走 selectedCardId2/#topCardPanel（与面板参数化同一套键） */
+function handleMapDeployClick(team, x, y) {
+    const selKey = team === 'ai' ? 'selectedCardId2' : 'selectedCardId';
+    const panelSel = team === 'ai' ? '#topCardPanel .card-btn' : '#cardPanel .card-btn';
+    const selectedId = game.uiState[selKey];
+    if (!selectedId) return;
 
-    cardIds.forEach(id => {
-        const card = CARDS[id];
-        if (!card) return;
-        if (isOnlineMode() && id === 'smoke_guide') return; // 🔗 联机：烟引暂禁用
-
-        const btn = document.createElement('div');
-        btn.className = 'card-btn';
-        btn.dataset.cardId = id;
-        // 根据卡牌类型加颜色分类（精锐=金色优先，其次法术/建筑/兵种）
-        if (card.category === 'elite') btn.classList.add('card-type-elite');
-        else if (card.type === 'spell') btn.classList.add('card-type-spell');
-        else if (card.type === 'tower' || card.type === 'barrack' || card.type === 'collector') btn.classList.add('card-type-building');
-        else btn.classList.add('card-type-troop');
-        btn.innerHTML = `<span class="card-cost">${card.cost}</span>${card.icon}<br>${card.name}`;
-
-        // ★ 镜像法术标记（红方）
-        if (id === 'mirror') {
-            btn.classList.add('card-mirror');
+    // 🧭 烟引：两段式引导交互（不走 deploy 常规路径）
+    //    镜像烟引 pending 中：镜像卡=「下烟」载体，点地图同样走放烟交互（不重复部署）
+    const _p = getSmokePending(team, selectedId === 'mirror');
+    if (selectedId === 'smoke_guide' || (selectedId === 'mirror' && _p)) {
+        handleSmokeGuideClick(team, x, y);
+        return;
+    }
+    // 🕊️ 技能卡选中时点地图 = 释放技能（法术式释放：单击选中 → 点战场任意位置释放，见 castSelectedSkill）
+    if (isSkillCardState(team, selectedId)) {
+        castSelectedSkill(team, selectedId, selKey, panelSel);
+        return;
+    }
+    if (dispatchCommand({ type: 'DEPLOY', team: team, cardId: selectedId, x: x, y: y })) {
+        // 🧭 烟引第一阶段（选范围套buff）部署成功后：保持选中烟引卡
+        //    → 预览无缝切换为「下烟」阶段（虚线箭头），继续放烟流程，无需重新点卡
+        if (game.uiState[selKey] !== 'smoke_guide') {
+            game.uiState[selKey] = null;
+            document.querySelectorAll(panelSel).forEach(b => b.classList.remove('selected'));
         }
-
-        // 冷却覆盖层
-        const cdOverlay = document.createElement('div');
-        cdOverlay.className = 'card-cooldown-overlay';
-        cdOverlay.textContent = '';
-        btn.appendChild(cdOverlay);
-
-        btn.addEventListener('click', () => {
-            if (game.gameOver) return;
-            if (!canOperateTeam('ai')) return; // 🔗 联机：红方仅加入者可操作
-
-            // ★ 统一记录"上次点击"（技能卡双击判定用；点过其他卡/地图会覆盖，避免误判双击）
-            const now = Date.now();
-            const prev = game.uiState._lastClick;
-            game.uiState._lastClick = { id, isSkill: isSkillCardState('ai', id), time: now };
-            const isDbl = !!(prev && prev.isSkill && prev.id === id && now - prev.time <= 300);
-
-            // 🕊️🪞 技能卡统一交互：单击=选中（可再单击取消），300ms内双击=释放技能
-            //    （🧭 烟引 pending 中选技能卡：只收预览，pending 后台继续计时）
-            if (isSkillCardState('ai', id)) {
-                handleSkillCardClick(id, btn, 'ai', isDbl);
-                return;
-            }
-
-            // 冷却判断（红方复用 ai 冷却槽；镜像法术冷却来源特殊=继承被复制卡冷却，点击时给出提示避免"没反应"）
-            const cd = id === 'mirror' ? getMirrorCooldown('ai') : ((game.cardCooldowns.ai || {})[id] || 0);
-            if (cd > 0) {
-                if (id === 'mirror') showGameTip(`镜像法术冷却中 ${Math.ceil(cd)}s`);
-                return;
-            }
-
-            // 🧭 烟引/镜像烟引 pending 中：点烟引卡或镜像卡 = 普通法术式 toggle（已选中时再点=放弃选中；pending 后台继续计时）
-            const pendingAi = id === 'mirror' ? getSmokePending('ai', true) : getSmokePending('ai', false);
-            if ((id === 'smoke_guide' || id === 'mirror') && pendingAi) {
-                if (game.uiState.selectedCardId2 === id) {
-                    game.uiState.selectedCardId2 = null;
-                    document.querySelectorAll('#topCardPanel .card-btn').forEach(b => b.classList.remove('selected'));
-                } else {
-                    // 选中红方烟引 → 取消蓝方选中
-                    game.uiState.selectedCardId = null;
-                    document.querySelectorAll('#cardPanel .card-btn').forEach(b => b.classList.remove('selected'));
-                    game.uiState.selectedCardId2 = id;
-                    document.querySelectorAll('#topCardPanel .card-btn').forEach(b => b.classList.remove('selected'));
-                    btn.classList.add('selected');
-                }
-                showGameTip(`🧭 烟引待放烟中（${Math.ceil(pendingAi.timer)}s），点击地图放烟`);
-                return;
-            }
-
-            if (game.uiState.selectedCardId2 === id) {
-                // 取消选中
-                game.uiState.selectedCardId2 = null;
-                document.querySelectorAll('#topCardPanel .card-btn').forEach(b => b.classList.remove('selected'));
-            } else {
-                // 选中红方卡牌 → 取消蓝方选中
-                game.uiState.selectedCardId = null;
-                document.querySelectorAll('#cardPanel .card-btn').forEach(b => b.classList.remove('selected'));
-                // 选中红方卡牌
-                game.uiState.selectedCardId2 = id;
-                document.querySelectorAll('#topCardPanel .card-btn').forEach(b => b.classList.remove('selected'));
-                btn.classList.add('selected');
-            }
-        });
-
-        panel.appendChild(btn);
-    });
+    } else {
+        // 部署失败：位置无效/屏障区/圣水不足保留选中方便直接重试；其余失败清空选中并提示，避免选中状态/预览残留造成"点了没反应/再次点击还是预览"
+        const failReason = game.uiState.deployFailReason;
+        game.uiState.deployFailReason = null;
+        if (failReason === 'elixir') {
+            // 💧 圣水不足：保留选中与预览，只弹提示——圣水攒够后点地图即可直接下卡（手感优化）
+            showGameTip('圣水不足，无法部署');
+        } else if (failReason !== 'position' && failReason !== 'barrier') {
+            game.uiState[selKey] = null;
+            document.querySelectorAll(panelSel).forEach(b => b.classList.remove('selected'));
+            if (failReason === 'invalid') showGameTip('无法部署：没有可复制的卡牌');
+            else if (failReason === 'cooldown') showGameTip('卡牌冷却中');
+            else if (failReason === 'temple_limit') showGameTip('己方最多同時存在1座神廟');
+            else showGameTip('部署失败');
+        } else if (failReason === 'barrier') {
+            showGameTip('🔮 敌方法术屏障笼罩该区域，无法释放法术');
+        }
+    }
 }
 
 /** 初始化 UI：绑定鼠标事件（卡牌面板由 renderCardPanel / renderTopCardPanel 单独渲染） */
@@ -317,88 +306,16 @@ function setupUI() {
         const x = (e.clientX - rect.left) * scaleX;
         const y = (e.clientY - rect.top) * scaleY;
 
-        // ★ 任何地图点击都会打断"技能卡双击"判定窗口（防止点完地图后误判双击释放）
+        // ★ 地图点击重置"上次点击"记录（技能释放/部署均以本次地图点击为准）
         game.uiState._lastClick = { id: null, isSkill: false, time: Date.now() };
 
-        // 优先蓝方（下方玩家；🔗 联机：仅房主可操作蓝方）
+        // 优先蓝方（下方玩家；🔗 联机：仅房主可操作蓝方），再红方（上方玩家；🔗 联机：仅加入者可操作红方）
         if (canOperateTeam('player') && game.uiState.selectedCardId) {
-            // 🧭 烟引：两段式引导交互（不走 deploy 常规路径）
-            //    镜像烟引 pending 中：镜像卡=「下烟」载体，点地图同样走放烟交互（不重复部署）
-            const _p = getSmokePending('player', game.uiState.selectedCardId === 'mirror');
-            if (game.uiState.selectedCardId === 'smoke_guide' || (game.uiState.selectedCardId === 'mirror' && _p)) {
-                handleSmokeGuideClick('player', x, y);
-                return;
-            }
-            // ★ 技能卡选中时点地图 = 取消选中（技能卡无需落子部署，且不残留预览）
-            if (isSkillCardState('player', game.uiState.selectedCardId)) {
-                game.uiState.selectedCardId = null;
-                document.querySelectorAll('#cardPanel .card-btn').forEach(b => b.classList.remove('selected'));
-                return;
-            }
-            if (dispatchCommand({ type: 'DEPLOY', team: 'player', cardId: game.uiState.selectedCardId, x, y })) {
-                // 🧭 烟引第一阶段（选范围套buff）部署成功后：保持选中烟引卡
-                //    → 预览无缝切换为「下烟」阶段（虚线箭头），继续放烟流程，无需重新点卡
-                if (game.uiState.selectedCardId !== 'smoke_guide') {
-                    game.uiState.selectedCardId = null;
-                    document.querySelectorAll('#cardPanel .card-btn').forEach(b => b.classList.remove('selected'));
-                }
-            } else {
-                // 部署失败：位置无效保留选中方便换位置；其余失败清空选中并提示，避免选中状态/预览残留造成"点了没反应/再次点击还是预览"
-                const failReason = game.uiState.deployFailReason;
-                game.uiState.deployFailReason = null;
-                if (failReason !== 'position' && failReason !== 'barrier') {
-                    game.uiState.selectedCardId = null;
-                    document.querySelectorAll('#cardPanel .card-btn').forEach(b => b.classList.remove('selected'));
-                    if (failReason === 'elixir') showGameTip('圣水不足，无法部署');
-                    else if (failReason === 'invalid') showGameTip('无法部署：没有可复制的卡牌或卡牌不可用');
-                    else if (failReason === 'cooldown') showGameTip('卡牌冷却中');
-                    else if (failReason === 'temple_limit') showGameTip('己方最多同時存在1座神廟');
-                    else showGameTip('部署失败');
-                } else if (failReason === 'barrier') {
-                    showGameTip('🔮 敌方法术屏障笼罩该区域，无法释放法术');
-                }
-            }
+            handleMapDeployClick('player', x, y);
             return;
         }
-
-        // 红方（上方玩家；🔗 联机：仅加入者可操作红方）
         if (canOperateTeam('ai') && game.uiState.selectedCardId2) {
-            // 🧭 烟引：两段式引导交互（红方双人模式同样支持）
-            //    镜像烟引 pending 中：镜像卡=「下烟」载体，点地图同样走放烟交互（不重复部署）
-            const _p = getSmokePending('ai', game.uiState.selectedCardId2 === 'mirror');
-            if (game.uiState.selectedCardId2 === 'smoke_guide' || (game.uiState.selectedCardId2 === 'mirror' && _p)) {
-                handleSmokeGuideClick('ai', x, y);
-                return;
-            }
-            // ★ 技能卡选中时点地图 = 取消选中（技能卡无需落子部署，且不残留预览）
-            if (isSkillCardState('ai', game.uiState.selectedCardId2)) {
-                game.uiState.selectedCardId2 = null;
-                document.querySelectorAll('#topCardPanel .card-btn').forEach(b => b.classList.remove('selected'));
-                return;
-            }
-            if (dispatchCommand({ type: 'DEPLOY', team: 'ai', cardId: game.uiState.selectedCardId2, x, y })) {
-                // 🧭 烟引第一阶段（选范围套buff）部署成功后：保持选中烟引卡
-                //    → 预览无缝切换为「下烟」阶段（虚线箭头），继续放烟流程，无需重新点卡
-                if (game.uiState.selectedCardId2 !== 'smoke_guide') {
-                    game.uiState.selectedCardId2 = null;
-                    document.querySelectorAll('#topCardPanel .card-btn').forEach(b => b.classList.remove('selected'));
-                }
-            } else {
-                // 部署失败：同上，清空选中并提示（位置无效保留选中）
-                const failReason = game.uiState.deployFailReason;
-                game.uiState.deployFailReason = null;
-                if (failReason !== 'position' && failReason !== 'barrier') {
-                    game.uiState.selectedCardId2 = null;
-                    document.querySelectorAll('#topCardPanel .card-btn').forEach(b => b.classList.remove('selected'));
-                    if (failReason === 'elixir') showGameTip('圣水不足，无法部署');
-                    else if (failReason === 'invalid') showGameTip('无法部署：没有可复制的卡牌或卡牌不可用');
-                    else if (failReason === 'cooldown') showGameTip('卡牌冷却中');
-                    else if (failReason === 'temple_limit') showGameTip('己方最多同時存在1座神廟');
-                    else showGameTip('部署失败');
-                } else if (failReason === 'barrier') {
-                    showGameTip('🔮 敌方法术屏障笼罩该区域，无法释放法术');
-                }
-            }
+            handleMapDeployClick('ai', x, y);
         }
     });
 
@@ -408,11 +325,13 @@ function setupUI() {
     });
 }
 
-/** 刷新上方（红方）卡牌冷却 */
-function refreshTopCardCooldowns() {
-    const panel = document.getElementById('topCardPanel');
+/** 刷新指定队伍卡牌面板的普通冷却（每帧由 update.js 调用；精英卡/镜像技能卡不在普通冷却体系内）。
+ *  ★ 原 refreshCardCooldowns / refreshTopCardCooldowns 成对手抄，且蓝方版用 '.card-btn' 把上方面板
+ *    也用蓝方冷却刷一遍、靠调用顺序被红方版纠正——现按队伍收敛为单实现，各自只刷本队面板 */
+function refreshCardCooldownsForTeam(team) {
+    const panel = document.getElementById(team === 'ai' ? 'topCardPanel' : 'cardPanel');
     if (!panel) return;
-    const cooldowns = game.cardCooldowns.ai || {};
+    const cooldowns = game.cardCooldowns[team] || {};
     panel.querySelectorAll('.card-btn').forEach(btn => {
         const id = btn.dataset.cardId;
         if (!id) return;
@@ -420,15 +339,15 @@ function refreshTopCardCooldowns() {
         if (card && card.activeSkill) return; // 🕊️ 精英卡冷却由 eliteSkills 管理，不走普通冷却
         if (btn.dataset.mirrorSkill) return;  // 🪞 镜像精英技能卡：冷却由镜像槽管理（技能冷却/已用在 updateSingleMirror 显示）
         // 🧭 烟引：pending 已结束（放烟/超时）但卡面仍被改写过 → 恢复原卡面
-        if (id === 'smoke_guide' && btn.dataset.smokePendingState && !getSmokePending('ai', false)) {
+        if (id === 'smoke_guide' && btn.dataset.smokePendingState && !getSmokePending(team, false)) {
             btn.dataset.smokePendingState = '';
             btn.innerHTML = `<span class="card-cost">${card.cost}</span>${card.icon}<br>${card.name}<span class="card-cooldown-overlay"></span>`;
         }
         const cd = cooldowns[id] || 0;
         const overlay = btn.querySelector('.card-cooldown-overlay');
         // 🧭 烟引 pending：卡面变「0费⬇️+倒计时」（非黑，无冷却覆盖层；倒计时实时刷新）
-        if (id === 'smoke_guide' && getSmokePending('ai', false)) {
-            const secs = Math.ceil(getSmokePending('ai', false).timer);
+        if (id === 'smoke_guide' && getSmokePending(team, false)) {
+            const secs = Math.ceil(getSmokePending(team, false).timer);
             if (btn.dataset.smokePendingState !== String(secs)) {
                 btn.dataset.smokePendingState = String(secs);
                 btn.innerHTML = `<span class="card-cost">0</span>⬇️<br>下烟 ${secs}s<span class="card-cooldown-overlay"></span>`;
@@ -441,7 +360,7 @@ function refreshTopCardCooldowns() {
         if (id === 'spell_barrier') {
             const costEl = btn.querySelector('.card-cost');
             if (costEl) {
-                const curCost = getCardCost('ai', id);
+                const curCost = getCardCost(team, id);
                 const shown = parseInt(costEl.textContent, 10);
                 if (!isNaN(shown) && shown !== curCost) costEl.textContent = curCost;
             }
@@ -454,6 +373,11 @@ function refreshTopCardCooldowns() {
             if (overlay) overlay.textContent = '';
         }
     });
+}
+
+/** 刷新上方（红方）卡牌冷却 */
+function refreshTopCardCooldowns() {
+    refreshCardCooldownsForTeam('ai');
 }
 
 /** 🕊️ 刷新精英技能卡牌状态（每帧由 refreshCardCooldowns 调用）：
@@ -625,7 +549,12 @@ function updateSingleMirror(selector, lastCardId, team) {
             // 技能卡：显示技能图标/名称/技能费，金色发光（保留 overlay 元素用于显示技能冷却秒数）
             // 🛕 技能费动态显示：镜像神庙神赐费用同样随使用哥布林卡递减（blessCost），其他精英回退卡牌基础费
             const mSkillCost = st.blessCost != null ? st.blessCost : origCard.activeSkill.cost;
-            mirrorBtn.innerHTML = `<span class="card-cost">${mSkillCost}</span><span class="card-icon">${origCard.activeSkill.icon}</span><br><span class="card-name">🪞${origCard.activeSkill.name}</span><span class="card-cooldown-overlay"></span>`;
+            // 🪞 状态未变化则跳过重写卡面：每帧重建 DOM 会吞掉 mousedown→mouseup 之间的点击（与精英卡 esState 同款守卫）
+            const faceKey = 'sk|' + mirrorCardId + '|' + st.mode + '|' + (st.skillCdLeft > 0 ? Math.ceil(st.skillCdLeft) : 0) + '|' + mSkillCost;
+            if (mirrorBtn.dataset.mirrorFace !== faceKey) {
+                mirrorBtn.dataset.mirrorFace = faceKey;
+                mirrorBtn.innerHTML = `<span class="card-cost">${mSkillCost}</span><span class="card-icon">${origCard.activeSkill.icon}</span><br><span class="card-name">🪞${origCard.activeSkill.name}</span><span class="card-cooldown-overlay"></span>`;
+            }
             mirrorBtn.classList.add('card-skill-mode', 'mirror-active');
             const overlay = mirrorBtn.querySelector('.card-cooldown-overlay');
             if (st.skillCdLeft > 0) {
@@ -635,7 +564,11 @@ function updateSingleMirror(selector, lastCardId, team) {
         } else if (st.mode === 'used') {
             // 已用：变黑
             const mSkillCostUsed = st.blessCost != null ? st.blessCost : origCard.activeSkill.cost;
-            mirrorBtn.innerHTML = `<span class="card-cost">${mSkillCostUsed}</span><span class="card-icon">✖</span><br><span class="card-name">已用</span><span class="card-cooldown-overlay"></span>`;
+            const faceKeyUsed = 'sk|' + mirrorCardId + '|used|0|' + mSkillCostUsed;
+            if (mirrorBtn.dataset.mirrorFace !== faceKeyUsed) {
+                mirrorBtn.dataset.mirrorFace = faceKeyUsed;
+                mirrorBtn.innerHTML = `<span class="card-cost">${mSkillCostUsed}</span><span class="card-icon">✖</span><br><span class="card-name">已用</span><span class="card-cooldown-overlay"></span>`;
+            }
             mirrorBtn.classList.add('card-skill-used', 'mirror-active');
         }
         mirrorBtn.dataset.mirrorSkill = mirrorCardId;
@@ -645,13 +578,14 @@ function updateSingleMirror(selector, lastCardId, team) {
 
     if (lastCardId && lastCardId !== 'mirror' && CARDS[lastCardId]) {
         const origCard = CARDS[lastCardId];
-        // 🔮 镜像复制屏障：费用跟随屏障动态费用+1（屏障6→镜像7，屏障8→镜像9）
-        const mirrorCost = (lastCardId === 'spell_barrier' ? getCardCost(team, 'spell_barrier') : origCard.cost) + 1;
+        // 🔮 镜像费用：公式统一走 getMirrorCost（屏障动态费用+1，与 deploy 扣费/联机预检共用）
+        const mirrorCost = getMirrorCost(team, lastCardId);
         // 🧭 镜像烟引 pending：镜像卡锁定「0费⬇️+倒计时」（非黑；放烟/超时后恢复普通镜像卡显示）
         if (lastCardId === 'smoke_guide' && getSmokePending(team, true)) {
             const secs = Math.ceil(getSmokePending(team, true).timer);
-            if (mirrorBtn.dataset.smokePendingState !== String(secs)) {
-                mirrorBtn.dataset.smokePendingState = String(secs);
+            mirrorBtn.dataset.smokePendingState = String(secs);
+            if (mirrorBtn.dataset.mirrorFace !== 'smoke|' + secs) {
+                mirrorBtn.dataset.mirrorFace = 'smoke|' + secs;
                 mirrorBtn.innerHTML = `<span class="card-cost">0</span>⬇️<br><span class="mirror-copied-name">下烟 ${secs}s</span><span class="card-cooldown-overlay"></span>`;
             }
             mirrorBtn.classList.add('mirror-active');
@@ -659,13 +593,22 @@ function updateSingleMirror(selector, lastCardId, team) {
             return;
         }
         mirrorBtn.dataset.smokePendingState = '';
-        mirrorBtn.innerHTML = `<span class="card-cost">${mirrorCost}</span>🪞<br><span class="mirror-copied-name">${origCard.name}</span><span class="card-cooldown-overlay"></span>`;
+        const faceKey = 'cp|' + lastCardId + '|' + mirrorCost;
+        if (mirrorBtn.dataset.mirrorFace !== faceKey) {
+            mirrorBtn.dataset.mirrorFace = faceKey;
+            mirrorBtn.innerHTML = `<span class="card-cost">${mirrorCost}</span>🪞<br><span class="mirror-copied-name">${origCard.name}</span><span class="card-cooldown-overlay"></span>`;
+        }
         mirrorBtn.classList.add('mirror-active');
         mirrorBtn.classList.remove('card-skill-mode', 'card-skill-used', 'card-skill-cd');
     } else {
         mirrorBtn.dataset.smokePendingState = '';
-        mirrorBtn.innerHTML = `<span class="card-cost">1</span>🪞<br>镜像法术<span class="card-cooldown-overlay"></span>`;
+        // 🪞 无复制目标：费用显示 ?（点击 deploy 会失败并提示，见 handleMapDeployClick）
+        if (mirrorBtn.dataset.mirrorFace !== 'none') {
+            mirrorBtn.dataset.mirrorFace = 'none';
+            mirrorBtn.innerHTML = `<span class="card-cost">?</span>🪞<br>镜像法术<span class="card-cooldown-overlay"></span>`;
+        }
         mirrorBtn.classList.remove('mirror-active', 'card-skill-mode', 'card-skill-used', 'card-skill-cd');
+        return;
     }
 }
 
@@ -673,48 +616,7 @@ function updateSingleMirror(selector, lastCardId, team) {
 function refreshCardCooldowns() {
     updateMirrorCardDisplay(); // 先更新镜像法术显示
     refreshEliteSkillCards();  // 🕊️ 精英主动技能：技能卡状态刷新（技能/已用/死亡冷却）
-    const cooldowns = game.cardCooldowns.player || {};
-    document.querySelectorAll('.card-btn').forEach(btn => {
-        const id = btn.dataset.cardId;
-        if (!id) return;
-        const card = CARDS[id];
-        if (card && card.activeSkill) return; // 🕊️ 精英卡冷却由 eliteSkills 管理，不走普通冷却
-        if (btn.dataset.mirrorSkill) return;  // 🪞 镜像精英技能卡：冷却由镜像槽管理（技能冷却/已用在 updateSingleMirror 显示）
-        // 🧭 烟引：pending 已结束（放烟/超时）但卡面仍被改写过 → 恢复原卡面
-        if (id === 'smoke_guide' && btn.dataset.smokePendingState && !getSmokePending('player', false)) {
-            btn.dataset.smokePendingState = '';
-            btn.innerHTML = `<span class="card-cost">${card.cost}</span>${card.icon}<br>${card.name}<span class="card-cooldown-overlay"></span>`;
-        }
-        const cd = cooldowns[id] || 0;
-        const overlay = btn.querySelector('.card-cooldown-overlay');
-        // 🧭 烟引 pending：卡面变「0费⬇️+倒计时」（非黑，无冷却覆盖层；倒计时实时刷新）
-        if (id === 'smoke_guide' && getSmokePending('player', false)) {
-            const secs = Math.ceil(getSmokePending('player', false).timer);
-            if (btn.dataset.smokePendingState !== String(secs)) {
-                btn.dataset.smokePendingState = String(secs);
-                btn.innerHTML = `<span class="card-cost">0</span>⬇️<br>下烟 ${secs}s<span class="card-cooldown-overlay"></span>`;
-            }
-            btn.classList.remove('on-cooldown');
-            return;
-        }
-        btn.dataset.smokePendingState = '';
-        // 🔮 法术屏障：动态费用显示（场上每多1座己方屏障费用+2）
-        if (id === 'spell_barrier') {
-            const costEl = btn.querySelector('.card-cost');
-            if (costEl) {
-                const curCost = getCardCost('player', id);
-                const shown = parseInt(costEl.textContent, 10);
-                if (!isNaN(shown) && shown !== curCost) costEl.textContent = curCost;
-            }
-        }
-        if (cd > 0) {
-            btn.classList.add('on-cooldown');
-            if (overlay) overlay.textContent = cd.toFixed(1) + 's';
-        } else {
-            btn.classList.remove('on-cooldown');
-            if (overlay) overlay.textContent = '';
-        }
-    });
+    refreshCardCooldownsForTeam('player');
 }
 
 /** 更新悬停实体检测（从 render.js 移入，符合"状态改变归 ui"原则） */

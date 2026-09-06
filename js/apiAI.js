@@ -30,6 +30,7 @@ let LLM_CONFIG = {
 // ---- 预设管理 ----
 
 const PRESET_STORAGE_KEY = 'towerwar_ai_presets';
+const PRESET_ACTIVE_KEY  = 'towerwar_active_preset_id';  // 当前选用预设 id（原 5 处字面量散落，收敛到此常量）
 const DEFAULT_PRESETS = [
     { id: 1, name: 'OpenAI',       apiKey: '', baseUrl: 'https://api.openai.com/v1',              proxyUrl: '', model: 'gpt-4o-mini' },
     { id: 2, name: '硅基流动',     apiKey: '', baseUrl: 'https://api.siliconflow.cn/v1',           proxyUrl: '', model: 'Qwen/Qwen2.5-7B-Instruct' },
@@ -47,7 +48,7 @@ function getPresets() {
     if (ud && Array.isArray(ud.presets) && ud.presets.length > 0) {
         setPresets(ud.presets); // 导入并持久化到浏览器本地，后续保存照常
         if (ud.activePresetId != null) {
-            try { localStorage.setItem('towerwar_active_preset_id', String(ud.activePresetId)); } catch (e2) { /* ignore */ }
+            try { localStorage.setItem(PRESET_ACTIVE_KEY, String(ud.activePresetId)); } catch (e2) { /* ignore */ }
             const active = ud.presets.find(p => String(p.id) === String(ud.activePresetId));
             if (active && !LLM_CONFIG.apiKey) {
                 LLM_CONFIG.apiKey   = (active.apiKey || '').trim();
@@ -86,7 +87,7 @@ function savePreset(preset) {
 /** 设置某个预设为激活状态 */
 function setActivePreset(id) {
     if (id === undefined || id === null) return;
-    localStorage.setItem('towerwar_active_preset_id', String(id));
+    localStorage.setItem(PRESET_ACTIVE_KEY, String(id));
 }
 
 /** 删除一个预设 */
@@ -106,12 +107,12 @@ function applyPreset(preset) {
     localStorage.setItem('towerwar_llm_base',  LLM_CONFIG.baseUrl);
     localStorage.setItem('towerwar_llm_proxy', LLM_CONFIG.proxyUrl);
     localStorage.setItem('towerwar_llm_model', LLM_CONFIG.model);
-    localStorage.setItem('towerwar_active_preset_id', String(preset.id));
+    localStorage.setItem(PRESET_ACTIVE_KEY, String(preset.id));
 }
 
 /** 获取当前激活的预设 ID */
 function getActivePresetId() {
-    return localStorage.getItem('towerwar_active_preset_id') || null;
+    return localStorage.getItem(PRESET_ACTIVE_KEY) || null;
 }
 
 /** 获取当前 LLM 配置（key 脱敏） */
@@ -217,7 +218,7 @@ function buildCardDescriptions(deckOnly = false) {
             if (c.desc) lines.push(`   - ${c.desc}`);
         } else if (c.type === 'tower') {
             lines.push(`   - HP：${c.hp}  |  攻击：${c.atk}  |  攻速：${c.atkSpeed}s`);
-            lines.push(`   - 射程：${c.range}${c.onlyGround ? '  |  只攻击地面单位' : '  |  对空对地'}`);
+            lines.push(`   - 射程：${c.range}${c.groundOnly ? '  |  只攻击地面单位' : '  |  对空对地'}`);
             if (c.splash) lines.push(`   - 溅射半径：${c.splash}（群体伤害）`);
             if (c.desc) lines.push(`   - ${c.desc}`);
         } else if (c.type === 'barrack') {
@@ -517,7 +518,7 @@ function fallbackDeployNear(cardId, baseX, baseY) {
         const x = Math.min(W - 30, Math.max(30, baseX + dx));
         const y = Math.min(H - 30, Math.max(30, baseY + dy));
         if (canDeployHere(cardId, 'ai', x, y, game.entities, game.bastionsLost.ai, game.bastionsLost.player)) {
-            deploy(cardId, 'ai', x, y);
+            dispatchCommand({ type: 'DEPLOY', team: 'ai', cardId: cardId, x: x, y: y });
             return true;
         }
     }
@@ -638,7 +639,7 @@ async function llmAiMakeDecision() {
             const y = Math.min(H - 30, Math.max(30, decision.y));
 
             if (canDeployHere(decision.cardId, 'ai', x, y, game.entities, game.bastionsLost.ai, game.bastionsLost.player)) {
-                deploy(decision.cardId, 'ai', x, y);
+                dispatchCommand({ type: 'DEPLOY', team: 'ai', cardId: decision.cardId, x: x, y: y });
             } else {
                 // 坐标不合法 → 就近偏移修正（只修坐标，不改决策）
                 fallbackDeployNear(decision.cardId, x, y);
@@ -656,7 +657,7 @@ async function llmAiMakeDecision() {
                     const x = Math.min(W - 30, Math.max(30, decision.x));
                     const y = Math.min(H - 30, Math.max(30, decision.y));
                     if (canDeployHere(decision.cardId, 'ai', x, y, game.entities, game.bastionsLost.ai, game.bastionsLost.player)) {
-                        deploy(decision.cardId, 'ai', x, y);
+                        dispatchCommand({ type: 'DEPLOY', team: 'ai', cardId: decision.cardId, x: x, y: y });
                     } else {
                         fallbackDeployNear(decision.cardId, x, y);
                     }
@@ -675,7 +676,7 @@ async function llmAiMakeDecision() {
 //  初始化：页面加载时恢复上次激活的预设
 // ===================================================================
 (function initActivePreset() {
-    const activeId = localStorage.getItem('towerwar_active_preset_id');
+    const activeId = localStorage.getItem(PRESET_ACTIVE_KEY);
     if (activeId) {
         try {
             const presets = JSON.parse(localStorage.getItem(PRESET_STORAGE_KEY) || '[]');

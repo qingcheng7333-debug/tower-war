@@ -151,7 +151,7 @@ canvas {
 /* ---- 卡牌面板 ---- */
 .card-panel {
     display: flex; flex-wrap: wrap; justify-content: center;
-    gap: 8px; margin-top: 15px; max-width: 1087px;
+    gap: 8px; margin-top: 15px; max-width: 1452px;
 }
 .card-btn {
     width: 65px; height: 90px; background: #e2e2e2; border-radius: 12px;

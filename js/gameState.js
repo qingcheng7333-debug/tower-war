@@ -4,7 +4,7 @@
 function createGameState(gameMode, detect220Flag, noBastionFlag) {
     return {
         gameMode: gameMode || 'classic',      // 'classic' | 'deck' | 'api' | 'local_multi' | 'online'
-        detect220: !!detect220Flag,           // 🧪 索敌收窄标记：true=发现锁敌收窄 220/飞行440（update.js 索敌类三处 gate：findTarget/火豆/出圈弃锁；由 resetGame(seed, true[, , true]) 传入；工厂重建后无法保留，必须开局显式传参）
+        detect220: !!detect220Flag,           // 🧪 索敌收窄标记：true=发现锁敌收窄 330/飞行440（update.js 索敌类三处 gate：findTarget/火豆/出圈弃锁；由 resetGame(seed, true[, , true]) 传入；工厂重建后无法保留，必须开局显式传参；detect220 为模式历史名，地面半径 v11.72 起=330）
         shrink220: !!detect220Flag && !noBastionFlag,  // 🧪 整图缩窄标记：true=测试双人（本机）缩窄图全套（W1400/窄河/桥/行军/排斥/改道/落水，地图类 gate 统一用它）；🧪测试模板1=索敌收窄但标准图 → false
         noBastion: !!noBastionFlag,           // 🧪 测试模板1：true=开局不创建四个堡垒（render 同步不画堡垒虚线；丢堡推进线因丢堡数恒0天然失效）
         // ── 阵营对称数据（联机前置：按 team 键索引；单机时 'ai' 键交给本地 AI 托管）──
@@ -13,7 +13,6 @@ function createGameState(gameMode, detect220Flag, noBastionFlag) {
         baseElixirRate: 1 / 2.8,
         elixirMultiplier: { player: 1.0, ai: 1.0 }, // 原 playerElixirMultiplier/aiElixirMultiplier
         bastionsLost: { player: 0, ai: 0 },         // 原 playerBastionsLost/aiBastionsLost
-        lastBastionPromptLevel: 0,  // 0=未提示 1=已提示1.2x 2=已提示1.4x
 
         entities: [],
         bombs: [],
@@ -27,7 +26,8 @@ function createGameState(gameMode, detect220Flag, noBastionFlag) {
         uiState: {
             selectedCardId: null,
             selectedCardId2: null,  // 双人模式 - 红方（上方玩家）选中卡牌
-            deployFailReason: null, // 最近一次 deploy 失败的简要原因：'elixir'|'position'|'cooldown'|'invalid'|'elite_used'
+            deployFailReason: null, // 最近一次 deploy 失败的简要原因：'elixir'|'position'|'cooldown'|'invalid'|'elite_used'|'barrier'|'temple_limit'
+            lastBastionPromptLevel: 0,  // 🗼 堡垒爆破提示等级（0=未提示 1=已提示1.2x 2=已提示1.4x）——纯本地 UI 提醒状态，归 uiState（2026-09 审计迁移：原在顶层，与 uiState 收纳规则矛盾）
             mouseX: 0,
             mouseY: 0,
             hoveredEntity: null,
@@ -43,6 +43,10 @@ function createGameState(gameMode, detect220Flag, noBastionFlag) {
         projectiles: [],    // 弹道：{ x, y, tx, ty, char, size, speed, timer }
         spellEffects: [],   // 法术特效：{ x, y, char, size, timer, maxTimer }
         dmgNumbers: [],     // 伤害飘字：{ x, y, amount, color, timer, maxTimer }
+        fishingLines: [],   // 🪝 渔夫鱼线（甩钩/吞拉）：{ id, ownerId, targetId, x, y, dx, dy, traveled, speed, lineLen, pulling }
+        clawEffects: [],    // 🐾 兽爪血痕/斩痕（全局特效层，渲染在实体之上）：{ x, y, dir, flip?, yomiSlash?, timer, maxTimer }
+        splashFX: [],       // 🌊 落水水花（溺亡特效）：{ x, y, timer, maxTimer, drops }
+        _fishingLineSeq: 0, // 🪝 鱼线 id 序号（fishingLines 配套计数，防止 id 撞车）
         yomiRealms: [],     // 🌑 黄泉·界域领域（固定位置，不随黄泉移动）：{ x, y, team, ownerId, timer, maxTimer, fading, fadeTimer }
         realmCasts: [],     // 🌑 黄泉·界域施法扩散特效：{ x, y, team, ownerId, timer, maxTimer, fading, fadeTimer }
         // ---- 部署延迟队列 ----
@@ -66,6 +70,12 @@ function createGameState(gameMode, detect220Flag, noBastionFlag) {
         // ---- 🤢 毒药法术·毒雾领域 ----
         poisonZones: [], // { x, y, radius, timer, maxTimer, team, dps, slowFactor, slowDuration, tickTimer, bubbleTimer, bubbles[] }
         hurricaneZones: [],  // { x, y, radius, timer, maxTimer, tickTimer, tickInterval, pullAndDamage } 飓风领域（持续牵引+每0.5s一跳伤害）
+        // ---- 📖 读书人·书灵技能 ----
+        windZones: [],         // 💨 风人风爆区 { x, y, radius, team, ownerId, timer, maxTimer, tickTimer }
+        snowTrails: [],        // ☃️ 雪人雪地轨迹 { x, y, radius, team, timer, maxTimer, tickTimer }（1s一跳6伤害+❄️减速）
+        windFields: [],        // 💨 风人·扩散风场 { ownerId, team, x, y, radius, timer, maxTimer, tickTimer, ticks }（跟随风人移动）
+        scholarClouds: [],     // 鎮：☁️雷云 { sx, sy(地面影子坐标), team, ownerId, targetId, timer, maxTimer, tickTimer } 云恒在影子正上方105px
+        scholarHurricanes: [], // 聚：小飓风 { x, y, radius, team, timer, maxTimer, tickTimer, dirAng, dirTimer }
         // ---- 🧭 烟引法术：pending 待放烟 + 活跃引导 ----
         // smokePending 与 mirrorSmokePending 分开，防止镜像烟引影响原烟引
         smokePending: { player: null, ai: null },
@@ -79,6 +89,11 @@ function createGameState(gameMode, detect220Flag, noBastionFlag) {
         rocketFlights: [], // { x, y, team, radius, damage, mul, timer, maxTimer, tx, ty, cloud }
         // ---- 🪵 滚木：竖直木头（长65px厚7px）横向滚动560px（法术影响范围：长560px×宽65px；只打地面不影响空中；沿途伤害+击退，每敌仅结算一次）----
         logRolls: [], // { x, y, dir, team, halfW, damage, knockback, speed, distance, logLength, logWidth, startX, hitIds:Set }
+        // ---- 🪨 投石人巨石：直线滚出105px（只打地面；沿途58伤害+20px击退，每敌仅结算一次）----
+        boulderRolls: [], // { x, y, dx, dy, team, ownerId, damage, knockback, speed, distance, traveled, radius, hitCount:{} }
+        // ---- 🪦 骷髅召唤：淡紫墓土范围持续9.1s，每0.7s随机破土一只骷髅（共13只，无伤害）----
+        skeletonSummonZones: [], // { x, y, radius, team, strikesLeft, interval, timer }
+        skeletonDigSpawns: [],   // { x, y, team, timer } 破土 pending：土堆隆起期满后兑现成骷髅实体
         // ---- 地震法术三段延迟伤害（持续3秒，对建筑10倍）----
         earthquakeStrikes: [], // { x, y, radius, team, damage, buildingMul, strikesLeft, interval, timer }
         // ---- 大雷电：三道落雷延迟结算（每0.5秒一道，锁定生命值最高者）----
@@ -261,24 +276,33 @@ function getBattleStateSnapshot() {
         bastionsLost: { player: g.bastionsLost.player, ai: g.bastionsLost.ai },
         lastDeployedCardId: g.lastDeployedCardId,
         lastDeployedCardId2: g.lastDeployedCardId2,
+        mirrorDeploySeq: g.mirrorDeploySeq,
         cardCooldowns: g.cardCooldowns,
         eliteSkills: g.eliteSkills,
         // 实体与部署队列
         entities: g.entities.map(e => ({ ...e })),
         deploying: g.deploying,
+        // 🧭 烟引 pending（核心战斗数据：getMirrorCopiedCard 靠它锁定镜像卡，联机同步必须带上）
+        smokePending: g.smokePending, mirrorSmokePending: g.mirrorSmokePending,
         // 特效队列（视觉一致性）
         projectiles: g.projectiles, spellEffects: g.spellEffects, dmgNumbers: g.dmgNumbers,
         lightningChains: g.lightningChains, deployLightnings: g.deployLightnings,
         deployEffects: g.deployEffects, pierceArrows: g.pierceArrows,
         speedZones: g.speedZones, rageZones: g.rageZones, freezeZones: g.freezeZones,
-        curseZones: g.curseZones, smokeGuides: g.smokeGuides,
-        poisonZones: g.poisonZones,
+        curseZones: g.curseZones, poisonZones: g.poisonZones,
+        hurricaneZones: g.hurricaneZones,
+        scholarClouds: g.scholarClouds, scholarHurricanes: g.scholarHurricanes,
+        windZones: g.windZones, windFields: g.windFields, snowTrails: g.snowTrails,
+        smokeGuides: g.smokeGuides,
         arrowRainStrikes: g.arrowRainStrikes, fireballFlights: g.fireballFlights,
-        rocketFlights: g.rocketFlights, logRolls: g.logRolls,
+        rocketFlights: g.rocketFlights, logRolls: g.logRolls, boulderRolls: g.boulderRolls,
+        skeletonSummonZones: g.skeletonSummonZones, skeletonDigSpawns: g.skeletonDigSpawns,
         earthquakeStrikes: g.earthquakeStrikes, thunderStrikes: g.thunderStrikes,
-        princeGuardSpawns: g.princeGuardSpawns, batSpawns: g.batSpawns,
+        princeGuardSpawns: g.princeGuardSpawns, jessieStakeSpawns: g.jessieStakeSpawns,
+        batSpawns: g.batSpawns,
         goblinBarrels: g.goblinBarrels, arrowRainFlights: g.arrowRainFlights,
         bombs: g.bombs, fishingLines: g.fishingLines,
+        clawEffects: g.clawEffects, splashFX: g.splashFX,
         yomiRealms: g.yomiRealms, realmCasts: g.realmCasts,
     };
 }

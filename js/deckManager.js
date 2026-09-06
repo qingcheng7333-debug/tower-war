@@ -57,7 +57,8 @@ function getActiveDeck() {
 // ---- 获取当前激活卡组的卡牌列表（返回 cardId 数组）----
 function getActiveDeckCards() {
     const deck = getActiveDeck();
-    return deck ? deck.cards : DEFAULT_DECK_CARDS;
+    // ⛔ 容错：localStorage 损坏导致 cards 缺失/非数组时回落默认卡组，避免 ui 层 .forEach 直接 TypeError
+    return (deck && Array.isArray(deck.cards)) ? deck.cards : DEFAULT_DECK_CARDS;
 }
 
 // ---- 初始化卡组：若无任何卡组则创建默认卡组 ----

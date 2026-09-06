@@ -50,11 +50,17 @@ let NET_REMOTE_CONFIRMED_TICK = -1;
 // ---- Lockstep 等待/校验（防画面分叉）----
 let NET_REMOTE_TICK = -1;          // 对手最新已确认逻辑帧（SYNC 心跳携带；-1 = 尚未收到）
 let NET_LAST_CMD_TICK = -1;        // 对手最新已下达指令的 genTick（远端无指令时判断「对手已确认到此帧」的依据）
-const NET_FREEZE_TIMEOUT_MS = 3000; // 连续冻结超 3 秒（真实时间）无对手进展 → 判定失联（冻结期逻辑帧不推进，不能用帧计数计时）
-const NET_SYNC_MS = 900;           // 每 900ms 真实时间互发一次 SYNC 心跳（与逻辑帧解耦：冻结期也能发）
+const NET_FREEZE_TIMEOUT_MS = 5000; // 连续冻结超 5 秒（真实时间）无对手进展 → 判定失联（冻结期逻辑帧不推进，不能用帧计数计时；配合 CMD 重发 + SDK 自动重连，覆盖短暂网络抖动）
+const NET_SYNC_MS = 900;           // 每 900ms 真实时间互发一次 SYNC 心跳（由 netRealtimeTick 定时器驱动，与 rAF/逻辑帧解耦：冻结期、页面隐藏时也能发）
+const NET_CMD_ACK_TIMEOUT_MS = 600; // CMD 发出后 600ms 未收到 CMD_ACK → 重发（对端按 seq 去重，幂等）
+const NET_REALTIME_TICK_MS = 300;  // 真实时间驱动定时器周期：CMD 重发检查 + SYNC 心跳
+const NET_TICK_SYNC_MARGIN = 12;   // INPUT 软门控缓冲：我方 tick 最多领先对手 INPUT 进度 12 帧（≈400ms）。
+                                   // 必须 < NET_SYNC_DELAY_TICKS(18)：错位上限 12 + 传输延迟 ≈2 帧 < 18 → 指令永不过期
 const NET_HASH_TICKS = 120;        // 每 120 逻辑帧（4s）记录一次状态哈希，用于分叉检测
-let NET_FREEZE_SINCE_MS = 0;       // 本轮连续冻结起始时刻（0=未冻结）；对手 SYNC 有进展即归零
+let NET_FREEZE_SINCE_MS = 0;       // 本轮连续冻结起始时刻（0=未冻结）；对手 INPUT 进展 / SYNC 进展即归零
 let NET_LAST_SYNC_MS = 0;          // 上次发送 SYNC 心跳的真实时间
+let NET_CMD_UNACKED = new Map();   // 已发送未确认的 CMD：seq → {msg, sentAt}（收到 CMD_ACK 或会话清理时移除）
+let NET_REALTIME_TIMER = null;     // 真实时间驱动定时器（CMD 重发 + SYNC 心跳），模块加载即常驻
 let NET_HASH_LOG = new Map();      // 本端哈希日志 tick → hash（收到对手哈希时比对）
 let NET_OPP_HASH = new Map();      // 对手最近哈希缓存 tick → hash（本端滞后时，等本端记到同 tick 再比对）
 let NET_DESYNC_WARNED = false;     // 分叉告警只提示一次，避免刷屏
@@ -131,6 +137,7 @@ function resetSessionState() {
     NET_MAX_REMOTE_INPUT_SEQ = 0;
     NET_REMOTE_TICK = -1;
     NET_LAST_CMD_TICK = -1;
+    NET_CMD_UNACKED.clear();
     NET_FREEZE_SINCE_MS = 0;
     NET_LAST_SYNC_MS = 0;
     NET_HASH_LOG = new Map();
@@ -266,6 +273,7 @@ function onNetMessage(data, fromPeerId) {
         case 'LOBBY_READY': onNetLobbyReady(data); break;
         case 'GAME_START':  onNetGameStart(data); break;
         case 'CMD':         onRemoteCommand(data); break;
+        case 'CMD_ACK':     onCmdAck(data); break;
         case 'INPUT':       onRemoteInput(data); break;
         case 'SYNC':        onNetSync(data); break;
         case 'LEAVE':       onNetPeerLost('对方已离开房间'); break;
@@ -281,6 +289,7 @@ function onNetPeerEvent(event) {
         if (NET_ROLE === 'client' && NET_STATE === 'joined') {
             sendNet({ type: 'HELLO', name: NET_MY_NAME, deck: NET_MY_DECK });
         }
+        flushUnackedCmds(); // 通道（重）建立 → 立即补发未确认 CMD（重连恢复场景），不等重发超时
         fireLobbyUpdate();
     } else if (event.type === 'connecting' || event.type === 'reconnecting') {
         NET_RECONNECTING = true;
@@ -391,6 +400,7 @@ function beginOnlineBattle(msg, isHost) {
     NET_MAX_REMOTE_INPUT_SEQ = 0;
     NET_REMOTE_TICK = -1;
     NET_LAST_CMD_TICK = -1;
+    NET_CMD_UNACKED.clear();
     NET_FREEZE_SINCE_MS = 0;
     NET_LAST_SYNC_MS = 0;
     NET_HASH_LOG = new Map();
@@ -423,13 +433,92 @@ function queueCommand(cmd) {
     const fullCmd = { ...cmd, team };
     scheduleNetExec(fullCmd, genTick + NET_SYNC_DELAY_TICKS, seq, team);
     recordLocalInputCommand(genTick, fullCmd);
-    sendNet({ type: 'CMD', genTick, seq, cmd: fullCmd });
+    const cmdMsg = { type: 'CMD', genTick, seq, cmd: fullCmd };
+    sendNet(cmdMsg);
+    // 登记未确认队列：600ms 内未收到 CMD_ACK 则由 netRealtimeTick 重发（对端按 seq 去重，幂等）
+    NET_CMD_UNACKED.set(seq, { msg: cmdMsg, sentAt: Date.now() });
+    return true;
+}
+
+/**
+ * 🔗 联机预检：指令入队前的轻量校验，只做"当场就能判定"的检查（卡牌存在/圣水/冷却/卡组限制），
+ * 让 ui 层的失败提示（deployFailReason → showGameTip）与失败处理逻辑在联机下也能生效——
+ * 此前联机 dispatchCommand 恒返回 true，选中被清、提示永不出现，校验全部后置到 +18 tick 执行端。
+ *
+ * 确定性安全（Lockstep 不变量）：预检只决定"指令是否发送"——
+ *   预检放行 → 两端在 +NET_SYNC_DELAY_TICKS 仍走 deploy()/castActiveSkill() 的完整校验，
+ *              任一端失败则两端同样失败（同 tick 同状态），不产生分叉；
+ *   预检拒绝 → 指令不发送，两端同样不执行，同样不分叉。
+ * 预检刻意不查部署位置/屏障庇护（状态在 +18 tick 内可能变化，避免误拒正常落点）。
+ */
+function precheckCommand(cmd) {
+    const team = cmd.team || myOnlineTeam();
+    if (cmd.type === 'DEPLOY') {
+        const cardId = cmd.cardId;
+        if (typeof cardId !== 'string' || !CARDS[cardId]) {
+            game.uiState.deployFailReason = 'invalid';
+            return false;
+        }
+        const elixir = game.elixir[team] || 0;
+        if (cardId === 'mirror') {
+            // 镜像法术：费用=被复制卡动态费用+1（公式统一走 getMirrorCost），复制对象不存在即无效
+            const lastId = getMirrorCopiedCard(team);
+            if (!lastId || !CARDS[lastId]) {
+                game.uiState.deployFailReason = 'invalid';
+                return false;
+            }
+            if (elixir < getMirrorCost(team, lastId)) {
+                game.uiState.deployFailReason = 'elixir';
+                return false;
+            }
+            if (getMirrorCooldown(team) > 0) {
+                game.uiState.deployFailReason = 'cooldown';
+                return false;
+            }
+            if (isCardLockedByDeck(team, 'mirror')) {
+                game.uiState.deployFailReason = 'invalid';
+                return false;
+            }
+            return true;
+        }
+        if (elixir < getCardCost(team, cardId)) {
+            game.uiState.deployFailReason = 'elixir';
+            return false;
+        }
+        if (((game.cardCooldowns[team] || {})[cardId] || 0) > 0) {
+            game.uiState.deployFailReason = 'cooldown';
+            return false;
+        }
+        if (isCardLockedByDeck(team, cardId)) {
+            game.uiState.deployFailReason = 'invalid';
+            return false;
+        }
+        return true;
+    }
+    if (cmd.type === 'SKILL') {
+        // 技能：槽位存在且处于技能态、技能冷却完毕、圣水足够（镜像槽 key='mirror_'+卡id，与 castActiveSkill 同协议）
+        const skillKey = cmd.skillKey;
+        if (typeof skillKey !== 'string') return false;
+        const realId = skillKey.indexOf('mirror_') === 0 ? skillKey.slice(7) : skillKey;
+        const card = CARDS[realId];
+        if (!card || !card.activeSkill) return false;
+        const st = (game.eliteSkills[team] || {})[skillKey];
+        if (!st || st.mode !== 'skill' || st.skillCdLeft > 0) return false;
+        const skillCost = (card.activeSkill.id === 'goblin_bless' && st.blessCost != null)
+            ? Math.max(1, st.blessCost)
+            : card.activeSkill.cost;
+        if ((game.elixir[team] || 0) < skillCost) return false;
+        return true;
+    }
     return true;
 }
 
 function dispatchCommand(cmd) {
     if (!cmd || typeof cmd !== 'object' || typeof cmd.type !== 'string') return false;
-    if (isOnlineMode()) return queueCommand(cmd);
+    if (isOnlineMode()) {
+        if (!precheckCommand(cmd)) return false; // 🔗 联机预检：当场可判定的失败即时反馈（确定性论证见函数头注释）
+        return queueCommand(cmd);
+    }
     switch (cmd.type) {
         case 'DEPLOY': return deploy(cmd.cardId, cmd.team, cmd.x, cmd.y);
         case 'SKILL': return castActiveSkill(cmd.skillKey, cmd.team);
@@ -440,7 +529,9 @@ function dispatchCommand(cmd) {
 function onRemoteCommand(data) {
     if (!isOnlineMode() || !data || !data.cmd || typeof data.cmd.type !== 'string') return;
     const seq = Number.isInteger(data.seq) ? data.seq : 0;
-    if (seq <= 0 || NET_REMOTE_SEQ.has(seq)) return;
+    if (seq <= 0) return;
+    sendNet({ type: 'CMD_ACK', seq }); // 收到即回执（重复 seq 也回，防 ACK 丢失导致发送方无限重发）
+    if (NET_REMOTE_SEQ.has(seq)) return; // 重发去重：同一 seq 的指令只入队一次
     const team = data.cmd.team;
     if (team !== oppOnlineTeam()) return;
     const genTick = Number.isInteger(data.genTick) ? data.genTick : -1;
@@ -473,6 +564,15 @@ function pruneInputFrames() {
         // seq 集合属于远端命名空间，用远端已见最大 seq 兜底裁剪（不能错用本地 NET_INPUT_SEQ）
         const keepFrom = Math.max(0, NET_MAX_REMOTE_INPUT_SEQ - 2048);
         NET_REMOTE_INPUT_SEQ = new Set([...NET_REMOTE_INPUT_SEQ].filter(seq => seq >= keepFrom));
+    }
+    if (NET_REMOTE_SEQ.size > 2048) {
+        // CMD 重发去重集合同样只增不减：按已见最大 seq 保留最新段，防长局无界增长。
+        //   被裁掉的旧 seq 理论上存在"极旧 CMD 重发被再执行一次"的窗口，但该窗口远大于输入缓冲保留期，
+        //   实际由 onRemoteCommand 的 genTick 时界检查兜底（过期指令不入队）
+        let maxSeq = 0;
+        for (const seq of NET_REMOTE_SEQ) if (seq > maxSeq) maxSeq = seq;
+        const keepCmdFrom = Math.max(0, maxSeq - 2048);
+        NET_REMOTE_SEQ = new Set([...NET_REMOTE_SEQ].filter(seq => seq >= keepCmdFrom));
     }
 }
 
@@ -542,7 +642,10 @@ function onRemoteInput(data) {
         type: 'INPUT', tick: data.tick, seq: data.seq,
         commands: data.commands.map(cmd => ({ ...cmd, team }))
     });
-    NET_REMOTE_INPUT_TICK = Math.max(NET_REMOTE_INPUT_TICK, data.tick);
+    if (data.tick > NET_REMOTE_INPUT_TICK) {
+        NET_REMOTE_INPUT_TICK = data.tick;
+        NET_FREEZE_SINCE_MS = 0; // 对手 INPUT 有进展 → 冻结计时归零（INPUT 30Hz 粒度，比 SYNC 心跳更准）
+    }
     updateConfirmedInputTick();
 }
 
@@ -591,29 +694,40 @@ function executeNetCmd(cmd) {
 function setNetworkEnabled(v) { NET_ENABLED = !!v; }
 function isOnlineMode() { return NET_ENABLED && game.gameMode === 'online'; }
 
+/** 🔗 当前联机局是否为卡组模式（NET_MODE='deck'）；未联机时恒 false。
+ *  供 entities.js 的 isCardLockedByDeck 做联机卡组校验（卡组以 NET_MY_DECK/NET_OPP_DECK 为准） */
+function isOnlineDeckMode() {
+    return isOnlineMode() && NET_MODE === 'deck';
+}
+
 /* ================================================================
  * 🔒 Lockstep 门控：canAdvanceTick()
  * 本帧是否允许推进逻辑（main.js 主循环每 tick 调用一次）。
- * 原理：正常情况下按固定输入延迟推进；只有已知的远程指令到期仍未到达时等待。
- *   - 有远端指令排程时：需 tick < 队列中最早 execTick（该指令前的帧不受它影响）；
- *   - 无远端指令时：允许继续推进，SYNC 不参与正常推进门控。
- * 若远程指令到期后 3 秒仍未到达 → 放弃等待，按断线处理。
+ * 原理：以对手 INPUT 帧的实时进度做软门控 —— 我方 tick 最多领先对手
+ *   「最新已到达 INPUT tick」+ NET_TICK_SYNC_MARGIN 帧，超出即冻结等待。
+ *   - 对手正常推进时：INPUT 每 tick 实时到达，等待通常 <100ms，无感；
+ *   - 对手挂起/掉线时：INPUT 停 → 我方领先缓冲后冻结，5 秒无进展 → 断线。
+ * 价值：把两端 tick 错位钳制在缓冲帧内（< 指令延迟缓冲 18 帧），从源头杜绝
+ *   「tick 错位 → 指令过期 → 冻结死锁」——过期指令在 Lockstep 语义下既不能
+ *   立即执行（错 tick 执行 = 分叉）也不能等待（永远等不到正确 tick = 死锁）。
  * 单机模式恒 true。
  * ================================================================ */
 function canAdvanceTick() {
     if (!isOnlineMode()) return true;
     // INPUT 帧封存点：即将推进本 tick，本地输入不再变化 → 在此统一提交（含空帧）。
-    // 只作观测/确认数据，不参与执行路径；放在 tick<10 早退之前，保证从 tick 0 起每帧都有 INPUT。
+    // 放在 tick<10 早退之前，保证从 tick 0 起每帧都有 INPUT（对端确认链从开局对称推进）。
     flushLocalInputFrame(game.tick);
 
     // 开局前 10 帧不设卡（等待双方 resetGame 完成与首轮 SYNC 交换）
     if (game.tick < 10) return true;
 
-    // 1) 队列中有「对手阵营」的指令到期未执行 → 冻结等待（本地指令本地立即执行，无需等待）
-    //    若对手消息迟迟不到（卡死/掉线），累计冻结 3 秒 → 断线处理
-    const firstRemote = NET_PENDING_EXEC.find(e => e.team === oppOnlineTeam());
-    if (firstRemote && game.tick >= firstRemote.execTick) {
-        if (NET_FREEZE_SINCE_MS === 0) NET_FREEZE_SINCE_MS = Date.now();
+    // 软门控：领先对手 INPUT 进度超过缓冲 → 冻结等待（对手 INPUT 一到即恢复）。
+    // NET_REMOTE_INPUT_TICK = -1 表示尚未收到对手任何 INPUT（tick≥10 时理论必已到达，防御兜底）。
+    if (NET_REMOTE_INPUT_TICK >= 0 && game.tick >= NET_REMOTE_INPUT_TICK + NET_TICK_SYNC_MARGIN) {
+        if (NET_FREEZE_SINCE_MS === 0) {
+            NET_FREEZE_SINCE_MS = Date.now();
+            showGameTip('⏳ 正在等待对手同步…'); // 让玩家区分「在等」与「已断」
+        }
         else if (Date.now() - NET_FREEZE_SINCE_MS >= NET_FREEZE_TIMEOUT_MS) {
             NET_FREEZE_SINCE_MS = 0;
             const cb = NET_CB_ON_DISCONNECT;
@@ -622,15 +736,14 @@ function canAdvanceTick() {
         }
         return false;
     }
-    // 2) 没有到期的远程指令时，不再用 SYNC tick 限制正常推进。
-    //    SYNC 只负责连接监控/哈希校验；以心跳到达间隔作为推进门控会造成周期性卡顿。
+    // 未触发门控 → 正常推进。SYNC 心跳只负责连接监控/哈希校验，不参与推进门控。
     return true;
 }
 
-/** 主循环每帧调用（rAF 驱动，与逻辑帧解耦）：每 900ms 真实时间互发 SYNC 心跳 + 最近哈希 */
+/** 主循环每帧调用（rAF 驱动）：仅记录哈希日志；SYNC 心跳与 CMD 重发已迁至 netRealtimeTick（真实时间定时器，页面隐藏/掉帧时也保活） */
 function onLogicTick() {
     if (!isOnlineMode()) return;
-    // 1) 哈希日志：每 NET_HASH_TICKS 帧记录一份（冻结期 tick 不变不会重复记录）
+    // 哈希日志：每 NET_HASH_TICKS 帧记录一份（冻结期 tick 不变不会重复记录）
     if (game.tick > 0 && game.tick % NET_HASH_TICKS === 0 && !NET_HASH_LOG.has(game.tick)) {
         NET_HASH_LOG.set(game.tick, computeStateHash());
         // 反向比对：对手心跳先到（本端滞后）时，此刻补上延迟的比对
@@ -646,23 +759,57 @@ function onLogicTick() {
             NET_HASH_LOG.delete(oldest);
         }
     }
-    // 2) 心跳：真实时间驱动（冻结等待期也能发出，避免双方互相冻死）
-    const now = Date.now();
-    if (now - NET_LAST_SYNC_MS < NET_SYNC_MS) return;
-    NET_LAST_SYNC_MS = now;
-    const msg = {
-        type: 'SYNC',
-        tick: game.tick,
-        confirmedTick: NET_CONFIRMED_TICK,
-        lastInputTick: NET_LAST_INPUT_TICK,
-        lastCmdTick: NET_LAST_CMD_TICK
-    };
-    // 附带最近 2 份哈希（[tick,hash] 数组）：覆盖两端推进速度差一档（落后一方）的情况
-    if (NET_HASH_LOG.size > 0) {
-        msg.hashes = [...NET_HASH_LOG.entries()].slice(-2);
-    }
-    sendNet(msg);
 }
+
+/** 真实时间驱动定时器（300ms，模块常驻）：CMD 未确认重发 + SYNC 心跳。
+ *  与 rAF 解耦：页面隐藏/掉帧时浏览器仍以 ≥1s 节流调用本函数，心跳与补发不中断。 */
+function netRealtimeTick() {
+    if (!NET_ROOM || NET_STATE === 'idle') return;
+    const now = Date.now();
+    // 1) CMD 重发：超过确认超时未收到 CMD_ACK → 原样重发（对端按 seq 去重，幂等）
+    if (NET_CMD_UNACKED.size > 0) {
+        NET_CMD_UNACKED.forEach((entry, seq) => {
+            if (now - entry.sentAt < NET_CMD_ACK_TIMEOUT_MS) return;
+            entry.sentAt = now;
+            sendNet(entry.msg);
+            console.warn('[NET] CMD 未收到确认，重发 seq=' + seq);
+        });
+    }
+    // 2) SYNC 心跳（自 onLogicTick 迁入；冻结等待期也照发，避免双方互相冻死）
+    if (isOnlineMode() && now - NET_LAST_SYNC_MS >= NET_SYNC_MS) {
+        NET_LAST_SYNC_MS = now;
+        const msg = {
+            type: 'SYNC',
+            tick: game.tick,
+            confirmedTick: NET_CONFIRMED_TICK,
+            lastInputTick: NET_LAST_INPUT_TICK,
+            lastCmdTick: NET_LAST_CMD_TICK
+        };
+        // 附带最近 2 份哈希（[tick,hash] 数组）：覆盖两端推进速度差一档（落后一方）的情况
+        if (NET_HASH_LOG.size > 0) {
+            msg.hashes = [...NET_HASH_LOG.entries()].slice(-2);
+        }
+        sendNet(msg);
+    }
+}
+
+/** 通道（重）建立后立即补发全部未确认 CMD（重连恢复场景，不等重发超时）。 */
+function flushUnackedCmds() {
+    if (NET_CMD_UNACKED.size === 0) return;
+    const now = Date.now();
+    NET_CMD_UNACKED.forEach((entry) => {
+        entry.sentAt = now;
+        sendNet(entry.msg);
+    });
+}
+
+/** 对手确认收到 CMD → 从未确认队列移除 */
+function onCmdAck(data) {
+    if (!data || !Number.isInteger(data.seq)) return;
+    NET_CMD_UNACKED.delete(data.seq);
+}
+
+NET_REALTIME_TIMER = setInterval(netRealtimeTick, NET_REALTIME_TICK_MS);
 
 /** 对手 SYNC 心跳/哈希到达 */
 function onNetSync(data) {
@@ -700,11 +847,27 @@ function onNetSync(data) {
     }
 }
 
-/** 状态哈希：遍历实体/弹道/掉落物，轻量折叠成 32 位整数（联机分叉检测用） */
+/** 状态哈希：轻量折叠成 32 位整数（联机分叉检测用）。
+ *  覆盖面：tick/圣水/实体/弹道 + 冷却/精英槽/部署队列/阵营数据/烟引 pending/各领域队列——
+ *  此前仅实体+弹道，冷却或领域类状态分叉时哈希不报警（检测盲区）。
+ *  确定性要求：所有对象键一律按 CARD_IDS 固定顺序遍历，禁止 for-in（key 顺序依赖插入史） */
 function computeStateHash() {
     let h = 2166136261 >>> 0;
     const mix = (n) => {
         h = (Math.imul(h, 16777619) ^ (n | 0)) >>> 0;
+    };
+    const mixStr = (s) => {
+        const str = String(s == null ? '' : s);
+        for (let i = 0; i < str.length; i++) mix(str.charCodeAt(i));
+        mix(0x9e37); // 串分隔符：防 "ab"+"c" 与 "a"+"bc" 折叠同值
+    };
+    const mixNum = (n) => mix(Number.isFinite(n) ? Math.round(n * 10) : -99999);
+    const mixMode = (st) => { // 精英槽折叠：mode 短码 + 死亡冷却 + 技能冷却 + 神庙神赐费用
+        if (!st) return;
+        mix(st.mode === 'deploy' ? 1 : st.mode === 'skill' ? 2 : 3);
+        mixNum(st.cdLeft);
+        mixNum(st.skillCdLeft);
+        mixNum(st.blessCost != null ? st.blessCost : -1);
     };
     mix(game.tick);
     mix(Math.round(game.elixir.player * 10));
@@ -719,6 +882,49 @@ function computeStateHash() {
             mix(pr.x !== undefined ? Math.round(pr.x * 10) : 0);
             mix(pr.y !== undefined ? Math.round(pr.y * 10) : 0);
         }
+    }
+    // ---- 扩展覆盖面（以下全部为影响逻辑确定性的状态）----
+    mixStr(game.lastDeployedCardId || '');
+    mixStr(game.lastDeployedCardId2 || '');
+    mix(game.bastionsLost ? game.bastionsLost.player : -1);
+    mix(game.bastionsLost ? game.bastionsLost.ai : -1);
+    for (const team of ['player', 'ai']) {
+        const cds = game.cardCooldowns[team] || {};
+        for (const id of CARD_IDS) mixNum(cds[id]);
+        mixNum(cds.mirror); // 镜像冷却单独记键
+    }
+    for (const team of ['player', 'ai']) {
+        const es = game.eliteSkills[team] || {};
+        for (const id of CARD_IDS) {
+            if (es[id]) { mixStr(id); mixMode(es[id]); }
+            const mkey = 'mirror_' + id;
+            if (es[mkey]) { mixStr(mkey); mixMode(es[mkey]); }
+        }
+    }
+    if (Array.isArray(game.deploying)) {
+        mix(game.deploying.length);
+        for (const d of game.deploying) {
+            mixStr(d.cardId || '');
+            mix(d.team === 'player' ? 1 : 2);
+            mixNum(d.timer); mixNum(d.x); mixNum(d.y);
+        }
+    }
+    for (const team of ['player', 'ai']) {
+        const p = game.smokePending && game.smokePending[team];
+        if (p) { mixStr('sp' + team); mixNum(p.timer); }
+        const mp = game.mirrorSmokePending && game.mirrorSmokePending[team];
+        if (mp) { mixStr('mp' + team); mixNum(mp.timer); }
+    }
+    // 领域/延迟结算类队列：长度 + timer 总和（轻量折叠，足以反映"有无/进度"分叉）
+    for (const key of ['speedZones', 'rageZones', 'freezeZones', 'curseZones', 'poisonZones',
+        'hurricaneZones', 'scholarClouds', 'scholarHurricanes', 'windZones', 'windFields', 'snowTrails', 'smokeGuides', 'arrowRainStrikes', 'earthquakeStrikes',
+        'thunderStrikes', 'princeGuardSpawns', 'jessieStakeSpawns', 'batSpawns']) {
+        const arr = game[key];
+        if (!Array.isArray(arr)) { mix(-1); continue; }
+        mix(arr.length);
+        let timerSum = 0;
+        for (const z of arr) timerSum += (z && z.timer) || 0;
+        mix(Math.round(timerSum * 10));
     }
     return h >>> 0;
 }
