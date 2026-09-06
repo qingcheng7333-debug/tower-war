@@ -1,10 +1,165 @@
 /* ===== update.js — 每帧更新逻辑（移动、攻击、生产、治疗） ===== */
 /** 群体攻击范围提示环颜色（淡红 RGB，渲染层拼接 rgba） */
 const AOE_RING_COLOR = '255, 80, 80';
+/** 疗豆治疗范围提示环颜色（淡绿 RGB，渲染层拼接 rgba） */
+const HEAL_RING_COLOR = '80, 220, 120';
 // 范围伤害三档规范（2026-08-12）：法师塔45为最高档基准；普攻/弹道溅射类统一收口
 const AOE_RANGE_LARGE = 45; // 高档：法师塔（飞龙已改34）
 const AOE_RANGE_MED   = 35; // 中档：迫击炮 / 电磁炮
 const AOE_RANGE_SMALL = 25; // 低档：超级骑士普攻 / 女巫
+
+/** 🔥💚 火豆/疗豆跳跃自爆参数表（行为骨架共用 beanJump 块，仅弹道参数不同） */
+const BEAN_SPECS = {
+    _fireBean: { char: '🔥', jumpFlag: 'isFireJump', damage: 10, burn: true },
+    _healBean: { char: '💚', jumpFlag: 'isHealJump', damage: 25, burn: false },
+};
+
+/** 🪝 清理实体持有的鱼线引用：按字段名（_gulpLineId/_hookLineId）从全局鱼线队列摘除并清空字段。
+ *  收敛 update.js 内 5 处同构清理块（吞拉取消/完成、钩线取消/命中/收线） */
+function removeFishingLineRef(e, field) {
+    const lineId = e[field];
+    if (lineId) game.fishingLines = game.fishingLines.filter(l => l.id !== lineId);
+    e[field] = null;
+}
+
+/** 🪞 复制法术产物特性继承（统一公式）：复制体 1 血薄皮（护盾随父体有无），标记 isCopy 不触发死亡结算。
+ *  收敛 update.js 内 9 处同语义块（召唤物/蝙蝠/幼体/龙蛋/亡语等）。
+ *  📖 靈·紫色克隆体的衍生单位走同一入口（守卫为 isCopy || _spiritClone）：不锁1血，
+ *     改继承紫色克隆体印记 + 独立40s存在倒计时（召唤物/凤凰蛋/分裂物/小虫等全部如此） */
+function inheritCopyTraits(spawn, parent) {
+    if (parent._spiritClone) {
+        spawn._spiritClone = true;
+        spawn._spiritLifeTimer = 40;
+        return;
+    }
+    spawn.hp = 1;
+    spawn.maxHp = 1;
+    spawn.shield = (parent.maxShield || 0) > 0 ? 1 : 0;
+    spawn.maxShield = spawn.shield;
+    spawn.isCopy = true;
+}
+
+/** ⏳ 多段延迟范围结算骨架：timer 递减 → 到点逐段结算（圈内敌人按 dmgFor 取伤，统一走 calcActualDmg 收口）→ 段数耗尽移除。
+ *  箭雨（fortification×mul）/ 地震（建筑×buildingMul、仅地面）双份循环收敛于此；每段特效由 onStrike 注入。
+ *  ⛔ interval<=0 时按 0.3 兜底：0 会让 while 永不推进（潜伏死循环，审计 A-4 一并拆除） */
+/** 🗡️ 浪人反弹成功特效：两道交叉刀痕（样式借鉴黄泉刀痕）出现在浪人与被反弹者中间 */
+function spawnReflectCrossFx(ronin, parried) {
+    const mx = (ronin.x + parried.x) / 2;
+    const my = (ronin.y + parried.y) / 2;
+    const baseA = Math.atan2(parried.y - ronin.y, parried.x - ronin.x) + Math.PI / 2; // ✕ 整体随连线旋转后再转90°
+    // 两道刀痕同向弯曲（"（（"式）：弧凸面统一背向浪人（凹面/圆心朝向浪人），朝向大致一致不搞 "）（" 对摆
+    const awayA = baseA - Math.PI / 2;                    // 浪人→中点的延长方向（远离浪人）
+    const awayX = Math.cos(awayA), awayY = Math.sin(awayA);
+    for (const dir of [baseA + Math.PI / 6, baseA - Math.PI / 6]) {
+        const nlX = -Math.sin(dir), nlY = Math.cos(dir);  // 刀痕左法线（渲染器默认弧凸方向）
+        const bowSign = (nlX * awayX + nlY * awayY) >= 0 ? 1 : -1; // 让凸面朝向远离浪人的一侧
+        game.clawEffects.push({ x: mx, y: my, dir, yomiSlash: true, symmetric: true, cyan: true, scale: 1.12, bowSign, timer: 0.38, maxTimer: 0.38 });
+    }
+}
+
+function tickMultiStrikeQueue(queue, deltaSec, onStrike, dmgFor, opts) {
+    for (let i = queue.length - 1; i >= 0; i--) {
+        const s = queue[i];
+        s.timer -= deltaSec;
+        while (s.timer <= 0 && s.strikesLeft > 0) {
+            s.strikesLeft--;
+            s.timer += s.interval || 0.3;
+            game.entities.forEach(e => {
+                if (e.team === s.team || e.hp <= 0 || e._headHidden) return;
+                if (opts && opts.groundOnly && e.flying) return;
+                if (dist(e, { x: s.x, y: s.y }) <= s.radius) {
+                    const dmgS = calcActualDmg(dmgFor(e, s), null, e); // 法术伤害统一收口（无攻击者）
+                    e.hp -= dmgS;
+                    spawnDmgNum(e.x, e.y - 20, dmgS);
+                }
+            });
+            onStrike(s);
+        }
+        if (s.strikesLeft <= 0) queue.splice(i, 1);
+    }
+}
+
+/** ⚡ 雷电连锁统一骨架：主目标眩晕 → 就近逐跳（链内不重复、可配跳过隐身）→ 逐跳结算+眩晕 → 画折线链。
+ *  雷龙（全额不衰减、跳过隐身、带阵营链色）/ 雷电法师（chainDmgMul^i 衰减）双份收敛于此 */
+function chainLightning(attacker, target, cfg) {
+    applyHardControl(target, 'stun', 0.5); // 主目标眩晕0.5秒💫
+    const card = CARDS[attacker.cardId];
+    const chainRange = card.chainRange || cfg.chainRange;
+    const chainCount = card.chainCount || cfg.chainCount;
+    const chainPoints = [{ x: attacker.x, y: attacker.y }, { x: target.x, y: target.y }];
+    let currentTarget = target;
+    const hitIds = new Set([target.id]);
+    for (let i = 0; i < chainCount; i++) {
+        let best = null, bestDist = Infinity;
+        for (const e of game.entities) {
+            if (e.team === attacker.team || e.hp <= 0 || e._headHidden) continue;
+            if (cfg.skipStealthed && e._stealthed) continue;
+            if (hitIds.has(e.id)) continue;
+            const d = dist(currentTarget, e);
+            if (d <= chainRange && d < bestDist) {
+                bestDist = d;
+                best = e;
+            }
+        }
+        if (!best) break;
+        // 第 i+1 跳伤害：配了 dmgMul 则按 atk×mul^(i+1) 衰减，否则全额；逐目标单独结算、吃目标自身减伤（框架第13条）
+        const raw = cfg.dmgMul != null ? attacker.atk * Math.pow(cfg.dmgMul, i + 1) : attacker.atk;
+        const chainDmg = calcActualDmg(raw, attacker, best);
+        best.hp -= chainDmg;
+        spawnDmgNum(best.x, best.y - 20, chainDmg);
+        applyHardControl(best, 'stun', 0.5); // 连锁目标眩晕💫
+        hitIds.add(best.id);
+        chainPoints.push({ x: best.x, y: best.y });
+        currentTarget = best;
+    }
+    // 记录闪电链路径（含主目标连线；雷龙/法师两端行为一致恒绘制，color 缺省走渲染默认色）
+    game.lightningChains.push({
+        points: chainPoints,
+        timer: 0.3,
+        maxTimer: 0.3,
+        color: cfg.color
+    });
+}
+
+/** 🟢 领域伤害 tick（诅咒/毒雾共用公式）：每 interval 秒对圈内敌人结算 zone.dps，
+ *  防御工事（主塔/堡垒）× towerDmgMul（缺省 0.5 减半），统一 calcActualDmg 收口（框架第13条，无攻击者） */
+function tickZoneDamage(zone, deltaSec, interval) {
+    zone.tickTimer -= deltaSec;
+    if (zone.tickTimer > 0) return false;
+    zone.tickTimer = interval;
+    for (let e of game.entities) {
+        if (e.hp <= 0 || e.team === zone.team || e._headHidden) continue;
+        if (dist(e, zone) <= zone.radius) {
+            const dmg = calcActualDmg(e.fortification ? zone.dps * (zone.towerDmgMul || 0.5) : zone.dps, null, e);
+            e.hp -= dmg;
+            spawnDmgNum(e.x, e.y - 20, dmg);
+        }
+    }
+    return true; // 本帧触发了一跳（调用方可借此同步做附加效果，如读书人小飓风的牵引）
+}
+
+/** 🫧 领域气泡生成+上浮+回收（诅咒绿泡/毒雾毒泡共用；cfg 见两处调用点的参数注释） */
+function tickZoneBubbles(zone, deltaSec, cfg) {
+    zone.bubbleTimer -= deltaSec;
+    if (zone.bubbleTimer <= 0) {
+        zone.bubbleTimer = cfg.intervalMin + rand() * cfg.intervalVar;
+        zone.bubbles.push({
+            x: zone.x + (rand() - 0.5) * zone.radius * cfg.spread,
+            y: zone.y + (rand() - 0.5) * zone.radius * cfg.spread,
+            timer: cfg.life + rand() * cfg.lifeVar,
+            maxTimer: cfg.maxLife,
+            vy: -(cfg.vyMin + rand() * cfg.vyVar), // 缓慢上浮
+        });
+    }
+    for (let b = zone.bubbles.length - 1; b >= 0; b--) {
+        const bubble = zone.bubbles[b];
+        bubble.timer -= deltaSec;
+        bubble.y += bubble.vy * deltaSec;
+        if (bubble.timer <= 0) {
+            zone.bubbles.splice(b, 1);
+        }
+    }
+}
 /* ═══════════════════════════════════════════
  * 弹道处理器表（务实版规范化：行为零变化）
  *  6 类弹道 → 统一接口 update(p, deltaSec)，内部各自组织 移动→碰撞→结算→消散
@@ -44,10 +199,35 @@ function scanEnemies(p, onHit, opts) {
     return hit;
 }
 
+/** 🔥❄️🤢 debuff 统一施加入口（持续时间累加、效果取最强不叠加）：
+ *  重复获得同一 buff → 时长累加，强度取历史最强（灼烧伤害率取高者 / 减速系数取强者；中毒与毒药法术标记强度固定）。
+ *  全游戏所有灼烧/减速/中毒施加点统一走这里（原各处"重复获得只刷新不叠加"语义全部改为此规则） */
+function applyBurn(target, rate, time) {
+    target._burnDamage = Math.max(target._burnDamage || 0, rate);
+    target._burnTimer = (target._burnTimer || 0) + time;
+}
+function applySlow(target, factor, time) {
+    target.slowFactor = Math.min(target.slowFactor || 1, factor);
+    target.slowTimer = (target.slowTimer || 0) + time;
+}
+function applyPoisonDot(target, time, dps, slowFactor) {
+    target._poisonTimer = (target._poisonTimer || 0) + time;
+    target._poisonDps = Math.max(target._poisonDps || 0, dps || 10); // 🤢 毒伤率取历史最强（同🔥伤害率语义）
+    // 🤢 自带减速强度：独立乘区（与❄️的slowFactor分开），取历史最强（系数最小）
+    target._poisonSlowFactor = Math.min(target._poisonSlowFactor || 1, slowFactor || 0.6);
+    if (target._poisonAccumulator === undefined) target._poisonAccumulator = 0;
+}
+function applyFear(target, time) {
+    target._fearTimer = (target._fearTimer || 0) + time;
+}
+/** 😱 恐惧攻速通道：恐惧中攻速冷却衰减率 ×0.75（与 rageMult 同一乘法通道，攻速-25%） */
+function fearMult(e) {
+    return e && e._fearTimer > 0 ? 0.75 : 1.0;
+}
+
 function applyIceMageDebuff(target) {
     // 🧊 寒冰法师命中效果：减速60% + 攻击力降低60%，持续2.5秒
-    target.slowFactor = Math.min(target.slowFactor || 1.0, 0.4);
-    target.slowTimer = Math.max(target.slowTimer || 0, 2.5);
+    applySlow(target, 0.4, 2.5);
     target._iceMageAtkFactor = 0.4;
     target._iceMageAtkTimer = Math.max(target._iceMageAtkTimer || 0, 2.5);
 }
@@ -61,6 +241,7 @@ function applyAoe(p, center, atkEnt) {
             const dmgA = calcActualDmg(aoeDmg, atkEnt, e2); // 溅射也统一收口
             e2.hp -= dmgA;
             spawnDmgNum(e2.x, e2.y - 20, dmgA);
+            if (p.burnTimer) applyBurn(e2, p.burnDamage, p.burnTimer); // 🔥 灼烧弹（火法师火球）
             if (p.isIceShard) applyIceMageDebuff(e2);
         }
     });
@@ -130,8 +311,10 @@ const PROJECTILE_HANDLERS = {
                     const d1 = calcActualDmg(p.damage, atkEnt, centerEnt);
                     centerEnt.hp -= d1;
                     spawnDmgNum(centerEnt.x, centerEnt.y - 20, d1);
+                    // 🔥 主目标同样点燃（1秒20灼烧，同溅射目标）
+                    if (p.burnTimer) applyBurn(centerEnt, p.burnDamage, p.burnTimer);
                 }
-                applyAoe(p, centerEnt || { x: cx, y: cy }, atkEnt); // fullAoe：35px范围内全额60（火球不施加任何debuff）
+                applyAoe(p, centerEnt || { x: cx, y: cy }, atkEnt); // fullAoe：35px范围内全额40+点燃
                 game.spellEffects.push({ x: cx, y: cy, char: '💥', size: 28, color: '#ff7043', timer: 1.35, maxTimer: 1.35 });
                 game.deployEffects.push({ x: cx, y: cy, radius: p.aoeRadius, timer: 0.35, maxTimer: 0.35, color: '#ff6b3d', static: true });
             };
@@ -139,6 +322,28 @@ const PROJECTILE_HANDLERS = {
             if (hit) { p.timer = 0; return; }
             // 到底爆炸：未命中时飞到 maxDist(135) 终点也爆裂（打空也有群攻伤害）
             if (p.dist >= (p.maxDist || 135)) { boom(p.x, p.y, null); p.timer = 0; return; }
+            if (p.x < -60 || p.x > W + 60 || p.y < -60 || p.y > H + 60) p.timer = 0;
+        }
+    },
+    // ── 💨 风人风爆：💨直线弹道（不追踪），碰到敌人即在其位置生成55px风爆区
+    //    （0.4s一跳4伤害、1.2s共3跳12伤害，读书人小飓风同款特效但无牵引不移动）；未命中飞到135终点也生成风爆区（同火法师终点爆裂）──
+    windBlast: {
+        update(p, deltaSec) {
+            moveStraight(p, deltaSec);
+            const spawnZone = (cx, cy) => {
+                game.windZones.push({
+                    x: cx, y: cy, radius: 55, team: p.team, ownerId: p.ownerId,
+                    timer: 1.2, maxTimer: 1.2, tickTimer: 0,
+                });
+                game.spellEffects.push({ x: cx, y: cy, char: '💨', size: 26, timer: 0.35, maxTimer: 0.35 });
+            };
+            const hit = scanEnemies(p, (e2) => { spawnZone(e2.x, e2.y); }, { breakOnHit: true });
+            if (hit) { p.timer = 0; return; }
+            if (p.dist >= (p.maxDist || 135)) {
+                spawnZone(p.x, p.y); // 未命中：飞到135终点也生成风爆区（同火法师终点爆裂）
+                p.timer = 0;
+                return;
+            }
             if (p.x < -60 || p.x > W + 60 || p.y < -60 || p.y > H + 60) p.timer = 0;
         }
     },
@@ -410,8 +615,7 @@ const PROJECTILE_HANDLERS = {
                         const dmgM = calcActualDmg(p.damage, atkEnt, e2);
                         e2.hp -= dmgM;
                         spawnDmgNum(e2.x, e2.y - 20, dmgM);
-                        e2._burnDamage = p.burnDamage;
-                        e2._burnTimer = p.burnTimer;
+                        applyBurn(e2, p.burnDamage, p.burnTimer);
                     }
                 });
                 // 落地特效：爆点 + 火焰（同原跳炸特效）
@@ -419,6 +623,21 @@ const PROJECTILE_HANDLERS = {
                 game.spellEffects.push({ x: p.tx, y: p.ty, char: '🔥', size: 35, timer: 0.5, maxTimer: 0.5 });
                 // 范围提示：淡红色小环（同群攻，静态真实范围）
                 game.deployEffects.push({ x: p.tx, y: p.ty, radius: p.aoeRadius, timer: 0.4, maxTimer: 0.4, color: AOE_RING_COLOR, static: true });
+                p.timer = 0;
+            }
+        }
+    },
+    // ── 💚 疗豆跳跃：抛物线自爆（飞行同火豆；落地单体25伤害 + 75px内友军恢复buff 4秒每秒40共160）──
+    healJump: {
+        update(p, deltaSec) {
+            p.dist += p.speed * deltaSec;
+            const t = Math.min(1, p.dist / p.maxDist);
+            // 水平匀速 + 垂直抛物线（先升后降，同火豆）
+            p.x = p.sx + (p.tx - p.sx) * t;
+            p.y = p.sy + (p.ty - p.sy) * t - p.arcHeight * Math.sin(Math.PI * t);
+            if (t >= 1) {
+                // 落地：单体伤害 + 友军治疗buff（与死亡自爆共用 explodeHealBean，两条路径结算一致）
+                explodeHealBean(p.tx, p.ty, p.team, p.ownerId);
                 p.timer = 0;
             }
         }
@@ -489,6 +708,7 @@ const PROJECTILE_HANDLERS = {
                         tgt.hp -= dmgT;
                         spawnDmgNum(tgt.x, tgt.y - 20, dmgT);
                         if (p.isNinjaDart) applyPoison(tgt); // 🥷 忍者飞镖命中：施加/刷新4秒中毒
+                        if (p.isSnowBall) applySlow(tgt, 0.7, 1.5); // ☃️ 雪球命中：❄️减速30%持续1.5秒
                         // 溅射/范围伤害：法师塔0.6倍，电磁炮全额，女巫固定25
                         if (p.aoeRadius) applyAoe(p, tgt, atkEnt);
                         // 命中特效
@@ -577,6 +797,7 @@ function tryReflectProjectile(p, deltaSec) {
         p.targetId = origin.id;
     }
     // 反弹特效：青色返回箭头（呼应光晕）
+    p.prevX = monk.x; p.prevY = monk.y; // 插值基准重定到武僧：防本渲染帧从旧弹道位置 smear 回来
     game.spellEffects.push({ x: monk.x, y: monk.y - 20, char: '↩️', size: 20, color: '#00e5ff', timer: 0.4, maxTimer: 0.4 });
     return true;
 }
@@ -617,6 +838,7 @@ function tryReflectSpellFlight(f, deltaSec) {
     f._reflected = true;
     f.maxTimer *= newDist / d0;
     f.timer = f.maxTimer;            // 从武僧处重新起飞
+    f.prevTimer = f.timer;           // 插值基准重定：防本渲染帧从旧进度 smear 回来
     // 反弹特效：武僧处青色返回箭头（呼应光晕）+ 大本营处青色警示爆点
     game.spellEffects.push({ x: monk.x, y: monk.y - 20, char: '↩️', size: 20, color: '#00e5ff', timer: 0.4, maxTimer: 0.4 });
     game.spellEffects.push({ x: base.x, y: base.y - 20, char: '🔥', size: 26, color: '#00e5ff', timer: 0.5, maxTimer: 0.5 });
@@ -646,6 +868,8 @@ function tryReflectPierceArrow(a, deltaSec) {
     a.dx = (origin.x - monk.x) / dR;
     a.dy = (origin.y - monk.y) / dR;
     a.traveled = 0;      // 从武僧位置重新飞行
+    a.prevTraveled = 0;  // 插值基准重定：防本渲染帧从旧里程 smear 回来
+    a.prevX = a.x; a.prevY = a.y;
     a.team = monk.team;
     a.ownerId = monk.id;
     a.hitIds = new Set(); // 反弹后重新计数命中
@@ -712,6 +936,14 @@ const SUMMON_CREATORS = {
     skeleton: createSkeleton,              // 骷髅：女巫，spread 圆散半径50 + _isSpawned
     barbarian: createBarbarian,             // 蛮人：强壮蛮人缩小版建模
     goblin: (x, y, team) => createSummon(BASE_UNITS.goblin || GOBLIN_TEMPLATE, 'goblin', x, y, team, { jitterX: 20, jitterY: 15 }),
+    fire_bean: (x, y, team) => {           // 🔥 火豆：火熔炉每5秒蹦出（属性取自 CARDS.fire_bean + _fireBean 标记驱动跳跃自爆）
+        const c = CARDS.fire_bean;
+        const b = createSummon(
+            { hp: c.hp, atk: c.atk, atkSpeed: c.atkSpeed, moveSpeed: c.moveSpeed, range: c.range, targetMode: c.targetMode },
+            'fire_bean', x, y, team, { jitterX: 20, jitterY: 15 });
+        b._fireBean = true;
+        return b;
+    },
 };
 
 /** 周期性召唤通用循环（女巫/暗夜女巫/兵营共用）：
@@ -728,7 +960,7 @@ function tickSpawner(e, deltaSec, src, opts) {
         for (let i = 0; i < (src.spawnCount || 1); i++) {
             const spawned = creator(e.x, e.y, e.team);
             // 🔷 复制体召唤的衍生物也继承复制特性：1滴血；护盾随父体（父体带盾则子代1盾，父体无盾则子代无盾）
-            if (opts.inheritCopy && e.isCopy) { spawned.hp = 1; spawned.maxHp = 1; spawned.shield = (e.maxShield || 0) > 0 ? 1 : 0; spawned.maxShield = spawned.shield; spawned.isCopy = true; }
+            if (opts.inheritCopy && (e.isCopy || e._spiritClone)) inheritCopyTraits(spawned, e);
             game.entities.push(spawned);
         }
     }
@@ -754,10 +986,12 @@ function spawnTowerProjectile(e, target, opts) {
  */
 const DEATH_RESOLVERS = [
     // ---- 🤢 中毒扩散：中毒单位死亡时，将中毒传给45px内同阵营友军 ----
+    //    ☠️ 这是忍者的能力：场上存在敌方忍者（含复制体/镜像）时才生效，忍者全灭则链式扩散停止
     {
         match: e => e.hp <= 0 && e._poisonTimer > 0 && !e._poisonSpreadDone,
         handler: e => {
             e._poisonSpreadDone = true; // 同一次死亡只扩散一次，避免死亡清理前重复触发
+            if (!game.entities.some(x => x.cardId === 'ninja' && x.hp > 0 && x.team !== e.team)) return; // ☠️ 忍者不在场 → 不扩散
             const spreadRadius = AOE_RANGE_LARGE; // 与飞龙群攻范围一致：45px
             for (const ally of game.entities) {
                 if (ally === e || ally.hp <= 0 || ally.team !== e.team || ally._headHidden) continue;
@@ -805,12 +1039,7 @@ const DEATH_RESOLVERS = [
             for (let i = 0; i < 2; i++) {
                 const t = createGoblinThrower(e.x, e.y, e.team);
                 // 🔷 复制体巨人死亡召唤的投矛手也继承复制特性：1滴血；护盾随父体
-                if (e.isCopy) {
-                    t.hp = 1; t.maxHp = 1;
-                    t.shield = (e.maxShield || 0) > 0 ? 1 : 0;
-                    t.maxShield = t.shield;
-                    t.isCopy = true;
-                }
+                if (e.isCopy || e._spiritClone) inheritCopyTraits(t, e);
                 game.entities.push(t);
             }
             // 袋子爆开特效
@@ -826,12 +1055,7 @@ const DEATH_RESOLVERS = [
             for (let i = 0; i < 2; i++) {
                 const b = createBarbarian(e.x, e.y, e.team);
                 // 🔷 复制体攻城槌死亡召唤的蛮人也继承复制特性：1滴血；护盾随父体
-                if (e.isCopy) {
-                    b.hp = 1; b.maxHp = 1;
-                    b.shield = (e.maxShield || 0) > 0 ? 1 : 0;
-                    b.maxShield = b.shield;
-                    b.isCopy = true;
-                }
+                if (e.isCopy || e._spiritClone) inheritCopyTraits(b, e);
                 game.entities.push(b);
             }
             game.spellEffects.push({ x: e.x, y: e.y, char: '💥', size: 36, timer: 0.5, maxTimer: 0.5 });
@@ -924,7 +1148,7 @@ const DEATH_RESOLVERS = [
                 for (let i = 0; i < card.deathSpawnCount; i++) {
                     const bat = createBat(e.x, e.y, e.team);
                     // 🔷 复制体女巫死亡召唤的蝙蝠也继承复制特性：1滴血；护盾随父体
-                    if (e.isCopy) { bat.hp = 1; bat.maxHp = 1; bat.shield = (e.maxShield || 0) > 0 ? 1 : 0; bat.maxShield = bat.shield; bat.isCopy = true; }
+                    if (e.isCopy || e._spiritClone) inheritCopyTraits(bat, e);
                     game.entities.push(bat);
                 }
             }
@@ -967,7 +1191,7 @@ const DEATH_RESOLVERS = [
                     const r = Math.sqrt(rand()) * 70;
                     const pup = createLavaPup(e.x + Math.cos(ang) * r, e.y + Math.sin(ang) * r, e.team);
                     // 🔷 复制体熔岩猎犬爆炸召唤的幼崽也继承复制特性：1滴血；护盾随父体
-                    if (e.isCopy) { pup.hp = 1; pup.maxHp = 1; pup.shield = (e.maxShield || 0) > 0 ? 1 : 0; pup.maxShield = pup.shield; pup.isCopy = true; }
+                    if (e.isCopy || e._spiritClone) inheritCopyTraits(pup, e);
                     game.entities.push(pup);
                 }
             }
@@ -982,7 +1206,7 @@ const DEATH_RESOLVERS = [
                 for (let i = 0; i < card.deathSpawnCount; i++) {
                     const child = createCraftedWaterCarrier(e.x, e.y, e.team);
                     // 🔷 复制体送水人分裂出的子代也继承复制特性：1滴血；护盾随父体
-                    if (e.isCopy) { child.hp = 1; child.maxHp = 1; child.shield = (e.maxShield || 0) > 0 ? 1 : 0; child.maxShield = child.shield; child.isCopy = true; }
+                    if (e.isCopy || e._spiritClone) inheritCopyTraits(child, e);
                     game.entities.push(child);
                 }
                 game.spellEffects.push({ x: e.x, y: e.y, char: '💧', size: 24, timer: 0.4, maxTimer: 0.4 });
@@ -996,7 +1220,7 @@ const DEATH_RESOLVERS = [
             for (let i = 0; i < 2; i++) {
                 const child = createSmallWaterCarrier(e.x, e.y, e.team);
                 // 🔷 复制体送水人分裂出的子代也继承复制特性：1滴血；护盾随父体
-                if (e.isCopy) { child.hp = 1; child.maxHp = 1; child.shield = (e.maxShield || 0) > 0 ? 1 : 0; child.maxShield = child.shield; child.isCopy = true; }
+                if (e.isCopy || e._spiritClone) inheritCopyTraits(child, e);
                 game.entities.push(child);
             }
             game.spellEffects.push({ x: e.x, y: e.y, char: '💧', size: 18, timer: 0.35, maxTimer: 0.35 });
@@ -1013,11 +1237,14 @@ const DEATH_RESOLVERS = [
             }
         },
     },
-    // ---- 巫师🐛标记：死亡召唤小虫 ----
+    // ---- 巫师🐛标记：死亡召唤小虫（🪞复制体死亡 → 1血复制体虫；📖靈克隆体死亡 → 紫色克隆体虫+40s印记）----
     {
         match: e => e.hp <= 0 && e._wormMarkTimer > 0,
         handler: e => {
-            game.entities.push(createWorm(e.x, e.y, e._wormMarkTeam));
+            const worm = createWorm(e.x, e.y, e._wormMarkTeam);
+            // 🐛 虫继承父体的复制特性——此前漏了继承，复制体死亡会蹦出满血正常虫
+            if (e.isCopy || e._spiritClone) inheritCopyTraits(worm, e);
+            game.entities.push(worm);
             // 小虫出现特效
             game.spellEffects.push({ x: e.x, y: e.y, char: '🐛', size: 18, timer: 0.5, maxTimer: 0.5 });
         },
@@ -1046,7 +1273,7 @@ const DEATH_RESOLVERS = [
             game.spellEffects.push({ x: e.x, y: e.y, char: '💥', size: 16, timer: 0.15, maxTimer: 0.15 });
         },
     },
-    // ---- 气球兵：死亡留下💣（2秒后爆炸，范围45px同法师塔群攻，111范围伤害，防重复）----
+    // ---- 气球兵：死亡留下💣（2秒后爆炸，范围45px同法师塔群攻，222范围伤害，防重复）----
     {
         match: e => e.hp <= 0 && e.cardId === 'balloon' && !e._balloonBombDropped,
         handler: e => {
@@ -1067,7 +1294,7 @@ const DEATH_RESOLVERS = [
             egg._hatchMaxHp = Math.round((e.maxHp || e.hp) * 0.8);
             egg._hatchAtk = Math.round(e.atk * 0.8);
             // 🔷 复制体凤凰留下的蛋也继承复制特性：1滴血、护盾随父体、亮蓝幻影
-            if (e.isCopy) { egg.hp = 1; egg.maxHp = 1; egg.shield = (e.maxShield || 0) > 0 ? 1 : 0; egg.maxShield = egg.shield; egg.isCopy = true; }
+            if (e.isCopy || e._spiritClone) inheritCopyTraits(egg, e);
             game.entities.push(egg);
             game.spellEffects.push({ x: e.x, y: e.y, char: '🥚', size: 20, timer: 0.5, maxTimer: 0.5 });
         },
@@ -1083,8 +1310,7 @@ const DEATH_RESOLVERS = [
                     const bd = calcActualDmg(25, e, en); // 冰豆自爆：45px范围25伤害+减速80%持续1.5秒
                     en.hp -= bd;
                     spawnDmgNum(en.x, en.y - 20, bd);
-                    en.slowFactor = 0.2;
-                    en.slowTimer = 1.5;
+                    applySlow(en, 0.2, 1.5);
                 }
             }
             // 范围提示：淡红色小环（同群攻，静态真实范围）
@@ -1102,8 +1328,7 @@ const DEATH_RESOLVERS = [
                     const bd = calcActualDmg(18, e, en); // 小冰人死亡冰爆：45px范围18伤害+减速80%持续1.5秒（参考冰豆）
                     en.hp -= bd;
                     spawnDmgNum(en.x, en.y - 20, bd);
-                    en.slowFactor = 0.2;   // 减速80%
-                    en.slowTimer = 1.5;    // 持续1.5秒
+                    applySlow(en, 0.2, 1.5); // 减速80%持续1.5秒
                 }
             }
             // 范围提示：淡红色小环（同冰豆，静态真实范围）
@@ -1120,14 +1345,20 @@ const DEATH_RESOLVERS = [
                     const bd2 = calcActualDmg(10, e, en);
                     en.hp -= bd2;
                     spawnDmgNum(en.x, en.y - 20, bd2);
-                    en._burnDamage = 20;
-                    en._burnTimer = 3.0;
+                    applyBurn(en, 20, 3.0);
                 }
             }
             game.spellEffects.push({ x: e.x, y: e.y, char: '💥', size: 24, timer: 0.3, maxTimer: 0.3 });
             game.spellEffects.push({ x: e.x, y: e.y, char: '🔥', size: 35, timer: 0.5, maxTimer: 0.5 });
             // 范围提示：淡红色小环（同群攻，静态真实范围）
             game.deployEffects.push({ x: e.x, y: e.y, radius: 35, timer: 0.4, maxTimer: 0.4, color: AOE_RING_COLOR, static: true });
+        },
+    },
+    // ---- 疗豆：死亡自爆（被攻击打死也触发：单体25伤害+友军治疗buff，已自爆的跳过防重复；结算与跳跃落地共用 explodeHealBean）----
+    {
+        match: e => e.hp <= 0 && e._healBean && !e._selfDestructed,
+        handler: e => {
+            explodeHealBean(e.x, e.y, e.team, e.id);
         },
     },
     // ---- 冥王：收集死亡灵魂升级（场上所有冥王独立计数）----
@@ -1183,6 +1414,10 @@ const DEATH_RESOLVERS = [
                         released.maxHp = 1;
                         released.shield = (released.maxShield || 0) > 0 ? 1 : 0;
                         released.maxShield = released.shield;
+                    } else if (e._spiritClone) {
+                        // 📖 靈·紫色克隆体汉拔尼释放的猎物同为靈克隆体（紫色+40s存在印记，不锁血）
+                        released._spiritClone = true;
+                        released._spiritLifeTimer = 40;
                     }
                     game.entities.push(released);
                     game.deployEffects.push({
@@ -1192,8 +1427,9 @@ const DEATH_RESOLVERS = [
                     });
                 }
             }
-            // 拉取中目标尚未转成快照，汉拔尼死亡时销毁旧拉取对象；消化中目标本来已不在 entities。
-            if (prey) {
+            // 拉取中目标尚未转成快照：存活时已由快照释放出新实体 → 移除原体防重复；
+            //    已死亡（同帧被其他伤害打死）则留在数组，交由正常死亡结算（自身死亡结算器+精英卡复位），不得 splice
+            if (prey && snapshot && snapshot.hp > 0) {
                 const idx = game.entities.indexOf(prey);
                 if (idx >= 0) game.entities.splice(idx, 1);
             }
@@ -1201,10 +1437,7 @@ const DEATH_RESOLVERS = [
             e._digesting = false;
             e._gulping = false;
             e._gulpTargetId = null;
-            if (game.fishingLines && e._gulpLineId) {
-                game.fishingLines = game.fishingLines.filter(l => l.id !== e._gulpLineId);
-            }
-            e._gulpLineId = null;
+            removeFishingLineRef(e, '_gulpLineId');
         },
     },
 ];
@@ -1229,7 +1462,37 @@ function resolveDeaths() {
     }
 }
 
-/** 核心更新函数：每帧调用一次 */
+/** 🕊️ 精英本体死亡 → 恢复本体卡为普通卡面并开始死亡冷却（死亡后才计时）。
+ *  调用方：死亡结算循环（尸体仍在实体数组）、汉拔尼消化完成（被吞单位在吞噬瞬间已 splice 出数组，见消化 tick）。
+ *  场上还有其他存活本体时跳过（本体槽仍被占用），返回是否执行了复位。 */
+function resetEliteCardOnDeath(team, cardId) {
+    const card = CARDS[cardId];
+    if (!card || !card.activeSkill) return false;
+    // 场上还有其他存活的本体 → 暂不恢复（镜像精英不计入，本体槽独立；📖靈紫色克隆体同为"假本体"不计入——
+    // 否则克隆体存活期间本体死亡不归位，克隆体死亡又走 _spiritClone 跳过 → 卡牌永久卡在技能态）
+    if (game.entities.some(x => x.cardId === cardId && x.team === team && x.hp > 0 && !x.isCopy && !x.isMirrored && !x._spiritClone)) return false;
+    const es = game.eliteSkills[team];
+    if (!es || !es[cardId]) return false;
+    const st = es[cardId];
+    st.mode = 'deploy';
+    st.cdLeft = card.cooldown;       // 死亡后才开始冷却计时（15秒）
+    st.skillCdLeft = 0;              // 清除技能冷却，重新部署后御剑可直接使用
+    // 🛕 神赐：神庙死亡 → 费用重置11（不在场不累计，重新部署后从11重新减费）
+    if (card.activeSkill.id === 'goblin_bless') st.blessCost = card.activeSkill.cost;
+    return true;
+}
+
+/** 🪞 镜像精英死亡 → 清除镜像槽，镜像卡恢复为镜像法术并开始读秒（继承该精英卡冷却；取较大值不顶掉正在读的冷却）。
+ *  非精英镜像（无 activeSkill）不会设置冷却，避免阵亡时镜像卡被无端二次拉黑。 */
+function clearMirrorEliteSlot(team, cardId) {
+    const esM = game.eliteSkills[team];
+    if (esM && esM['mirror_' + cardId]) delete esM['mirror_' + cardId];
+    const dCard = CARDS[cardId];
+    if (dCard && dCard.activeSkill && dCard.cooldown) {
+        setMirrorCooldown(team, Math.max(getMirrorCooldown(team), dCard.cooldown));
+    }
+}
+
 /** 地狱光束共用逻辑：锁定、切换冷却、蓄热和伤害结算。 */
 function updateInfernoBeam(entity, deltaSec, currentTarget, options) {
     const switchCooldown = options.switchCooldown;
@@ -1265,7 +1528,7 @@ function updateInfernoBeam(entity, deltaSec, currentTarget, options) {
         entity._beamTimer = 0;
     }
 
-    if (entity.atkCooldown > 0) entity.atkCooldown -= deltaSec * rageMult(entity);
+    if (entity.atkCooldown > 0) entity.atkCooldown -= deltaSec * rageMult(entity) * fearMult(entity);
     if ((entity._stunTimer || 0) <= 0 && entity.atkCooldown <= 0 && currentTarget && entity._beamTargetId) {
         const elapsedSeconds = Math.floor(entity._beamTimer || 0);
         const rampSteps = [0, ...(CARDS[entity.cardId].infernoRamp || rampDefault)];
@@ -1279,6 +1542,27 @@ function updateInfernoBeam(entity, deltaSec, currentTarget, options) {
     return currentTarget;
 }
 
+/**
+ * 渲染插值基准快照（非实体移动对象）：弹道/伤害数字/滚木记 x/y，
+ * 飞行物（桶/箭雨/火球/火箭）记 timer（位置由 timer 进度推导），穿透箭/鱼线记 traveled。
+ * 与实体的 prevX/prevY 对等：render.draw 投影绘制后 finally 恢复，逻辑零副作用。
+ */
+function snapRenderPrevAll() {
+    const lists = [
+        game.projectiles, game.dmgNumbers, game.logRolls,
+        game.goblinBarrels, game.arrowRainFlights, game.fireballFlights, game.rocketFlights,
+        game.pierceArrows, game.fishingLines, game.boulderRolls,
+    ];
+    for (const list of lists) {
+        for (const o of list) {
+            if (typeof o.x === 'number') { o.prevX = o.x; o.prevY = o.y; }
+            if (typeof o.timer === 'number') o.prevTimer = o.timer;
+            if (typeof o.traveled === 'number') o.prevTraveled = o.traveled;
+        }
+    }
+}
+
+/** 核心更新函数：每帧调用一次 */
 function update(deltaSec) {
     if (game.gameOver) return;
 
@@ -1291,6 +1575,7 @@ function update(deltaSec) {
         e.prevX = e.x;
         e.prevY = e.y;
     }
+    snapRenderPrevAll();
 
     // ---- 圣水回复（各边独立，丢堡方加速帮扶） ----
     const playerRate = game.baseElixirRate * game.elixirMultiplier.player;
@@ -1346,8 +1631,7 @@ function update(deltaSec) {
                 const selectedId = isMirror ? 'mirror' : 'smoke_guide';
                 if (game.uiState[selKey] === selectedId) {
                     game.uiState[selKey] = null;
-                    const panelSel = teamName === 'player' ? '#cardPanel .card-btn' : '#topCardPanel .card-btn';
-                    document.querySelectorAll(panelSel).forEach(b => b.classList.remove('selected'));
+                    clearCardPanelSelection(teamName);  // DOM 操作归 ui.js（基础框架 4.7：圣水 DOM 是唯一历史特例，不构成先例）
                 }
             }
         }
@@ -1448,6 +1732,158 @@ function update(deltaSec) {
         }
     }
 
+    // ---- 📖 读书人·鎮 ☁️雷云：云恒在影子正上方105px、影子锁定敌人；敌人死亡影子以16速带云同步移向
+    //      下一个敌人，影子与敌人差不多重合才劈雷；10s后消散 ----
+    for (let i = game.scholarClouds.length - 1; i >= 0; i--) {
+        const cloud = game.scholarClouds[i];
+        cloud.timer -= deltaSec;
+        if (cloud.timer <= 0) {
+            game.scholarClouds.splice(i, 1);
+            continue;
+        }
+        // 锁定目标校验：死亡/失效则移向离影子最近的下一个敌人（确定性 tie-break：距离同取 id 小者）
+        let target = game.entities.find(e => e.id === cloud.targetId && e.hp > 0 && e.team !== cloud.team);
+        if (!target) {
+            target = findNearestEnemy(cloud.sx, cloud.sy, cloud.team, false);
+            if (target) cloud.targetId = target.id;
+        }
+        if (!target) continue; // 场上无敌人：云原地悬浮等待
+        // 影子以22速滑向锁定敌人（换目标时影子移动、云恒随影子正上方105px同步移动）
+        const mdist = Math.hypot(target.x - cloud.sx, target.y - cloud.sy);
+        if (mdist > 1) {
+            const step = Math.min(mdist, 22 * deltaSec);
+            cloud.sx += (target.x - cloud.sx) / mdist * step;
+            cloud.sy += (target.y - cloud.sy) / mdist * step;
+        }
+        // 每1.2s劈雷：42伤害（单体，吃读书人实时狂暴/暴击；堡垒/主塔减半）+ 💫眩晕1s（仅可移动单位）；
+        // 影子与敌人差不多重合才劈
+        cloud.tickTimer -= deltaSec;
+        if (cloud.tickTimer <= 0 && mdist <= 14) {
+            cloud.tickTimer = 1.2;
+            const owner = game.entities.find(e => e.id === cloud.ownerId && e.hp > 0) || null;
+            game.lightningChains.push({
+                points: [{ x: cloud.sx, y: cloud.sy - 105 }, { x: target.x, y: target.y }],
+                timer: 0.25, maxTimer: 0.25,
+            });
+            const base = target.fortification ? 42 * 0.5 : 42; // 📖 法术惯例：堡垒/主塔伤害减半
+            const dmg = calcActualDmg(base, owner, target);
+            target.hp -= dmg;
+            spawnDmgNum(target.x, target.y - 20, dmg);
+            if (target.moveSpeed !== undefined) applyHardControl(target, 'stun', 1);
+        }
+    }
+
+    // ---- 📖 读书人·聚 小飓风：55范围持续8秒，每0.4s对圈内敌方兵种造成8点伤害；
+    //      风眼常显🌪️、以移速22随机游走、每2秒变一次方向 ----
+    for (let i = game.scholarHurricanes.length - 1; i >= 0; i--) {
+        const h = game.scholarHurricanes[i];
+        h.timer -= deltaSec;
+        if (h.timer <= 0) {
+            game.scholarHurricanes.splice(i, 1);
+            continue;
+        }
+        h.dirTimer -= deltaSec;
+        if (h.dirTimer <= 0) {
+            h.dirTimer = 2;
+            h.dirAng = rand() * Math.PI * 2;
+        }
+        h.x = Math.min(W - 20, Math.max(20, h.x + Math.cos(h.dirAng) * 8 * deltaSec));
+        h.y = Math.min(H - 20, Math.max(20, h.y + Math.sin(h.dirAng) * 8 * deltaSec));
+        // 伤害走通用 tickZoneDamage（堡垒/主塔减半惯例收口，zone 自带 dps/towerDmgMul）；触发一跳时同步做牵引
+        if (tickZoneDamage(h, deltaSec, 0.4)) {
+            for (const e of game.entities) {
+                if (e.team === h.team || e.hp <= 0 || e._headHidden || e.moveSpeed === undefined) continue;
+                if (Math.hypot(e.x - h.x, e.y - h.y) <= h.radius) {
+                    // 拉拢（持续牵引：仅可移动单位，同飓风法术；每次跳伤刷新牵引计时到下一跳之后）
+                    e._pullToX = h.x;
+                    e._pullToY = h.y;
+                    e._pullTimer = Math.min(0.4 + 0.1, 0.6);
+                }
+            }
+        }
+    }
+
+    // ---- 💨 风人·风爆区（55范围 0.4s一跳4伤害，1.2s共3跳12伤害；无牵引不移动）----
+    for (let i = game.windZones.length - 1; i >= 0; i--) {
+        const z = game.windZones[i];
+        z.timer -= deltaSec;
+        if (z.timer <= 0) {
+            game.windZones.splice(i, 1);
+            continue;
+        }
+        z.tickTimer -= deltaSec;
+        if (z.tickTimer <= 0) {
+            z.tickTimer = 0.4; // 首跳立即结算（生成即命中）
+            z.ticks = (z.ticks || 0) + 1;
+            const owner = game.entities.find(e => e.id === z.ownerId && e.hp > 0) || null;
+            for (const e of game.entities) {
+                if (e.team === z.team || e.hp <= 0 || e._headHidden) continue;
+                if (Math.hypot(e.x - z.x, e.y - z.y) <= z.radius) {
+                    const dmg = calcActualDmg(4, owner, e);
+                    e.hp -= dmg;
+                    spawnDmgNum(e.x, e.y - 20, dmg);
+                }
+            }
+            // 🌪️ 拟风：固定第二跳伤害时进行 buff 刷新扩散 + 4×实例数结算（判定仅限🌪️圈内）
+            if (z.ticks === 2) windManSyncDebuffs(z);
+        }
+    }
+
+    // ---- 💨 风人·扩散 风场（135跟随风人移动4秒：0.4s一跳4伤害，每3跳一次buff大结算；风人阵亡即消散）----
+    for (let i = game.windFields.length - 1; i >= 0; i--) {
+        const f = game.windFields[i];
+        const owner = game.entities.find(e => e.id === f.ownerId && e.hp > 0);
+        if (!owner) {
+            game.windFields.splice(i, 1); // 风场以风人为本体：本体不在则消散
+            continue;
+        }
+        f.x = owner.x;
+        f.y = owner.y; // 风场跟随风人移动
+        f.timer -= deltaSec;
+        if (f.timer <= 0) {
+            game.windFields.splice(i, 1);
+            continue;
+        }
+        f.tickTimer -= deltaSec;
+        if (f.tickTimer <= 0) {
+            f.tickTimer = 0.4;
+            f.ticks++;
+            for (const e of game.entities) {
+                if (e.team === f.team || e.hp <= 0 || e._headHidden) continue;
+                if (Math.hypot(e.x - f.x, e.y - f.y) <= f.radius) {
+                    const dmg = calcActualDmg(4, owner, e);
+                    e.hp -= dmg;
+                    spawnDmgNum(e.x, e.y - 20, dmg);
+                }
+            }
+            // 每3跳一次buff大结算（展开瞬间的首结算不计入；ticks 3/6/9 → 共4次大结算）
+            if (f.ticks % 3 === 0) windManSyncDebuffs(f);
+        }
+    }
+
+    // ---- ☃️ 雪人·雪地轨迹（30px淡白区5秒：1s一跳6伤害 + ❄️减速30%持续1秒，踩着即持续刷新）----
+    for (let i = game.snowTrails.length - 1; i >= 0; i--) {
+        const t = game.snowTrails[i];
+        t.timer -= deltaSec;
+        if (t.timer <= 0) {
+            game.snowTrails.splice(i, 1);
+            continue;
+        }
+        t.tickTimer -= deltaSec;
+        if (t.tickTimer <= 0) {
+            t.tickTimer = 1;
+            for (const e of game.entities) {
+                if (e.team === t.team || e.hp <= 0 || e._headHidden) continue;
+                if (Math.hypot(e.x - t.x, e.y - t.y) <= t.radius) {
+                    const dmg = calcActualDmg(6, null, e);
+                    e.hp -= dmg;
+                    spawnDmgNum(e.x, e.y - 20, dmg);
+                    applySlow(e, 0.7, 1); // ❄️ 30%减速持续1秒（时长累加，踩着即持续刷新）
+                }
+            }
+        }
+    }
+
     // ---- ❄️ 冰冻法术·冰封区域计时（纯展示，4秒后消失）----
     for (let i = game.freezeZones.length - 1; i >= 0; i--) {
         const zone = game.freezeZones[i];
@@ -1540,46 +1976,17 @@ function update(deltaSec) {
             game.curseZones.splice(i, 1);
             continue;
         }
-        // 伤害 tick：一秒一次
-        zone.tickTimer -= deltaSec;
-        if (zone.tickTimer <= 0) {
-            zone.tickTimer = 1.0;
-            for (let e of game.entities) {
-                if (e.hp <= 0 || e.team === zone.team || e._headHidden) continue;
-                if (dist(e, zone) <= zone.radius) {
-                    const dmg = calcActualDmg(e.fortification ? zone.dps * (zone.towerDmgMul || 0.5) : zone.dps, null, e); // 法术伤害统一收口（框架第13条），无攻击者狂暴；主塔/堡垒伤害减半
-                    e.hp -= dmg;
-                    spawnDmgNum(e.x, e.y - 20, dmg);
-                }
-            }
-        }
+        // 伤害 tick：一秒一次（公式与毒雾共用 tickZoneDamage）
+        tickZoneDamage(zone, deltaSec, 1.0);
         // 🐌 领域减速：圈内敌军持续减速20%（走出领域后1秒内恢复；取更强减速，不覆盖冰豆80%这类更强效果）
         for (let e of game.entities) {
             if (e.hp <= 0 || e.team === zone.team || e._headHidden) continue;
             if (dist(e, zone) <= zone.radius) {
-                e.slowFactor = Math.min(e.slowFactor || 1.0, 0.8);
-                e.slowTimer = Math.max(e.slowTimer || 0, 1.0);
+                applySlow(e, 0.8, 1.0);
             }
         }
         // 低频率冒出小绿泡（每1.2~2秒一个，缓慢上浮，寿命约1.5秒）
-        zone.bubbleTimer -= deltaSec;
-        if (zone.bubbleTimer <= 0) {
-            zone.bubbleTimer = 1.2 + rand() * 0.8;
-            zone.bubbles.push({
-                x: zone.x + (rand() - 0.5) * zone.radius * 1.5,
-                y: zone.y + (rand() - 0.5) * zone.radius * 1.5,
-                timer: 1.5, maxTimer: 1.5,
-                vy: -(10 + rand() * 15), // 缓慢上浮
-            });
-        }
-        for (let b = zone.bubbles.length - 1; b >= 0; b--) {
-            const bubble = zone.bubbles[b];
-            bubble.timer -= deltaSec;
-            bubble.y += bubble.vy * deltaSec;
-            if (bubble.timer <= 0) {
-                zone.bubbles.splice(b, 1);
-            }
-        }
+        tickZoneBubbles(zone, deltaSec, { intervalMin: 1.2, intervalVar: 0.8, spread: 1.5, life: 1.5, lifeVar: 0, maxLife: 1.5, vyMin: 10, vyVar: 15 });
     }
 
     // ---- 🤢 毒药法术·毒雾领域（持续8秒，每0.4秒对圈内所有敌人造成18伤害 + 减速15%由🤢本身提供；气泡密集细小上浮）----
@@ -1590,46 +1997,20 @@ function update(deltaSec) {
             game.poisonZones.splice(i, 1);
             continue;
         }
-        // 伤害 tick：0.4秒一次
+        // 🤢 每秒施加一次🤢buff（持续1秒，毒药伤害折算为每秒45由buff自身结算）+ ❄️减速15%持续1秒
+        // （走出领域后各1秒内走完；伤害/减速全部由通用🤢/❄️模板携带，见 applyPoisonDot/applySlow）
         zone.tickTimer -= deltaSec;
         if (zone.tickTimer <= 0) {
-            zone.tickTimer = 0.4;
+            zone.tickTimer = 1.0;
             for (let e of game.entities) {
                 if (e.hp <= 0 || e.team === zone.team || e._headHidden) continue;
                 if (dist(e, zone) <= zone.radius) {
-                    const dmg = calcActualDmg(e.fortification ? zone.dps * (zone.towerDmgMul || 0.5) : zone.dps, null, e);
-                    e.hp -= dmg;
-                    spawnDmgNum(e.x, e.y - 20, dmg);
+                    applyPoisonDot(e, 1.0, zone.dps || 45, zone.slowFactor || 0.85);
                 }
             }
         }
-        // 🤢 领域减速：圈内敌军持续减速15%（减速由🤢buff本身提供，走出领域后1秒内恢复）
-        for (let e of game.entities) {
-            if (e.hp <= 0 || e.team === zone.team || e._headHidden) continue;
-            if (dist(e, zone) <= zone.radius) {
-                // 🤢 中毒 buff 标记（减速15%由🤢本身提供，伤害由领域tick独立结算）
-                e._poisonSpellTimer = zone.slowDuration;
-            }
-        }
         // 气泡生成：更小更密集（每0.3~0.6秒一个，寿命约1秒，半径3px）
-        zone.bubbleTimer -= deltaSec;
-        if (zone.bubbleTimer <= 0) {
-            zone.bubbleTimer = 0.3 + rand() * 0.3;
-            zone.bubbles.push({
-                x: zone.x + (rand() - 0.5) * zone.radius * 1.8,
-                y: zone.y + (rand() - 0.5) * zone.radius * 1.8,
-                timer: 0.8 + rand() * 0.4, maxTimer: 1.2,
-                vy: -(12 + rand() * 18), // 缓慢上浮
-            });
-        }
-        for (let b = zone.bubbles.length - 1; b >= 0; b--) {
-            const bubble = zone.bubbles[b];
-            bubble.timer -= deltaSec;
-            bubble.y += bubble.vy * deltaSec;
-            if (bubble.timer <= 0) {
-                zone.bubbles.splice(b, 1);
-            }
-        }
+        tickZoneBubbles(zone, deltaSec, { intervalMin: 0.3, intervalVar: 0.3, spread: 1.8, life: 0.8, lifeVar: 0.4, maxLife: 1.2, vyMin: 12, vyVar: 18 });
     }
 
     // ---- 遍历所有实体 ----
@@ -1657,6 +2038,13 @@ function update(deltaSec) {
                 e.hp -= selfDmg;
                 if (e._swallowedSnapshot.hp <= 0) {
                     // ✅ 消化完成：快照单位死亡，汉拔尼恢复原状
+                    // 🕊️ 被吞单位在吞噬瞬间已 splice 出实体数组，永远进不了死亡结算 → 此处补齐精英卡复位
+                    //    （本体精英 → 恢复本体卡+死亡冷却；镜像精英 → 清镜像槽+镜像卡开始读秒；复制体不触发）
+                    const prey = e._swallowedSnapshot;
+                    if (prey && !prey.isCopy && CARDS[prey.cardId] && CARDS[prey.cardId].activeSkill) {
+                        if (prey.isMirrored) clearMirrorEliteSlot(prey.team, prey.cardId);
+                        else resetEliteCardOnDeath(prey.team, prey.cardId);
+                    }
                     e._swallowedSnapshot = null;
                     e._digesting = false;
                     e.moveSpeed = e._digestOrigSpeed;
@@ -1716,6 +2104,73 @@ function update(deltaSec) {
             if (e._rageTimer <= 0) e._rageTimer = 0;
         }
 
+        // --- 📖 读书人：極 buff 衰减（到期还原攻速2s / 暴击率20%）---
+        if ((e._extremeTimer || 0) > 0) {
+            e._extremeTimer -= deltaSec;
+            if (e._extremeTimer <= 0) {
+                e._extremeTimer = 0;
+                e.atkSpeed = CARDS.scholar.atkSpeed;
+                e._scholarCritRate = 0.2;
+            }
+        }
+        // --- 📖 读书人：护盾破碎「閃」→ 0.6s后往攻击方向后面瞬移105px（同杰西后撤方向算法：背向当前目标）---
+        if ((e._scholarBlinkTimer || 0) > 0) {
+            e._scholarBlinkTimer -= deltaSec;
+            if (e._scholarBlinkTimer <= 0) {
+                e._scholarBlinkTimer = 0;
+                e._scholarShieldBroke = false;
+                let dirX = 0, dirY = 0;
+                const bt = game.entities.find(en => en.id === e.targetId && en.hp > 0);
+                if (bt) {
+                    const bdd = Math.hypot(bt.x - e.x, bt.y - e.y) || 1;
+                    dirX = (bt.x - e.x) / bdd;
+                    dirY = (bt.y - e.y) / bdd;
+                }
+                if (!dirX && !dirY) dirX = e.team === 'player' ? 1 : -1; // 无目标时默认前进方向：玩家向右、AI向左
+                e.x = Math.min(W - 30, Math.max(30, e.x - dirX * 105)); // 往攻击方向后面闪（杰西后撤同款取反）
+                e.y = Math.min(H - 30, Math.max(30, e.y - dirY * 105));
+                // 🌊 落点防溺水（缩窄图）：闪进水域核心会被 checkRiverDrown 判溺亡（闪完人没了 bug）→
+                //    y 夹回最近桥面 ±HALF，与跳跃落点/riverGuardPush 桥面约束同款
+                if (game.shrink220 && !e.flying
+                    && e.x > MODE_TEST_RIVER_LEFT + MODE_TEST_RIVER_GUARD && e.x < MODE_TEST_RIVER_RIGHT - MODE_TEST_RIVER_GUARD
+                    && MODE_TEST_BRIDGE_YS.every(by => Math.abs(e.y - by) > MODE_TEST_BRIDGE_HALF)) {
+                    let nb = MODE_TEST_BRIDGE_YS[0];
+                    for (const by of MODE_TEST_BRIDGE_YS) if (Math.abs(e.y - by) < Math.abs(e.y - nb)) nb = by;
+                    e.y = Math.max(nb - MODE_TEST_BRIDGE_HALF, Math.min(nb + MODE_TEST_BRIDGE_HALF, e.y));
+                }
+                game.spellEffects.push({ x: e.x, y: e.y, char: '✨', size: 20, timer: 0.3, maxTimer: 0.3 });
+            }
+        }
+        // --- 💨 风人·扩散：0.6s站桩后展开跟随风场（读书人中途阵亡则作废）---
+        if (e._windSpreadPending) {
+            e._windSpreadPending -= deltaSec;
+            if (e._windSpreadPending <= 0) {
+                e._windSpreadPending = null;
+                e._holdMove = 0;
+                if (e.hp > 0) {
+                    const field = { ownerId: e.id, team: e.team, x: e.x, y: e.y, radius: 135, timer: 4, maxTimer: 4, tickTimer: 0, ticks: 0 };
+                    game.windFields.push(field);
+                    game.spellEffects.push({ x: e.x, y: e.y, char: '💨', size: 40, timer: 0.5, maxTimer: 0.5 });
+                    windManSyncDebuffs(field); // 展开瞬间：立刻进行一次buff大结算（整个135风场范围）
+                }
+            }
+        }
+        // --- 📖 靈：0.5s延迟生成紫色克隆体（读书人中途阵亡则作废；可灵化 troop/healer）---
+        if (e._spiritPending) {
+            e._spiritPending.timer -= deltaSec;
+            if (e._spiritPending.timer <= 0) {
+                const spTarget = game.entities.find(en => en.id === e._spiritPending.targetId && en.hp > 0
+                    && (en.type === 'troop' || en.type === 'healer'));
+                if (spTarget && e.hp > 0) spawnScholarSpiritClone(e.team, spTarget);
+                e._spiritPending = null;
+            }
+        }
+        // --- 📖 靈·紫色克隆体：40s寿命归零直接死亡 ---
+        if (e._spiritClone && (e._spiritLifeTimer || 0) > 0) {
+            e._spiritLifeTimer -= deltaSec;
+            if (e._spiritLifeTimer <= 0) e.hp = 0;
+        }
+
         // --- 🛡️ 免伤盾计时衰减 ---
         if (e._shieldTimer > 0) {
             e._shieldTimer -= deltaSec;
@@ -1756,9 +2211,17 @@ function update(deltaSec) {
         }
 
         // --- 🤢 中毒伤害：每秒10点，持续4秒；重复施加只刷新时间，不叠加伤害 ---
+        // --- 😱 恐惧计时衰减（攻击力/攻速-25%，时长累加语义）---
+        if (e._fearTimer > 0) {
+            e._fearTimer -= deltaSec;
+            if (e._fearTimer <= 0) e._fearTimer = 0;
+        }
+
         if (e._poisonTimer > 0) {
             e._poisonTimer -= deltaSec;
-            e._poisonAccumulator = (e._poisonAccumulator || 0) + 10 * deltaSec;
+            // 🤢 毒伤率由 _poisonDps 携带（各来源折算为每秒xx）；对主塔/堡垒减半（毒药法术惯例）
+            const poisonRate = (e._poisonDps || 10) * (e.fortification ? 0.5 : 1);
+            e._poisonAccumulator = (e._poisonAccumulator || 0) + poisonRate * deltaSec;
             if (e._poisonAccumulator >= 1) {
                 const poisonTick = Math.floor(e._poisonAccumulator);
                 e.hp -= calcActualDmg(poisonTick, null, e);
@@ -1770,17 +2233,31 @@ function update(deltaSec) {
             }
         }
 
-        // --- 🤢 毒药法术中毒 buff 计时衰减（🤢减速15% + 头顶图标，伤害由领域tick独立结算）---
-        if (e._poisonSpellTimer > 0) {
-            e._poisonSpellTimer -= deltaSec;
-            if (e._poisonSpellTimer <= 0) e._poisonSpellTimer = 0;
+        // --- ❤️‍🩹 疗豆恢复buff：自爆施加，持续4秒每秒治疗40（共160；不叠加只刷新持续时间；只回血不吃护盾，满血时buff照常走时间；图标复用常驻自回❤️‍🩹）---
+        if (e._healBuffTimer > 0) {
+            e._healBuffTimer -= deltaSec;
+            e._healBuffTickTimer = (e._healBuffTickTimer || 0) + deltaSec;
+            if (e._healBuffTickTimer >= 1) {
+                e._healBuffTickTimer -= 1;
+                if (e.hp > 0 && e.hp < e.maxHp && (e._healBuffPerSec || 0) > 0) {
+                    const amt = Math.min(e.maxHp - e.hp, e._healBuffPerSec);
+                    e.hp += amt;
+                    if (amt > 0) spawnDmgNum(e.x, e.y - 20, amt, true);
+                }
+            }
+            if (e._healBuffTimer <= 0) {
+                e._healBuffTimer = 0;
+                e._healBuffPerSec = 0;
+                e._healBuffTickTimer = 0;
+            }
         }
 
+        // --- 🤢 毒药法术中毒 buff 计时衰减（🤢减速15% + 头顶图标，伤害由领域tick独立结算）---
         // --- 兵营生产（spawnUnit 驱动 + tickSpawner 统一循环；建筑产兵不继承复制特性）---
         if (e.type === 'barrack') {
             if (e.cardId === 'barbarian_hut') {
-                // 每15秒启动一轮；第1只立即生成，第2/3只每0.3秒连续生成
-                e.spawnTimer += deltaSec;
+                // 每15秒启动一轮；第1只立即生成，第2/3只每0.3秒连续生成（吃狂暴1.3，同tickSpawner）
+                e.spawnTimer += deltaSec * rageMult(e);
                 if (e._spawnQueue <= 0 && e.spawnTimer >= e.spawnInterval) {
                     e.spawnTimer -= e.spawnInterval;
                     game.entities.push(createBarbarian(e.x, e.y, e.team));
@@ -1801,9 +2278,9 @@ function update(deltaSec) {
             }
         }
 
-        // --- 圣水生成器 ---
+        // --- 圣水生成器（吃狂暴1.3：狂暴区域内产水提速） ---
         if (e.type === 'collector') {
-            e.generateTimer += deltaSec;
+            e.generateTimer += deltaSec * rageMult(e);
             while (e.generateTimer >= e.generateInterval) {
                 e.generateTimer -= e.generateInterval;
                 if (e.team === 'player')
@@ -1846,7 +2323,7 @@ function update(deltaSec) {
                 for (const en of game.entities) {
                     if (members.length >= campCap) break;
                     if (en.team !== e.team || en.hp <= 0) continue;
-                    if ((en.type !== 'troop' && en.type !== 'healer') || en._campFlag || en.isCopy) continue; // 已被🚩标记或复制体不捕获（复制体不占名额、不施加🚩）；治疗兵也可被收编
+                    if ((en.type !== 'troop' && en.type !== 'healer') || en._campFlag || en.isCopy || en._spiritClone) continue; // 已被🚩标记或复制体不捕获（复制体不占名额、不施加🚩；📖靈克隆体同为临时单位不收编）；治疗兵也可被收编
                     if (en.cardId === 'main_tower_guard') continue; // 主塔守卫有自己的巡逻逻辑，不加入营地
                     if (CARDS[en.cardId] && CARDS[en.cardId].category === 'elite') continue; // 🗡️ 精英单位（如剑仙）不可被营地收编
                     if (Math.hypot(en.x - e.x, en.y - e.y) <= campR) {
@@ -1889,7 +2366,7 @@ function update(deltaSec) {
                 const hutRange = CARDS.goblin_hut.spawnRange || 125;
                 const hasEnemy = game.entities.some(en => en.team !== e.team && en.hp > 0 && !en._stealthed && !en._realmHidden && dist(e, en) <= hutRange);
                 if (hasEnemy) {
-                    e._spawnTimer = (e._spawnTimer || 0) + deltaSec;
+                    e._spawnTimer = (e._spawnTimer || 0) + deltaSec * rageMult(e); // 出兵吃狂暴1.3，同tickSpawner
                     const hutInterval = CARDS.goblin_hut.spawnInterval || 2.2;
                     while (e._spawnTimer >= hutInterval) {
                         e._spawnTimer -= hutInterval;
@@ -1902,7 +2379,7 @@ function update(deltaSec) {
             // 哥布林钻机：每秒自流血50；每3秒无条件钻出1只哥布林（近战小刀，无攻击力）
             if (e.cardId === 'goblin_drill') {
                 e.hp -= (CARDS.goblin_drill.burnPerSec || 50) * deltaSec; // 自流血
-                e._spawnTimer = (e._spawnTimer || 0) + deltaSec;
+                e._spawnTimer = (e._spawnTimer || 0) + deltaSec * rageMult(e); // 出兵吃狂暴1.3，同tickSpawner
                 const drillInterval = CARDS.goblin_drill.spawnInterval || 3;
                 while (e._spawnTimer >= drillInterval) {
                     e._spawnTimer -= drillInterval;
@@ -1941,7 +2418,7 @@ function update(deltaSec) {
                 if (e.cardId === 'crossbow') e.hp -= 24 * deltaSec;
                 // 🛡️ 炮台（炮车变形）自流血：每秒扣12HP（第二条命代价）
                 if (e.cardId === 'cannon_cart' && e._turretMode) e.hp -= 12 * deltaSec;
-                if ((e._stunTimer || 0) <= 0 && e.atkCooldown > 0) e.atkCooldown -= deltaSec * rageMult(e);
+                if ((e._stunTimer || 0) <= 0 && e.atkCooldown > 0) e.atkCooldown -= deltaSec * rageMult(e) * fearMult(e);
                 // 攻击：冷却结束且有目标才开火
                 if ((e._stunTimer || 0) <= 0 && e.atkCooldown <= 0 && currentTarget) {
                     const target = currentTarget;
@@ -2025,7 +2502,7 @@ function update(deltaSec) {
             // ---- 盔甲铺：蓄力6s蓄满 → 范围内(85px)未持盾友军兵种加100盾（每次1人，加完重新蓄力）----
             if (e.cardId === 'armor_smith') {
                 if (e._chargeTimer === undefined) e._chargeTimer = 0; // 防御兜底
-                e._chargeTimer += deltaSec;
+                e._chargeTimer += deltaSec * rageMult(e); // 蓄力吃狂暴1.3，同电磁炮
                 if (e._chargeTimer > e._chargeMax) e._chargeTimer = e._chargeMax;
                 // 蓄满：每帧尝试给盾，成功才清零（没人可给就蓄着，类似电磁炮等待目标）
                 if (e._chargeTimer >= e._chargeMax) {
@@ -2050,9 +2527,61 @@ function update(deltaSec) {
 
         }  // ← 关闭 bastion/tower if
 
-        // --- 女巫/暗夜女巫：周期性召唤（骷髅/蝙蝠），按 spawnUnit 查 SUMMON_CREATORS ---
-        if (e.type === 'troop' && (e.cardId === 'night_witch' || e.cardId === 'witch')) {
+        // --- 女巫/暗夜女巫/火熔炉：周期性召唤（骷髅/蝙蝠/火豆），按 spawnUnit 查 SUMMON_CREATORS ---
+        if (e.type === 'troop' && (e.cardId === 'night_witch' || e.cardId === 'witch' || e.cardId === 'fire_furnace')) {
             tickSpawner(e, deltaSec, CARDS[e.cardId], { inheritCopy: true });
+        }
+
+        // ---- ☃️ 雪人：每秒自流血34 + 每3.5s恐惧脉冲75px + 每1.5s留下雪地轨迹 ----
+        if (e.cardId === 'snowman') {
+            e.hp -= 36 * deltaSec; // 每秒自流血36（哥布林小屋同款逐帧结算）
+            e._fearPulseTimer = (e._fearPulseTimer || 3.5) - deltaSec;
+            if (e._fearPulseTimer <= 0) {
+                e._fearPulseTimer = 3.5;
+                // 😱 恐惧脉冲范围提示：75px 淡紫环（0.5s 淡出，低调提示作用范围）
+                game.deployEffects.push({ x: e.x, y: e.y, radius: 75, timer: 0.5, maxTimer: 0.5, color: '150, 125, 200', static: true });
+                for (const en of game.entities) {
+                    if (en.team === e.team || en.hp <= 0 || en._headHidden) continue;
+                    if (Math.hypot(en.x - e.x, en.y - e.y) <= 75) {
+                        applyFear(en, 4); // 😱 恐惧4秒（攻击力/攻速-25%）
+                        game.spellEffects.push({ x: en.x, y: en.y - 24, char: '😱', size: 20, timer: 0.5, maxTimer: 0.5 });
+                    }
+                }
+            }
+            e._snowTrailTimer = (e._snowTrailTimer || 1.6) - deltaSec;
+            if (e._snowTrailTimer <= 0) {
+                e._snowTrailTimer = 1.6;
+                game.snowTrails.push({ x: e.x, y: e.y, radius: 25, team: e.team, timer: 7, maxTimer: 7, tickTimer: 1 });
+            }
+        }
+
+        // --- 🪓 附魔巨人：维护🥊附魔（落地即附魔最近非建筑友军；每0.5s补位；最多2人；巨人阵亡后已有buff保留在友军身上直到其死亡）---
+        if (e.type === 'troop' && e.cardId === 'enchant_giant') {
+            // 清理已死亡/消失的附魔目标（友军死亡才掉buff——实体移除即掉，死亡后槽位空出可补）
+            if (e._enchantIds && e._enchantIds.length) {
+                e._enchantIds = e._enchantIds.filter(id => {
+                    const t = game.entities.find(en => en.id === id);
+                    return t && t.hp > 0;
+                });
+            }
+            e._enchantCheckTimer = (e._enchantCheckTimer || 0) - deltaSec;
+            if ((e._enchantCheckTimer || 0) <= 0) {
+                e._enchantCheckTimer = 0.5;
+                while ((e._enchantIds || []).length < 2) {
+                    // 最近的未附魔非建筑友军（距离不限；排除自己；已被任何巨人附魔的不重复）
+                    let best = null, bestD = Infinity;
+                    for (const t of game.entities) {
+                        if (t === e || t.team !== e.team || t.hp <= 0 || t.type !== 'troop') continue;
+                        if (t._enchantCrit) continue;
+                        const d = Math.hypot(t.x - e.x, t.y - e.y);
+                        if (d < bestD) { bestD = d; best = t; }
+                    }
+                    if (!best) break;
+                    best._enchantCrit = true;
+                    (e._enchantIds = e._enchantIds || []).push(best.id); // 惰性初始化：未初始化时直接 push 会抛异常导致上限失效
+                    game.spellEffects.push({ x: best.x, y: best.y - 14, char: '🥊', size: 18, timer: 0.6, maxTimer: 0.6 });
+                }
+            }
         }
 
         // --- 减速计时器衰减 ---
@@ -2063,6 +2592,9 @@ function update(deltaSec) {
                 e.slowFactor = 1.0;
             }
         }
+
+        // --- 🪓 瓦基里旋斧旋转视觉计时衰减 ---
+        if (e._spinTimer > 0) e._spinTimer -= deltaSec;
 
         // --- 🧊 寒冰法师攻击力降低计时器衰减 ---
         if (e._iceMageAtkTimer > 0) {
@@ -2078,6 +2610,16 @@ function update(deltaSec) {
         if (e._stunTimer > 0) {
             e._stunTimer -= deltaSec;
             if (e._stunTimer <= 0) e._stunTimer = 0;
+        }
+
+        // --- 🌿 藤蔓·暂时地面化倒计时：到期恢复原飞行状态（entities.js 施加时记录 _vineFlyingOrig，御剑 flying 切换同款写法） ---
+        if (e._vineGroundTimer > 0) {
+            e._vineGroundTimer -= deltaSec;
+            if (e._vineGroundTimer <= 0) {
+                e._vineGroundTimer = 0;
+                e.flying = e._vineFlyingOrig || false;
+                e._vineFlyingOrig = false;
+            }
         }
 
         // --- ⚡ 杰西后撤·金色电磁弹buff计时衰减（4秒，释放后撤时在 entities.js 设置） ---
@@ -2106,8 +2648,7 @@ function update(deltaSec) {
                             const bd = calcActualDmg(25, e, en); // 冰豆自爆：45px范围25伤害+减速80%持续1.5秒
                             en.hp -= bd;
                             spawnDmgNum(en.x, en.y - 20, bd);
-                            en.slowFactor = 0.2;
-                            en.slowTimer = 1.5;
+                            applySlow(en, 0.2, 1.5);
                         }
                     }
                     // 范围提示：淡红色小环（同群攻，静态真实范围）
@@ -2134,8 +2675,10 @@ function update(deltaSec) {
                 continue;
             }
 
-            // ---- 火豆：跳跃自爆（🚩被收编时索敌范围受巡逻圈约束：只打圈内敌人，圈内无敌→绕营巡逻）----
-            if (e._fireBean) {
+            // ---- 🔥💚 火豆/疗豆：跳跃自爆（行为骨架共用；🚩被收编时索敌范围受巡逻圈约束：只打圈内敌人，圈内无敌→绕营巡逻）----
+            //      火豆=35px自爆10伤害+灼烧3秒20/秒；疗豆=单体25伤害+友军治疗buff（结算在弹道 isFireJump/isHealJump 分支）
+            const beanSpec = e._fireBean ? BEAN_SPECS._fireBean : (e._healBean ? BEAN_SPECS._healBean : null);
+            if (beanSpec) {
                 // 收编状态：索敌约束在营地索敌圈（200px 以营地圆心）；未收编：全图索敌
                 const camp = e._campFlag
                     ? game.entities.find(c => c.id === e._campId && c.hp > 0)
@@ -2157,25 +2700,28 @@ function update(deltaSec) {
                 }
                 const JUMP_RANGE = 90; // 跳跃触发范围（同暗夜女巫射程）
                 if (nearest && minDist <= JUMP_RANGE) {
-                    // 🔥 真正的抛物线跳跃：本体离场，生成抛物线弹道（锁定落点不追踪，落地以落点为中心自爆）
+                    // 真正的抛物线跳跃：本体离场，生成抛物线弹道（锁定落点不追踪，落地以落点为中心结算）
                     const sx = e.x, sy = e.y;
                     const tx = nearest.x, ty = nearest.y; // 发射瞬间锁定落点（不追踪）
                     const d0 = Math.max(1, Math.hypot(tx - sx, ty - sy));
-                    game.projectiles.push({
+                    const proj = {
                         x: sx, y: sy, sx, sy,
-                        char: '🔥', size: 15,
+                        char: beanSpec.char, size: 15,
                         speed: 250, timer: 0.9, maxTimer: 0.9, // 滞空明显
-                        isFireJump: true, dist: 0, maxDist: d0,
+                        [beanSpec.jumpFlag]: true, dist: 0, maxDist: d0,
                         tx, ty, // 锁定落点
                         arcHeight: Math.min(160, Math.max(80, d0 * 0.8)), // 抛物线弧高（比迫击炮0.7略抖）
-                        damage: 10, team: e.team, ownerId: e.id,
-                        aoeRadius: 35, // 自爆范围同火豆
-                        burnDamage: 20, burnTimer: 3.0, // 灼烧3秒20/秒
-                    });
+                        damage: beanSpec.damage, team: e.team, ownerId: e.id,
+                        aoeRadius: 35, // 自爆/单体命中判定圈同火豆
+                    };
+                    if (beanSpec.burn) {
+                        proj.burnDamage = 20; proj.burnTimer = 3.0; // 灼烧3秒20/秒
+                    }
+                    game.projectiles.push(proj);
                     e._selfDestructed = true; // 防死亡自爆重复结算
                     e.hp = 0; // 本体离场（跳跃中由弹道呈现）
                 } else if (nearest) {
-                    // 未进入跳跃范围，向敌人移动（移速34）
+                    // 未进入跳跃范围，向敌人移动（移速取自身 moveSpeed）
                     moveToward(e, nearest.x, nearest.y, deltaSec);
                 } else if (camp) {
                     // 圈内无敌 → 绕营巡逻
@@ -2184,7 +2730,7 @@ function update(deltaSec) {
                     // 🧪 测试双人：圈内无敌且未收编 → 沿路行军（走到敌堆里自爆；模板1 无行军→原地待机）
                     marchFallback(e, deltaSec);
                 }
-                continue; // 火豆跳过其他兵种行为
+                continue; // 豆豆跳过其他兵种行为
             }
 
             // 🦸 超级骑士：抛物线跳跃飞行中（水平匀速+垂直正弦弧线，先升后降；不攻击不移动，可被攻击）
@@ -2292,7 +2838,7 @@ function update(deltaSec) {
                     if (e._hatchTimer <= 0) {
                         const ph = createPhoenix(e.x, e.y, e.team, { maxHp: e._hatchMaxHp, atk: e._hatchAtk });
                         // 🔷 复制体蛋孵化的凤凰也继承复制特性：1滴血、护盾随父蛋、亮蓝幻影
-                        if (e.isCopy) { ph.hp = 1; ph.maxHp = 1; ph.shield = (e.maxShield || 0) > 0 ? 1 : 0; ph.maxShield = ph.shield; ph.isCopy = true; }
+                        if (e.isCopy || e._spiritClone) inheritCopyTraits(ph, e);
                         game.entities.push(ph);
                         e.hp = 0; // 蛋完成使命，原地消失（下一帧走通用清除）
                         game.spellEffects.push({ x: e.x, y: e.y, char: '✨', size: 36, timer: 0.5, maxTimer: 0.5 });
@@ -2317,16 +2863,8 @@ function update(deltaSec) {
 
             // ---- 矿工：潜伏阶段为纯土堆特效（entities.js 两段式部署处理），实体生成即破土，无需额外计时 ----
 
-            // ---- 骑士：冲锋倒计时 ----
-            if (e.cardId === 'knight' && !e._charging) {
-                e._chargeTimer -= deltaSec * rageMult(e);
-                if (e._chargeTimer <= 0) {
-                    e._charging = true;
-                    e._chargeTimer = 0;
-                }
-            }
-            // ---- 蛮人攻城槌：4秒后进入冲锋 ----
-            if (e.cardId === 'barbarian_battering_ram' && !e._charging) {
+            // ---- 骑士 / 蛮人攻城槌：冲锋倒计时（ChargeTimer 递减，归零进入冲锋态；两卡逻辑逐字相同故合并）----
+            if ((e.cardId === 'knight' || e.cardId === 'barbarian_battering_ram') && !e._charging) {
                 e._chargeTimer -= deltaSec * rageMult(e);
                 if (e._chargeTimer <= 0) {
                     e._charging = true;
@@ -2455,21 +2993,21 @@ function update(deltaSec) {
                     // 🌀 浪人格挡反弹判定：黄泉伤害走独立结算（不经 attackTroop），需手动补上，
                     //    否则浪人的格挡200%反弹被动对黄泉失效（黄泉为近战物理攻击，应触发反弹）
                     if (yTarget.cardId === 'ronin' && (yTarget._reflectTimer || 0) <= 0) {
-                        yTarget._reflectTimer = CARDS.ronin.reflectCooldown || 3.5;
+                        yTarget._reflectTimer = CARDS.ronin.reflectCooldown || 3.2;
                         const reflectBase = dmg + (finishChargeBlocked(e, yTarget, { blocked: true }) || 0);
                         const rd = Math.floor(reflectBase * (CARDS.ronin.reflectMultiplier || 2));
                         const rdDmg = calcActualDmg(rd, yTarget, e); // 反弹吃被反弹者（黄泉）减伤
                         e.hp -= rdDmg;
                         spawnDmgNum(e.x, e.y - 20, rdDmg);
-                        // 特效：🚫 出现在被反弹者（黄泉）头顶
-                        game.spellEffects.push({ x: e.x, y: e.y - 20, char: '🚫', size: 30, color: '#ff4757', timer: 0.4, maxTimer: 0.4 });
+                        // 特效：交叉刀痕出现在浪人与被反弹者（黄泉）中间
+                        spawnReflectCrossFx(e, yTarget);
                     } else {
                         yTarget.hp -= dmg;
                         spawnDmgNum(yTarget.x, yTarget.y - 20, dmg);
                     }
                     // 刀痕特效：单根长斩痕（yomiSlash 单根变体，render.js 全局特效层渲染）
                     const slashA = Math.atan2(yTarget.y - e.y, yTarget.x - e.x);
-                    (game.clawEffects = game.clawEffects || []).push({
+                    game.clawEffects.push({
                         x: yTarget.x, y: yTarget.y,
                         dir: slashA, yomiSlash: true,
                         timer: 0.32, maxTimer: 0.32,
@@ -2641,8 +3179,8 @@ function update(deltaSec) {
                     // 巡逻绕圈方向随机（顺/逆时针）——独立兜底：召唤时已带 _patrolX 的守卫同样需要初始化，否则 -ry*undefined=NaN 坐标污染导致守卫消失
                     e._patrolDir = rand() < 0.5 ? 1 : -1;
                 }
-                const patrolR = 70;    // 巡逻半径（固定70，不再跟随法师塔攻击范围）
-                const detectR = 250;   // 索敌范围（固定250）
+                if (e._patrolR === undefined) e._patrolR = GUARD_PATROL_R; // 巡逻半径（固定，不再跟随法师塔攻击范围）——patrolOrbit 按 _patrolR 取轨道
+                const detectR = GUARD_DETECT_R;   // 索敌范围（固定）
                 // 索敌：巡逻中心圈内 / 自身攻击范围 e.range 内（双判定，任一命中即出击；targetMode=all，建筑/兵种都打）
                 let nearest = null, minDist = detectR;
                 for (const en of game.entities) {
@@ -2657,29 +3195,9 @@ function update(deltaSec) {
                 if (nearest) {
                     e.targetId = nearest.id;   // 圈内有敌 → 出击（交给下方通用攻击/移动逻辑）
                 } else {
-                    // 圈内无敌 → 回内圈继续巡逻（绕主塔转圈 + 径向回圈修正）
+                    // 圈内无敌 → 回内圈继续巡逻（绕主塔转圈 + 径向回圈修正，数学与营地成员共用 patrolOrbit）
                     e.targetId = null;
-                    // 🧭 烟引引导中：巡逻寻路暂时改为朝烟点（仅改变移动目标，其余行为特性不变）
-                    if (e._guideX !== undefined && e._guideY !== undefined) {
-                        moveToward(e, e._guideX, e._guideY, deltaSec);
-                        continue;
-                    }
-                    const dx = e.x - e._patrolX, dy = e.y - e._patrolY;
-                    const distC = Math.hypot(dx, dy) || 1;
-                    // 巡逻速度与通用移动一致：吃减速/极速/狂暴因子（守卫仅巡逻行为与索敌范围特殊，其余与普通兵种一致）
-                    const speed = e.moveSpeed * (e.slowFactor || 1.0) * (e._poisonTimer > 0 ? 0.6 : 1.0) * (e._poisonSpellTimer > 0 ? 0.85 : 1.0) * (e._speedBoosted ? 2.0 : 1.0) * (e._charging ? (e.cardId === 'barbarian_battering_ram' ? 2.0 : 3.0) : 1.0) * rageMult(e);
-                    const step = speed * deltaSec;
-                    const rx = dx / distC, ry = dy / distC;                    // 径向单位向量（中心→守卫）
-                    const tx = -ry * e._patrolDir, ty = rx * e._patrolDir;     // 切线单位向量（绕圈方向）
-                    const err = distC - patrolR;                               // >0 太远, <0 太近
-                    const radialPull = err > 0 ? Math.min(step, err) : Math.max(-step, err * 0.3);
-                    e.x += tx * step * 0.6 - rx * radialPull;
-                    e.y += ty * step * 0.6 - ry * radialPull;
-                    // 边界限制（同 moveToward）
-                    e.x = Math.min(W - 25, Math.max(25, e.x));
-                    e.y = Math.min(H - 25, Math.max(25, e.y));
-                    // 🌊 岸边排斥框（缩窄图）：守卫巡逻绕圈与通用移动同待遇（主塔离河远，兜底收口）
-                    if (game.shrink220 && !e.flying && e.moveSpeed) riverGuardPush(e, deltaSec);
+                    patrolOrbit(e, deltaSec);
                     continue; // 巡逻中不执行下方通用索敌/攻击
                 }
             }
@@ -2821,7 +3339,7 @@ function update(deltaSec) {
                 e.targetId = attackTarget ? attackTarget.id : null;
 
                 if (attackTarget && (e._stunTimer || 0) <= 0) {
-                    if (e.atkCooldown > 0) e.atkCooldown -= deltaSec * rageMult(e);
+                    if (e.atkCooldown > 0) e.atkCooldown -= deltaSec * rageMult(e) * fearMult(e);
                     if (e.atkCooldown <= 0) {
                         attackTroop(e, attackTarget);
                         e.atkCooldown = e.atkSpeed;
@@ -2920,10 +3438,6 @@ function update(deltaSec) {
                 } else if (game.shrink220 && e.type !== 'healer') {
                     // 🧪 测试双人：索敌圈内无敌 → 沿路行军（优先级最低：一旦索到敌人走正常锁定/追击；治疗兵走自己的行军分支）
                     marchFallback(e, deltaSec);
-                } else {
-                    // 🚨 【终极排查器】如果真的找不到目标，把真凶打印出来！
-                    const enemyTower = game.entities.find(en => en.type === 'main_tower' && en.team !== e.team);
-                    console.log(`[真凶抓捕] ${e.cardId}(id=${e.id}) 找不到目标！当前敌方主塔状态:`, enemyTower);
                 }
             }
 
@@ -3061,7 +3575,7 @@ function update(deltaSec) {
                     const ninjaDist = dist(e, target);
                     const ninjaInAttackRange = ninjaDist - getHitRadius(target) <= (e.range || 135);
                     if (ninjaInAttackRange && (e._stunTimer || 0) <= 0) {
-                        e.atkCooldown -= deltaSec * rageMult(e);
+                        e.atkCooldown -= deltaSec * rageMult(e) * fearMult(e);
                         if (e.atkCooldown <= 0) {
                             attackTroop(e, target);
                             // 每两次攻击后立即随机翻滚30px；翻滚期间可以正常受到伤害
@@ -3106,7 +3620,18 @@ function update(deltaSec) {
                             const preAngle = Math.atan2(leapTarget.y - e.y, leapTarget.x - e.x);
                             const landOffset = 12;
                             const leapX = leapTarget.x - Math.cos(preAngle) * landOffset;
-                            const leapY = leapTarget.y - Math.sin(preAngle) * landOffset;
+                            let leapY = leapTarget.y - Math.sin(preAngle) * landOffset;
+                            // 🌊 落点防溺水：目标贴桥走廊外缘（|y-桥心|∈28~40]）时 12px 偏移可能把落点滑出走廊
+                            // 落进水域核心（落地次帧即溺）→ 落点 y 夹回最近桥面 ±28（与 riverGuardPush 桥面约束
+                            // 同值）——跳跃照常执行、落点必安全；目标为活体地面单位必不在核心非桥段，仅此边缘滑出
+                            if (game.shrink220
+                                && leapX > MODE_TEST_RIVER_LEFT + MODE_TEST_RIVER_GUARD
+                                && leapX < MODE_TEST_RIVER_RIGHT - MODE_TEST_RIVER_GUARD
+                                && MODE_TEST_BRIDGE_YS.every(by => Math.abs(leapY - by) > MODE_TEST_BRIDGE_HALF)) {
+                                let nb = MODE_TEST_BRIDGE_YS[0];
+                                for (const by of MODE_TEST_BRIDGE_YS) if (Math.abs(leapY - by) < Math.abs(leapY - nb)) nb = by;
+                                leapY = Math.max(nb - 28, Math.min(nb + 28, leapY));
+                            }
                             const lDist = Math.max(1, Math.hypot(leapX - e.x, leapY - e.y));
                             e._leapJumping = true;   // 进入抛物线跳跃
                             e._leapSx = e.x; e._leapSy = e.y;
@@ -3165,13 +3690,13 @@ function update(deltaSec) {
                                 const aDmg = calcActualDmg(e.atk * 2, e, atkTarget);
                                 // 浪人：格挡突袭冲刺（近战）并200%反弹
                                 if (atkTarget.cardId === 'ronin' && (atkTarget._reflectTimer || 0) <= 0) {
-                                    atkTarget._reflectTimer = CARDS.ronin.reflectCooldown || 3.5;
+                                    atkTarget._reflectTimer = CARDS.ronin.reflectCooldown || 3.2;
                                     const rd = Math.floor(aDmg * (CARDS.ronin.reflectMultiplier || 2));
                                     const rdDmg = calcActualDmg(rd, atkTarget, e); // 反弹伤害统一收口：吃被反弹者减伤
                                     e.hp -= rdDmg;
                                     spawnDmgNum(e.x, e.y - 20, rdDmg);
-                                    // 特效：🚫 出现在被反弹者（突袭者）头顶
-                                    game.spellEffects.push({ x: e.x, y: e.y - 20, char: '🚫', size: 30, color: '#ff4757', timer: 0.4, maxTimer: 0.4 });
+                                    // 特效：交叉刀痕出现在浪人（atkTarget）与被反弹者（突袭者）中间
+                                    spawnReflectCrossFx(atkTarget, e);
                                 } else {
                                     atkTarget.hp -= aDmg;
                                     spawnDmgNum(atkTarget.x, atkTarget.y - 20, aDmg);
@@ -3199,10 +3724,7 @@ function update(deltaSec) {
                             e._gulping = false;
                             e._gulpTimer = 0;
                             e._gulpTargetId = null;
-                            if (game.fishingLines && e._gulpLineId) {
-                                game.fishingLines = game.fishingLines.filter(l => l.id !== e._gulpLineId);
-                            }
-                            e._gulpLineId = null;
+                            removeFishingLineRef(e, '_gulpLineId');
                         } else {
                             e._gulpTimer -= deltaSec;
                             // 🪝 收线拖拽：把敌人拉向汉拔尼（复用渔夫收线速度）
@@ -3229,10 +3751,7 @@ function update(deltaSec) {
                                 e._gulping = false;
                                 e._gulpTimer = 0;
                                 e._gulpTargetId = null;
-                                if (game.fishingLines && e._gulpLineId) {
-                                    game.fishingLines = game.fishingLines.filter(l => l.id !== e._gulpLineId);
-                                }
-                                e._gulpLineId = null;
+                                removeFishingLineRef(e, '_gulpLineId');
                                 game.spellEffects.push({ x: e.x, y: e.y - 24, char: '😋', size: 28, timer: 0.5, maxTimer: 0.5 });
                             }
                         }
@@ -3258,8 +3777,7 @@ function update(deltaSec) {
                             e._gulpTimer = CARDS.hannibal.gulpTime || 0.5;
                             e._gulpTargetId = prey.id;
                             // 创建鱼线（pulling 模式直接拖拽，钩头连目标）
-                            game.fishingLines = game.fishingLines || [];
-                            game._fishingLineSeq = (game._fishingLineSeq || 0) + 1;
+                            game._fishingLineSeq += 1;
                             game.fishingLines.push({
                                 id: game._fishingLineSeq,
                                 ownerId: e.id,
@@ -3283,11 +3801,8 @@ function update(deltaSec) {
                     const lineSpeed = CARDS.fisherman.hookLineSpeed || 700;
                     const pullSpeed = CARDS.fisherman.hookPullSpeed || 260;
                     // 查找当前鱼线
-                    const findLine = () => (game.fishingLines || []).find(l => l.id === e._hookLineId);
-                    const removeLine = () => {
-                        if (game.fishingLines) game.fishingLines = game.fishingLines.filter(l => l.id !== e._hookLineId);
-                        e._hookLineId = null;
-                    };
+                    const findLine = () => game.fishingLines.find(l => l.id === e._hookLineId);
+                    const removeLine = () => removeFishingLineRef(e, '_hookLineId');
 
                     // ① 蓄力中：倒计时，被眩晕/目标失效则取消
                     if (e._hookCharging) {
@@ -3304,8 +3819,7 @@ function update(deltaSec) {
                                 const sx = e.x + 10, sy = e.y - 16;
                                 const dx = hookTarget.x - sx, dy = (hookTarget.y - 10) - sy;
                                 const d = Math.hypot(dx, dy);
-                                game.fishingLines = game.fishingLines || [];
-                                game._fishingLineSeq = (game._fishingLineSeq || 0) + 1;
+                                game._fishingLineSeq += 1;
                                 game.fishingLines.push({
                                     id: game._fishingLineSeq,
                                     ownerId: e.id,
@@ -3428,7 +3942,7 @@ function update(deltaSec) {
                 if (target && dist(e, target) - getHitRadius(target) <= e.range) {
                     // ---- 🦄 独角兽：攻击范围内出现敌人 → 蓄力0.8秒（替代普攻；蓄满直线冲刺，处理见上方蓄力段）----
                     if (e.cardId === 'unicorn') {
-                        if (e.atkCooldown > 0) e.atkCooldown -= deltaSec * rageMult(e);
+                        if (e.atkCooldown > 0) e.atkCooldown -= deltaSec * rageMult(e) * fearMult(e);
                         if ((e._stunTimer || 0) <= 0 && !e._uniCharging && e.atkCooldown <= 0) {
                             // ⚡ 锁定的是方向而非敌人：蓄力开始瞬间记下朝向目标的方向，之后敌人死活/隐身/升空/跑出射程均不影响，
                             //    蓄满后朝该方向直线冲刺135px（参考超骑蓄力；atkSpeed=1.0 作为两轮冲刺的间隔）
@@ -3480,10 +3994,12 @@ function update(deltaSec) {
                     } else {
                         // 在攻击范围内 → 攻击
                         // 💥 狂战士爆发：buff期间攻速提升（冷却递减速度不变，由下方攻击间隔控制 0.2s）
-                        e.atkCooldown -= deltaSec * rageMult(e);
+                        e.atkCooldown -= deltaSec * rageMult(e) * fearMult(e);
                         if (e.atkCooldown <= 0) {
                             attackTroop(e, target);
-                            // 🥷 忍者：每两次攻击后，第二次攻击发出后立即随机方向翻滚30px；翻滚期间仍可受伤
+                            // 🥷 忍者：每两次攻击后，第二次攻击发出后立即随机方向翻滚30px；
+                            //    翻滚期间进入隐身（可受伤，但不被敌方锁定；翻滚结束由 _ninjaRollRemain 归零处统一现身）
+                            //    ★ 与上方忍者专用分支的翻滚语义统一（原此处漏了 _stealthed，攻击隐身目标的翻滚不隐身）
                             if (e.cardId === 'ninja' && (e._ninjaAttackCount || 0) % 2 === 0) {
                                 const rollA = rand() * Math.PI * 2;
                                 e._ninjaRollRemain = 30;
@@ -3491,6 +4007,7 @@ function update(deltaSec) {
                                 e._ninjaRollVy = Math.sin(rollA);
                                 e._ninjaRollAngle = 0;
                                 e._ninjaRollSpin = (rand() < 0.5 ? -1 : 1) * Math.PI * 8;
+                                e._stealthed = true;
                             }
                             // 👑 小王子：连续攻击同一目标攻速递增（每射一箭-0.2s，下限0.4s）；切换目标后重新从1.2s开始
                             if (e.cardId === 'little_prince') {
@@ -3628,7 +4145,7 @@ function update(deltaSec) {
     // ---- 更新弹道：统一查表分发（PROJECTILE_HANDLERS 处理器表见文件顶部）----
     for (let p of game.projectiles) {
         tryReflectProjectile(p, deltaSec); // 🧘 武僧超脱反弹：先于本帧移动检测（判定含本帧步长前瞻，命中结算前必先反弹）
-        PROJECTILE_HANDLERS[p.isElectroBall ? 'electroBall' : p.isElectro ? 'electro' : p.isShard ? 'shard' : p.isHuntShot ? 'huntShot' : p.isRocket ? 'rocket' : p.isMortar ? 'mortar' : p.isBomber ? 'bomber' : p.isFireJump ? 'fireJump' : p.isPrincessSalvo ? 'princessSalvo' : p.isSpear ? 'spear' : p.isAxe ? 'axe' : p.isDart ? 'dart' : p.isIceShard ? 'iceShard' : p.isFireShard ? 'fireShard' : p.isSword ? 'sword' : 'tracking'].update(p, deltaSec);
+        PROJECTILE_HANDLERS[p.isElectroBall ? 'electroBall' : p.isElectro ? 'electro' : p.isShard ? 'shard' : p.isHuntShot ? 'huntShot' : p.isRocket ? 'rocket' : p.isMortar ? 'mortar' : p.isBomber ? 'bomber' : p.isFireJump ? 'fireJump' : p.isHealJump ? 'healJump' : p.isPrincessSalvo ? 'princessSalvo' : p.isSpear ? 'spear' : p.isAxe ? 'axe' : p.isDart ? 'dart' : p.isIceShard ? 'iceShard' : p.isFireShard ? 'fireShard' : p.isSword ? 'sword' : p.isWindBlast ? 'windBlast' : 'tracking'].update(p, deltaSec);
     }
     game.projectiles = game.projectiles.filter(p => p.timer > 0);
 
@@ -3661,7 +4178,7 @@ function update(deltaSec) {
     game.pierceArrows = game.pierceArrows.filter(a => a.traveled < a.maxTravel);
 
     // ---- 清理渔夫/汉拔尼鱼线：关联单位已死或拉取已结束则移除 ----
-    if (game.fishingLines && game.fishingLines.length) {
+    if (game.fishingLines.length) {
         game.fishingLines = game.fishingLines.filter(l => {
             const owner = game.entities.find(en => en.id === l.ownerId);
             return owner && ((owner.cardId === 'fisherman' && (owner._hookFlying || owner._hookPulling))
@@ -3674,7 +4191,7 @@ function update(deltaSec) {
     game.spellEffects = game.spellEffects.filter(s => s.timer > 0);
 
     // ---- 🐾 更新狂战士爆发·兽爪血痕（全局特效层，渲染在所有实体之上）----
-    if (game.clawEffects && game.clawEffects.length) {
+    if (game.clawEffects.length) {
         for (let i = game.clawEffects.length - 1; i >= 0; i--) {
             game.clawEffects[i].timer -= deltaSec;
             if (game.clawEffects[i].timer <= 0) game.clawEffects.splice(i, 1);
@@ -3682,7 +4199,7 @@ function update(deltaSec) {
     }
 
     // ---- 🌊 更新落水水花特效（全局特效层，render 只读绘制；detect220 变体落水时生成）----
-    if (game.splashFX && game.splashFX.length) {
+    if (game.splashFX.length) {
         for (let i = game.splashFX.length - 1; i >= 0; i--) {
             game.splashFX[i].timer -= deltaSec;
             if (game.splashFX[i].timer <= 0) game.splashFX.splice(i, 1);
@@ -3795,68 +4312,38 @@ function update(deltaSec) {
         }
     }
 
-    // ---- 箭雨：三段延迟伤害（每0.3秒一段，共3段，每段触发一次特效）----
-    for (let i = game.arrowRainStrikes.length - 1; i >= 0; i--) {
-        const s = game.arrowRainStrikes[i];
-        s.timer -= deltaSec;
-        while (s.timer <= 0 && s.strikesLeft > 0) {
-            s.strikesLeft--;
-            s.timer += s.interval;
-            // 本段伤害（与火球/原箭雨一致：防御工事×towerDmgMul；武僧超脱反弹已在飞行途中处理）
-            game.entities.forEach(e => {
-                if (e.team === s.team || e.hp <= 0 || e._headHidden) return;
-                if (dist(e, { x: s.x, y: s.y }) <= s.radius) {
-                    const dmg2 = e.fortification ? s.damage * s.mul : s.damage;
-                    const dmgS = calcActualDmg(dmg2, null, e); // 箭雨法术伤害统一收口（无攻击者）
-                    e.hp -= dmgS;
-                    spawnDmgNum(e.x, e.y - 20, dmgS);
-                }
+    // ---- 箭雨：三段延迟伤害（每0.3秒一段，共3段，每段触发一次特效）——多段骨架 tickMultiStrikeQueue 收敛 ----
+    tickMultiStrikeQueue(game.arrowRainStrikes, deltaSec, (s) => {
+        // 本段特效：箭雨
+        for (let j = 0; j < 8; j++) {
+            const angle = rand() * 2 * Math.PI;
+            const r = rand() * s.radius * 0.7;
+            game.spellEffects.push({
+                x: s.x + Math.cos(angle) * r,
+                y: s.y + Math.sin(angle) * r,
+                char: '།', size: 16,
+                timer: 0.5 + rand() * 0.3,
+                maxTimer: 0.8,
             });
-            // 本段特效：箭雨
-            for (let j = 0; j < 8; j++) {
-                const angle = rand() * 2 * Math.PI;
-                const r = rand() * s.radius * 0.7;
-                game.spellEffects.push({
-                    x: s.x + Math.cos(angle) * r,
-                    y: s.y + Math.sin(angle) * r,
-                    char: '།', size: 16,
-                    timer: 0.5 + rand() * 0.3,
-                    maxTimer: 0.8,
-                });
-            }
-            // ★ 本段落地冲击（参考超骑落地效果）
-            game.deployEffects.push({ x: s.x, y: s.y, radius: s.radius * 0.3, timer: 0.3, maxTimer: 0.3 });
         }
-        if (s.strikesLeft <= 0) game.arrowRainStrikes.splice(i, 1);
-    }
+        // ★ 本段落地冲击（参考超骑落地效果）
+        game.deployEffects.push({ x: s.x, y: s.y, radius: s.radius * 0.3, timer: 0.3, maxTimer: 0.3 });
+    }, (e, s) => {
+        // 本段伤害（与火球/原箭雨一致：防御工事×towerDmgMul；武僧超脱反弹已在飞行途中处理）
+        return e.fortification ? s.damage * s.mul : s.damage;
+    });
 
-    // ---- 地震法术：持续3秒三段伤害（每1.5秒一段），对建筑10倍 ----
-    for (let i = game.earthquakeStrikes.length - 1; i >= 0; i--) {
-        const s = game.earthquakeStrikes[i];
-        s.timer -= deltaSec;
-        while (s.timer <= 0 && s.strikesLeft > 0) {
-            s.strikesLeft--;
-            s.timer += s.interval;
-            game.entities.forEach(e => {
-                if (e.team === s.team || e.hp <= 0 || e._headHidden) return;
-                if (e.flying) return; // 🌍 地震只震地面，不影响空中单位
-                if (dist(e, { x: s.x, y: s.y }) <= s.radius) {
-                    // 建筑（各类塔/兵营/采集器）受10倍伤害；主塔/堡垒除外（仅基础伤害）
-                    // 兵种也吃基础伤害
-                    const isBuilding = e.type === 'tower' || e.type === 'barrack'
-                        || e.type === 'collector';
-                    const dmg2 = isBuilding ? s.damage * s.buildingMul : s.damage;
-                    const dmgS = calcActualDmg(dmg2, null, e); // 地震法术伤害统一收口（无攻击者）
-                    e.hp -= dmgS;
-                    spawnDmgNum(e.x, e.y - 20, dmgS);
-                }
-            });
-            // 每段震动特效：冲击圈 + 震点
-            game.deployEffects.push({ x: s.x, y: s.y, radius: s.radius, timer: 0.35, maxTimer: 0.35 });
-            game.spellEffects.push({ x: s.x, y: s.y, char: '💥', size: 30, timer: 0.35, maxTimer: 0.35 });
-        }
-        if (s.strikesLeft <= 0) game.earthquakeStrikes.splice(i, 1);
-    }
+    // ---- 地震法术：持续3秒三段伤害（每1.5秒一段），对建筑10倍 ——多段骨架收敛（仅地面）----
+    tickMultiStrikeQueue(game.earthquakeStrikes, deltaSec, (s) => {
+        // 每段震动特效：冲击圈 + 震点
+        game.deployEffects.push({ x: s.x, y: s.y, radius: s.radius, timer: 0.35, maxTimer: 0.35 });
+        game.spellEffects.push({ x: s.x, y: s.y, char: '💥', size: 30, timer: 0.35, maxTimer: 0.35 });
+    }, (e, s) => {
+        // 建筑（各类塔/兵营/采集器）受10倍伤害；主塔/堡垒除外（仅基础伤害）——兵种也吃基础伤害
+        const isBuilding = e.type === 'tower' || e.type === 'barrack'
+            || e.type === 'collector';
+        return isBuilding ? s.damage * s.buildingMul : s.damage;
+    }, { groundOnly: true });
 
     // ---- 大雷电：三道落雷（每0.5秒一道），按锁定顺序逐次劈下 ----
     for (let i = game.thunderStrikes.length - 1; i >= 0; i--) {
@@ -3950,20 +4437,38 @@ function update(deltaSec) {
                 if (e.team === f.team || e.hp <= 0 || e._headHidden) return;
                 if (dist(e, { x: f.x, y: f.y }) <= f.radius) {
                     const dmg2 = e.fortification ? f.damage * f.mul : f.damage;
-                    const dmgF = calcActualDmg(dmg2, null, e); // 火球法术伤害统一收口（无攻击者）
+                    const dmgF = calcActualDmg(dmg2, null, e); // 火球/雪球法术伤害统一收口（无攻击者）
                     e.hp -= dmgF;
                     spawnDmgNum(e.x, e.y - 20, dmgF);
-                    // ★ 火球击退（参考超骑落地击退）：仅兵种生效；标记剩余位移向量，帧驱动渐进滑动（位移式击退，不瞬移）
+                    // ★ 击退（参考超骑落地击退）：仅兵种生效；标记剩余位移向量，帧驱动渐进滑动（位移式击退，不瞬移）
                     if (e.moveSpeed !== undefined && !e.fortification) {
                         const angle = Math.atan2(e.y - f.y, e.x - f.x);
                         e._kbX = Math.cos(angle) * f.knockback;
                         e._kbY = Math.sin(angle) * f.knockback;
+                        // ❄️ 雪球附加减速（参考冰豆减速buff）：取更强减速系数、时长取最大（3秒）；❄️图标由 drawStatusIcon 自动显示
+                        if (f.snow) {
+                            applySlow(e, f.slowFactor, f.slowDuration);
+                        }
                     }
                 }
             });
-            // ★ 落地特效：爆点 + 火焰 + 金色冲击圈 + 淡红色静态范围小红圈（两者并存）
-            game.spellEffects.push({ x: f.x, y: f.y, char: '💥', size: 44, timer: 0.35, maxTimer: 0.35 });
-            game.spellEffects.push({ x: f.x, y: f.y, char: '🔥', size: 40, timer: 0.6, maxTimer: 0.6 });
+            // ★ 落地特效：雪球=❄️爆点+冰晶四溅；火球=爆点+火焰（淡红色静态范围小红圈两者通用）
+            if (f.snow) {
+                game.spellEffects.push({ x: f.x, y: f.y, char: '❄️', size: 40, timer: 0.6, maxTimer: 0.6, color: 'rgba(170,220,255,0.9)' });
+                for (let j = 0; j < 5; j++) {
+                    const a = rand() * Math.PI * 2;
+                    const r = rand() * f.radius * 0.7;
+                    game.spellEffects.push({
+                        x: f.x + Math.cos(a) * r, y: f.y + Math.sin(a) * r,
+                        char: '❄️', size: 9 + rand() * 5,
+                        timer: 0.3 + rand() * 0.3, maxTimer: 0.6,
+                        color: 'rgba(190,230,255,0.9)',
+                    });
+                }
+            } else {
+                game.spellEffects.push({ x: f.x, y: f.y, char: '💥', size: 44, timer: 0.35, maxTimer: 0.35 });
+                game.spellEffects.push({ x: f.x, y: f.y, char: '🔥', size: 40, timer: 0.6, maxTimer: 0.6 });
+            }
             game.deployEffects.push({ x: f.x, y: f.y, radius: f.radius, timer: 0.4, maxTimer: 0.4 });
             game.deployEffects.push({ x: f.x, y: f.y, radius: f.radius, timer: 0.4, maxTimer: 0.4, color: AOE_RING_COLOR, static: true });
             game.fireballFlights.splice(i, 1);
@@ -4057,6 +4562,76 @@ function update(deltaSec) {
         if (Math.abs(lg.x - lg.startX) >= lg.distance) game.logRolls.splice(i, 1);
     }
 
+    // ---- 🪨 投石人巨石：直线滚动前进 + 沿途命中判定（只打地面；每个敌人仅一次伤害一次击退；滚满105px消失）----
+    for (let i = game.boulderRolls.length - 1; i >= 0; i--) {
+        const b = game.boulderRolls[i];
+        const prevX = b.x, prevY = b.y;
+        const step = b.speed * deltaSec;
+        b.x += b.dx * step;
+        b.y += b.dy * step;
+        b.traveled += step;
+        // 命中判定：敌人中心到本帧滚动线段的最近距离 ≤ 巨石半径+受击半径（扫掠检测防高速穿透漏判）
+        const vx = b.x - prevX, vy = b.y - prevY;
+        const L2 = vx * vx + vy * vy;
+        for (const e of game.entities) {
+            if (e.team === b.team || e.hp <= 0 || e._headHidden) continue;
+            if (e.flying) continue; // 不可对空（参考滚木）
+            if ((b.hitCount[e.id] || 0) >= 2) continue; // 每个敌人最多结算两次（两次击退合计可推出40px）
+            const wx = e.x - prevX, wy = e.y - prevY;
+            const t = L2 > 0 ? Math.max(0, Math.min(1, (wx * vx + wy * vy) / L2)) : 0;
+            const cx = prevX + vx * t, cy = prevY + vy * t;
+            if (Math.hypot(e.x - cx, e.y - cy) <= b.radius + getHitRadius(e)) {
+                const hits = (b.hitCount[e.id] || 0) + 1;
+                b.hitCount[e.id] = hits;
+                // 伤害只在第一次撞击结算；第二次仅击退（追撞推位不重复扣血）
+                if (hits === 1) {
+                    const atkEnt = game.entities.find(en => en.id === b.ownerId) || null;
+                    const dmgB = calcActualDmg(b.damage, atkEnt, e); // 单位攻击伤害：统一吃目标减伤/攻击者狂暴
+                    e.hp -= dmgB;
+                    spawnDmgNum(e.x, e.y - 20, dmgB);
+                }
+                // 击退（沿滚动方向推20px，位移式滑动不瞬移）：仅兵种生效（建筑/主塔不被推）
+                if (e.moveSpeed !== undefined && !e.fortification) {
+                    e._kbX = b.dx * b.knockback;
+                    e._kbY = b.dy * b.knockback;
+                }
+                // 命中特效：碎石 + 撞击
+                game.spellEffects.push({ x: e.x, y: e.y - 6, char: '🪨', size: 12, timer: 0.25, maxTimer: 0.25 });
+                game.spellEffects.push({ x: e.x, y: e.y + 4, char: '💥', size: 10, timer: 0.2, maxTimer: 0.2 });
+            }
+        }
+        // 滚动距离耗尽 → 碎裂消散
+        if (b.traveled >= b.distance) {
+            game.spellEffects.push({ x: b.x, y: b.y, char: '💥', size: 14, timer: 0.2, maxTimer: 0.2 });
+            game.boulderRolls.splice(i, 1);
+        }
+    }
+
+    // ---- 🪦 骷髅召唤：墓土圈内每0.7秒随机位置隆起小土堆，0.4s后破土钻出一只骷髅（共13只/9.1秒）——复用多段骨架，无伤害仅召唤 ----
+    tickMultiStrikeQueue(game.skeletonSummonZones, deltaSec, (s) => {
+        // 圆内均匀随机落点（rand() 种子随机，Lockstep 两端一致）；留 14px 余量防贴边出圈
+        const ang = rand() * 2 * Math.PI;
+        const rr = Math.sqrt(rand()) * Math.max(0, s.radius - 14);
+        const sx = s.x + Math.cos(ang) * rr;
+        const sy = s.y + Math.sin(ang) * rr;
+        // 土堆隆起段（矿工 miner_dig 小号版）：先鼓包 0.4s
+        game.spellEffects.push({ x: sx, y: sy, type: 'skeleton_dig', timer: 0.4, maxTimer: 0.4 });
+        // 破土段：土堆成型后骷髅钻出（挂 pending 由下方帧循环兑现）
+        game.skeletonDigSpawns.push({ x: sx, y: sy, team: s.team, timer: 0.4 });
+    }, () => 0); // 召唤法术无伤害：dmgFor 恒 0（calcActualDmg(0) 自动不产生飘字）
+
+    // ---- 🪦 骷髅破土兑现：土堆隆起期满 → 骷髅钻出 + 尘土爆点 ----
+    for (let i = game.skeletonDigSpawns.length - 1; i >= 0; i--) {
+        const d = game.skeletonDigSpawns[i];
+        d.timer -= deltaSec;
+        if (d.timer <= 0) {
+            // 破土召唤不散位：骷髅必须从土堆正下方钻出（女巫 creator 自带半径50圆散，这里改用微抖动）
+            game.entities.push(createSummon(GOBLIN_TEMPLATE, 'goblin', d.x, d.y, d.team, { jitterX: 6, jitterY: 6 }));
+            game.spellEffects.push({ x: d.x, y: d.y, char: '💥', size: 10, timer: 0.25, maxTimer: 0.25 });
+            game.skeletonDigSpawns.splice(i, 1);
+        }
+    }
+
     // ---- 更新闪电链特效 ----
     for (let c of game.lightningChains) c.timer -= deltaSec;
     game.lightningChains = game.lightningChains.filter(c => c.timer > 0);
@@ -4092,6 +4667,18 @@ function update(deltaSec) {
 
     // ---- 🐘 汉拔尼：吞入目标已在吞入瞬间转为快照并移除，无隐藏实体需要过滤 ----
 
+    // ---- 📖 读书人·閃第二条命：受致命攻击 → 血量锁1并再次触发閃（0.6s无敌+往攻击方向后面瞬移）；一条命仅一次 ----
+    //     必须赶在死亡结算链（resolveDeaths/精英槽恢复/死亡清理）之前把 hp 拉回正数，避免整条死亡流程误触发；
+    //     靈克隆体与复制体不享受（克隆体没有第二条命）
+    for (const e of game.entities) {
+        if (e.cardId === 'scholar' && !e.isCopy && !e._spiritClone && e._scholarSecondLife && e.hp <= 0 && !isNaN(e.hp)) {
+            e._scholarSecondLife = false;
+            e.hp = 1;
+            e._scholarBlinkTimer = Math.max(e._scholarBlinkTimer || 0, 0.6); // 触发閃：无敌窗口 + 帧循环结算瞬移
+            game.spellEffects.push({ x: e.x, y: e.y - 36, char: '閃', size: 26, color: '#ffd700', timer: 0.6, maxTimer: 0.6 });
+        }
+    }
+
     // ---- 死亡结算（配置驱动 DEATH_RESOLVERS，见文件顶部；必须在死亡清理之前）----
     resolveDeaths();
 
@@ -4111,29 +4698,13 @@ function update(deltaSec) {
     for (const e of game.entities) {
         if (e.hp > 0 || isNaN(e.hp)) continue;
         if (e.isCopy) continue;                       // 复制法术复制体不触发恢复
+        if (e._spiritClone) continue;                 // 📖 靈·紫色克隆体（读书人书灵技能）不触发任何精英槽恢复
         if (e.isMirrored) {
-            // 🪞 镜像精英死亡：删除独立镜像槽 → 镜像卡恢复为镜像法术；
-            //    🕊️ 精英镜像冷却从此刻才开始读秒（继承该精英卡的冷却，如剑仙15s），读秒期间镜像卡为黑色不可用
-            const esM = game.eliteSkills[e.team];
-            if (esM && esM['mirror_' + e.cardId]) delete esM['mirror_' + e.cardId];
-            const dCard = CARDS[e.cardId];
-            if (dCard && dCard.cooldown) {
-                setMirrorCooldown(e.team, dCard.cooldown);
-            }
+            // 🪞 镜像精英死亡：删除独立镜像槽 → 镜像卡恢复为镜像法术并开始读秒（见 clearMirrorEliteSlot）
+            clearMirrorEliteSlot(e.team, e.cardId);
             continue;
         }
-        const card = CARDS[e.cardId];
-        if (!card || !card.activeSkill) continue;
-        // 场上还有其他存活的本体 → 暂不恢复（镜像精英不计入，本体槽独立）
-        if (game.entities.some(x => x !== e && x.cardId === e.cardId && x.team === e.team && x.hp > 0 && !x.isCopy && !x.isMirrored)) continue;
-        const es = game.eliteSkills[e.team];
-        if (!es || !es[e.cardId]) continue;
-        const st = es[e.cardId];
-        st.mode = 'deploy';
-        st.cdLeft = card.cooldown;       // 死亡后才开始冷却计时（15秒）
-        st.skillCdLeft = 0;              // 清除技能冷却，重新部署后御剑可直接使用
-        // 🛕 神赐：神庙死亡 → 费用重置11（不在场不累计，重新部署后从11重新减费）
-        if (card.activeSkill.id === 'goblin_bless') st.blessCost = card.activeSkill.cost;
+        resetEliteCardOnDeath(e.team, e.cardId);
     }
 
     // ---- 移除死亡实体（同时过滤掉 hp 为 NaN 的脏数据）----
@@ -4154,8 +4725,8 @@ function update(deltaSec) {
     // 触发告警提示（仅在有新堡垒被摧毁时弹出）
     const totalLost = game.bastionsLost.player + game.bastionsLost.ai;
     let promptLevel = totalLost >= 2 ? 2 : totalLost >= 1 ? 1 : 0;
-    if (promptLevel > game.lastBastionPromptLevel) {
-        game.lastBastionPromptLevel = promptLevel;
+    if (promptLevel > game.uiState.lastBastionPromptLevel) {
+        game.uiState.lastBastionPromptLevel = promptLevel;
         showBastionAlert();
     }
 
@@ -4268,9 +4839,9 @@ function getHitRadius(e) {
 /** 判断单位能否攻击飞行 */
 function canTargetFlying(entity) {
     if (entity.canHitAir) return true;                  // 蝙蝠：近战但可对空
-    if (entity.groundOnly) return false;                // 炮车：只对地
+    if (entity.groundOnly) return false;                // 只对地（炮车/电磁炮/渔夫/独角兽/炮塔·迫击炮·十字弩——统一走 config 的 groundOnly 标记）
     if (entity.type === 'bastion') return true;            // 堡垒对空对地
-    if (entity.type === 'tower' && entity.cardId !== 'mage_tower' && entity.cardId !== 'inferno_tower' && entity.cardId !== 'tesla_tower') return false; // 炮塔默认只能对地，法师塔/地狱塔/电磁塔可对空
+    // 法师塔/地狱塔/电磁塔可对空（config 无 groundOnly 标记）→ 走下方 range 判定；其余对地塔已被 groundOnly 拦截
     // 🕊️ 剑仙御剑升空后可对空（须在近战拦截之前放行）
     if (entity.cardId === 'sword_immortal' && entity.flying) return true;
     // 🌑 黄泉·界域：大招激活期间可对空（须在近战拦截之前放行）
@@ -4294,10 +4865,10 @@ function clearChargeStates(e) {
     if (e._hookCharging) { e._hookCharging = false; e._hookTimer = 0; e._hookTargetId = null; }
     if (e._gulping) {  // 🐘 拉取失败：取消+清鱼线（与拉取分支 shouldCancel 同款清理）
         e._gulping = false; e._gulpTimer = 0; e._gulpTargetId = null;
-        if (game.fishingLines && e._gulpLineId) game.fishingLines = game.fishingLines.filter(l => l.id !== e._gulpLineId);
-        e._gulpLineId = null;
+        removeFishingLineRef(e, '_gulpLineId');
     }
     e._detourBridge = null; e._detourTargetId = null;  // 🌉 河道改道记忆随目标失效清除（detect220 变体字段，其他模式为 undefined 无害）
+    e._navPath = null; e._navDest = null; e._navIdx = 0;  // 🧭 导航寻路缓存随目标失效清除（路径/目的地/进度，目标更换时归零）
 }
 
 /** 🧪 行军走廊：段 a→b 上 t(0~1) 位置沿法向偏移 offset 的目标点（offset 正=段方向左侧） */
@@ -4307,13 +4878,36 @@ function marchOffsetPoint(ax, ay, bx, by, t, offset) {
     return { x: ax + (bx - ax) * t + nx * offset, y: ay + (by - ay) * t + ny * offset };
 }
 
+/** 🧪 走廊点出圈收缩（v11.73）：带偏移点若落入障碍膨胀体（pad=NAV_GRID_PAD，与寻路光栅化外扩一致），
+ *  偏移量保号按步长2向0收缩直到出圈再返回该点——路线点距堡垒/主塔中心≥70>阻挡圈半径53(碰撞半宽28+外扩25)，
+ *  off=0 必出圈=天然兜底（off===0 仍挡则防御性返回路线点）。治"堡垒旁走廊边缘卡死"：走廊偏移 ±30 使走廊边缘
+ *  距建筑中心最近 40px<53，偏移大的单位走廊目的地点落在建筑阻挡圈内 → A* 终点投影到圈外 vs marchFallback
+ *  汇入(6px)/段推进(10px)判定永不满足 → 单位在堡垒旁卡死抖动；收缩后目的地点必可走，A* 尾点还原精确到达 */
+function marchClearPoint(e, ax, ay, bx, by, t, offset) {
+    const obstacles = [];
+    for (const src of NAV_OBSTACLE_SOURCES) {
+        for (const obs of src(e)) obstacles.push(obs);
+    }
+    let off = offset;
+    for (;;) {
+        const p = marchOffsetPoint(ax, ay, bx, by, t, off);
+        let blocked = false;
+        for (const obs of obstacles) {
+            if (navObstacleContains(obs, p.x, p.y, NAV_GRID_PAD)) { blocked = true; break; }
+        }
+        if (!blocked || off === 0) return p;
+        off = off > 0 ? Math.max(0, off - 2) : Math.min(0, off + 2);
+    }
+}
+
 /**
  * 🧪 测试双人（本机）：无目标行军（detect220 专属，优先级最低）
- * 索敌圈（220）内无敌时沿 MODE_TEST_ROUTES 行军走向敌方主塔；一旦索到敌人，调用方分支不再进入本函数（去追杀）。
+ * 索敌圈（地面330）内无敌时沿 MODE_TEST_ROUTES 行军走向敌方主塔；一旦索到敌人，调用方分支不再进入本函数（去追杀）。
  * 路径选择：按 y<H/2 选上/下路，按 team 定方向（player 正序向右 / ai 反序向左）；每帧对折线做最近线段投影——
- * 部署在路中间时直接切入不回头路，战斗被拉离路线后自动重新吸附。终点=敌方主塔（半途必被220圈锁定转入战斗）。
- * 走廊：路线扩宽 ±30px，每单位 rand() 分配一次固定横向偏移（_marchOffset），队伍散布走廊内不全挤一条线。
- */
+ * 部署在路中间时直接切入不回头路，战斗被拉离路线后自动重新吸附。终点=敌方主塔（半途必被330圈锁定转入战斗）。
+ * 走廊：路线扩宽 ±30px，每单位 rand() 分配一次固定横向偏移（_marchOffset），队伍散布走廊内不全挤一条线；
+ * 带偏移目的地点过 marchClearPoint 出圈收缩（v11.73）——走廊边缘穿过堡垒/主塔阻挡圈（路线距建筑中心 70 <
+ * 阻挡圈半径 53+偏移 30），偏移大的单位走廊点落圈 → A* 绕圈 vs 汇入/推进精确判定死循环卡死，收缩后可走 */
 function marchFallback(e, deltaSec) {
     // 特殊状态豁免：冲锋/蓄力/拉取中不接管移动（保持自身行为）；消化中【不豁免】——消化移速16本就设计为边消化边推进
     if (e._retreatCharging || e._escortCharging || e._uniDashing || e._uniCharging
@@ -4326,15 +4920,20 @@ function marchFallback(e, deltaSec) {
     const pts = e.team === 'player' ? base : [...base].reverse();
 
     // 最近线段投影（点到各段取全局最近；目标点=投影点+段法向×走廊偏移，即"带偏移的平行线"）
-    let bestSeg = 0, bestD = Infinity, bestPt = pts[0];
+    let bestSeg = 0, bestD = Infinity, bestT = 0;
     for (let i = 0; i < pts.length - 1; i++) {
         const a = pts[i], b = pts[i + 1];
         const dx = b.x - a.x, dy = b.y - a.y;
         const t = Math.max(0, Math.min(1, ((e.x - a.x) * dx + (e.y - a.y) * dy) / (dx * dx + dy * dy || 1)));
         const target = marchOffsetPoint(a.x, a.y, b.x, b.y, t, e._marchOffset);
         const d = Math.hypot(e.x - target.x, e.y - target.y);
-        if (d < bestD) { bestD = d; bestSeg = i; bestPt = target; }
+        if (d < bestD) { bestD = d; bestSeg = i; bestT = t; }
     }
+    // 选中段的带偏移点过出圈收缩（堡垒旁走廊边缘段目的地点可走化），bestD 同步按收缩点重算——
+    // 否则单位到达收缩点后距原偏移点仍 13~30px，汇入/推进判定永不满足=原地滞留
+    const segA = pts[bestSeg], segB = pts[bestSeg + 1];
+    const bestPt = marchClearPoint(e, segA.x, segA.y, segB.x, segB.y, bestT, e._marchOffset);
+    bestD = Math.hypot(e.x - bestPt.x, e.y - bestPt.y);
 
     // 偏离走廊（>15px，如刚打完架/刚部署在路外）→ 先汇入带偏移投影点；贴线（≤15px）→ 直接沿 waypoint 前进
     if (!e._marchJoined || bestD > 15) {
@@ -4346,16 +4945,17 @@ function marchFallback(e, deltaSec) {
     e._marchJoined = true;
 
     // 沿 waypoint 前进：目标=当前段终点(带走廊偏移)；到达(≤10px)推进下一段；最后段终点=敌方主塔（不推进，走到半途必锁塔）
-    let next = marchOffsetPoint(pts[bestSeg].x, pts[bestSeg].y, pts[bestSeg + 1].x, pts[bestSeg + 1].y, 1, e._marchOffset);
+    let next = marchClearPoint(e, segA.x, segA.y, segB.x, segB.y, 1, e._marchOffset);
     if (bestSeg + 1 < pts.length - 1 && Math.hypot(e.x - next.x, e.y - next.y) < 10) {
         bestSeg++;
-        next = marchOffsetPoint(pts[bestSeg].x, pts[bestSeg].y, pts[bestSeg + 1].x, pts[bestSeg + 1].y, 1, e._marchOffset);
+        const na = pts[bestSeg], nb = pts[bestSeg + 1];
+        next = marchClearPoint(e, na.x, na.y, nb.x, nb.y, 1, e._marchOffset);
     }
     moveToward(e, next.x, next.y, deltaSec);
 }
 
-/** 🧪 测试双人（本机）：索敌圈半径（detect220 专属 gate）——飞行搜索者（flying）440（MODE_TEST_DETECT_R_FLY，空中视野翻倍）/
- *  地面 220（MODE_TEST_DETECT_R）；findTarget 过滤、火豆寻敌、目标超圈弃锁三处共用，保证三处半径判定一致（弃锁圈=发现圈防边界震荡） */
+/** 🧪 测试双人（本机）：索敌圈半径（detect220 专属 gate）——飞行搜索者（flying）440（MODE_TEST_DETECT_R_FLY）/
+ *  地面 330（MODE_TEST_DETECT_R，v11.72 由 220 调大）；findTarget 过滤、火豆寻敌、目标超圈弃锁三处共用，保证三处半径判定一致（弃锁圈=发现圈防边界震荡） */
 function detectR220Of(entity) {
     return entity.flying ? MODE_TEST_DETECT_R_FLY : MODE_TEST_DETECT_R;
 }
@@ -4368,7 +4968,7 @@ function findTarget(entity) {
         e.team !== entity.team && e.hp > 0 && !e._stealthed && !e._realmHidden
     );
 
-    // 🧪 测试双人（本机）：发现锁敌收窄到索敌圈（地面220=MODE_TEST_DETECT_R / 飞行搜索者440=MODE_TEST_DETECT_R_FLY）——圈外敌人一律视而不见，
+    // 🧪 测试双人（本机）：发现锁敌收窄到索敌圈（地面330=MODE_TEST_DETECT_R / 飞行搜索者440=MODE_TEST_DETECT_R_FLY）——圈外敌人一律视而不见，
     //    圈内无敌→返回null→原地待机（不加推进兜底，移动保持纯锁敌驱动）；塔类/营地成员/守卫/治疗兵不走本函数，天然不受影响
     if (game.detect220) {
         const detectR = detectR220Of(entity);
@@ -4427,6 +5027,49 @@ function findHealTarget(healer) {
 }
 
 /** 攻击目标（含溅射伤害 + 弹道特效 + 雷电法师连锁闪电 + 冰豆减速 + 幽灵隐身解除） */
+/** 💨 风人·拟风能力：🌪️风爆区第二跳伤害时结算，判定与影响仅限圈内敌人。
+ *  圈内若有敌人带 🔥灼烧 / ❄️减速 / 🤢中毒：每种 buff 由其携带人数决定传播量——
+ *  圈内每个敌人获得「1.5秒 × 该buff携带人数」的该 buff（时长累加、强度取最强采样，重复获得不叠强度），
+ *  同时对圈内每个敌人造成 4×buff实例数 伤害（每个人每个 buff 单独计数，伤害归属风爆弹主人）。
+ *  顺序：先按扩散前状态结算伤害，后传播 buff（同帧扩散不抬伤害）。
+ *  同图标不同效果按字段采样传播：灼烧取圈内最高伤害率；减速取圈内最强 slowFactor
+ *  （冰豆/雪球/魔咒/寒冰法师全走通用字段，天然覆盖）；🤢 通用模板：携带者 = _poisonTimer>0，
+ *  毒伤率按圈内最强 _poisonDps 采样传播（毒药法术领域已折算为每秒45的🤢，同一模板接入） */
+function windManSyncDebuffs(zone) {
+    const inZone = game.entities.filter(e => e.team !== zone.team && e.hp > 0 && !e._headHidden
+        && Math.hypot(e.x - zone.x, e.y - zone.y) <= zone.radius);
+    if (!inZone.length) return;
+    let burnCarriers = 0, slowCarriers = 0, poisonCarriers = 0, fearCarriers = 0;
+    let burnDmg = 0, slowFactor = 1, poisonDps = 0, poisonSlow = 1;
+    for (const e of inZone) {
+        if (e._burnTimer > 0) { burnCarriers++; burnDmg = Math.max(burnDmg, e._burnDamage || 20); }
+        if (e.slowTimer > 0 && e.cardId !== 'ice_bean') { slowCarriers++; slowFactor = Math.min(slowFactor, e.slowFactor || 1); }
+        // 🤢 通用模板：携带者 = _poisonTimer>0（各来源毒伤率不同，采样最强传播）
+        if (e._poisonTimer > 0) { poisonCarriers++; poisonDps = Math.max(poisonDps, e._poisonDps || 10); poisonSlow = Math.min(poisonSlow, e._poisonSlowFactor || 0.6); }
+        // 😱 恐惧（强度固定：攻击力/攻速-25%，只传时长）
+        if (e._fearTimer > 0) fearCarriers++;
+    }
+    const instances = burnCarriers + slowCarriers + poisonCarriers + fearCarriers; // 实例数 = 各buff携带人数之和
+    if (!instances) return; // 圈内没人带 buff → 不触发
+    const owner = game.entities.find(e => e.id === zone.ownerId && e.hp > 0) || null;
+    // ① 先结算伤害（基于扩散前的 buff 状态计数，4×实例数）
+    for (const e of inZone) {
+        const dmg = calcActualDmg(4 * instances, owner, e);
+        e.hp -= dmg;
+        spawnDmgNum(e.x, e.y - 20, dmg);
+    }
+    // ② 后传播 buff（伤害结算完后才传染，同帧扩散不抬伤害）：
+    //    每种 buff 按携带人数 ×0.7s 累加给圈内所有人（助手内部：时长累加、强度取最强）
+    if (burnCarriers > 0 || slowCarriers > 0 || poisonCarriers > 0 || fearCarriers > 0) {
+        for (const e of inZone) {
+            if (burnCarriers > 0) applyBurn(e, burnDmg, 0.7 * burnCarriers);
+            if (slowCarriers > 0) applySlow(e, slowFactor, 0.7 * slowCarriers);
+            if (poisonCarriers > 0) applyPoisonDot(e, 0.7 * poisonCarriers, poisonDps, poisonSlow);
+            if (fearCarriers > 0) applyFear(e, 0.7 * fearCarriers);
+        }
+    }
+}
+
 function attackTroop(attacker, target) {
     // 电磁塔未露头（隐藏）时免疫一切普攻/弹道
     if (target._headHidden) return;
@@ -4476,7 +5119,7 @@ function attackTroop(attacker, target) {
         const clawA = Math.atan2(target.y - attacker.y, target.x - attacker.x);
         const clawR = getHitRadius(target) || 8;
         const clawDur = attacker._berserkTimer > 0 ? 0.2 : (attacker.atkSpeed || 0.6);
-        (game.clawEffects = game.clawEffects || []).push({
+        game.clawEffects.push({
             x: target.x - Math.cos(clawA) * clawR * 0.6,
             y: target.y - Math.sin(clawA) * clawR * 0.6,
             dir: clawA,                                    // 抓痕方向（狂战士→敌人）
@@ -4524,9 +5167,13 @@ function attackTroop(attacker, target) {
         || attacker.cardId === 'little_prince'  // 👑 小王子：十字弩同款追踪弹道（命中才结算伤害）
         || attacker.cardId === 'bow_queen'  // 🏹 弓箭女皇：绿色细追踪箭（命中才结算伤害）
         || attacker.cardId === 'princess'  // 👸 公主：群箭迫击炮弹道（命中落点才结算伤害）
+        || attacker.cardId === 'wind_man'         // 💨 风人：💨直线风爆弹（命中生成风爆区才结算伤害）
+        || attacker.cardId === 'snowman'          // ☃️ 雪人：追踪雪球（命中才结算伤害+❄️减速）
         || attacker.cardId === 'goblin_bomber'  // 🧨 哥布林爆破手：迫击炮同款抛物线（命中落点才结算伤害）
         || attacker.cardId === 'ninja'  // 🥷 忍者：追踪飞镖（命中才结算伤害）
-        || attacker.cardId === 'jessie';  // �� 杰西：电磁团直线弹道（命中才结算伤害）
+        || attacker.cardId === 'jessie'  // 🟡 杰西：电磁团直线弹道（命中才结算伤害）
+        || attacker.cardId === 'fire_furnace'  // 🌋 火熔炉：🔴追踪弹道（命中才结算伤害，否则攻击瞬间+命中双吃）
+        || attacker.cardId === 'rock_thrower';  // 🪨 投石人：巨石滚动沿途结算（命中才结算伤害）
     // 弹道单位不在开头立即结算（护盾/减伤在命中时才吃）；近战/即时结算单位在此立即结算
     // 🗡️ 剑仙：御剑期间大剑强化——普攻伤害 75→80（御剑结束 _rideSword=false 自动还原75）
     // 💥 狂战士爆发：伤害固定 30（爆发结束 _berserkTimer<=0 自动还原 e.atk）
@@ -4537,6 +5184,34 @@ function attackTroop(attacker, target) {
         : (attacker.cardId === 'monk' && (attacker._punchCount || 0) % 3 === 0) ? 90
         : (attacker.cardId === 'bow_queen' && (attacker._queenStealthTimer || 0) > 0) ? attacker.atk * 3
         : getChargeAttackValue(attacker);
+    // ---- 🪓 瓦基里：旋斧转圈 AOE——对攻击范围内所有敌人各结算一次全额伤害（旋转视觉由 _spinTimer 驱动）----
+    if (attacker.cardId === 'valkyrie') {
+        attacker._spinTimer = 0.35; // 旋转一圈视觉时长
+        for (const e2 of game.entities) {
+            if (e2.team === attacker.team || e2.hp <= 0 || e2._headHidden) continue;
+            if (e2.flying) continue; // 近战惯例不对空
+            if (Math.hypot(e2.x - attacker.x, e2.y - attacker.y) <= (attacker.range || 35) + getHitRadius(e2)) {
+                // 🗡️ 浪人格挡：旋斧扫过浪人被格挡反弹（浪人自身免伤、瓦基里吃200%反弹；其余敌人照常受伤）
+                if (e2.cardId === 'ronin' && (e2._reflectTimer || 0) <= 0) {
+                    e2._reflectTimer = CARDS.ronin.reflectCooldown || 3.2;
+                    const rd = Math.floor(atkVal * (CARDS.ronin.reflectMultiplier || 2));
+                    const rdDmg = calcActualDmg(rd, e2, attacker); // 反弹伤害直接结算（吃被反弹者减伤）
+                    attacker.hp -= rdDmg;
+                    spawnDmgNum(attacker.x, attacker.y - 20, rdDmg);
+                    // 特效：交叉刀痕出现在浪人（e2）与被反弹者（瓦基里）中间
+                    spawnReflectCrossFx(e2, attacker);
+                    continue;
+                }
+                const dmgV = calcActualDmg(atkVal, attacker, e2); // 统一吃目标减伤/护盾/攻击者狂暴（🥊暴击自动生效）
+                e2.hp -= dmgV;
+                spawnDmgNum(e2.x, e2.y - 20, dmgV);
+            }
+        }
+        // 攻击范围提示：以自身为中心的淡红圈（与溅射提示同款）
+        game.deployEffects.push({ x: attacker.x, y: attacker.y, radius: attacker.range || 30, timer: 0.35, maxTimer: 0.35, color: AOE_RING_COLOR, static: true });
+        return; // 旋斧已结算全部目标，不走单目标近战结算
+    }
+
     let dmg = rangedShot ? 0 : calcActualDmg(atkVal, attacker, target);
 
     // ---- 矿工：对主塔/堡垒（防御工事）伤害 1/3 ----
@@ -4575,15 +5250,15 @@ function attackTroop(attacker, target) {
     //      · 远射程（巫师/雷电法师/电车小队/炮车等即时结算远程）→ isRanged 不反弹
     //      · 两者皆非（地面近战兵/战斗天使贴身挥击）→ 反弹
     if (!rangedShot && !isRanged && target.cardId === 'ronin' && (target._reflectTimer || 0) <= 0) {
-        target._reflectTimer = CARDS.ronin.reflectCooldown || 3.5;
+        target._reflectTimer = CARDS.ronin.reflectCooldown || 3.2;
         // 冲锋被格挡：机制自行返回额外冲锋伤害，统一计入反弹基数
         let reflectBase = dmg + (finishChargeBlocked(attacker, target, { blocked: true }) || 0);
         const rd = Math.floor(reflectBase * (CARDS.ronin.reflectMultiplier || 2));
         const rdDmg = calcActualDmg(rd, target, attacker); // 反弹伤害直接结算（不再触发反弹判定），吃被反弹者减伤
         attacker.hp -= rdDmg;
         spawnDmgNum(attacker.x, attacker.y - 20, rdDmg);
-        // 特效：🚫 出现在被反弹者（攻击者）头顶
-        game.spellEffects.push({ x: attacker.x, y: attacker.y - 20, char: '🚫', size: 30, color: '#ff4757', timer: 0.4, maxTimer: 0.4 });
+        // 特效：交叉刀痕出现在浪人（target）与被反弹者（攻击者）中间
+        spawnReflectCrossFx(target, attacker);
         return; // 本次近战攻击被格挡：跳过后续伤害结算（含骑士冲锋额外伤害）
     }
 
@@ -4625,93 +5300,26 @@ function attackTroop(attacker, target) {
 
     // ---- 冰豆：被攻击时让攻击者减速80%，头顶❄️标记持续1.5秒 ----
     if (target._iceBean) {
-        attacker.slowFactor = 0.2;    // 减速80%
-        attacker.slowTimer = 1.5;     // 持续1.5秒
+        applySlow(attacker, 0.2, 1.5); // 减速80%持续1.5秒
     }
 
-    // ---- 雷龙：雷电连锁（主目标后最多3跳，75px范围，每跳全额不衰减）----
+    // ---- 雷龙：雷电连锁（主目标后最多3跳，75px范围，每跳全额不衰减；跳过隐身目标）——chainLightning 统一骨架 ----
     if (attacker.cardId === 'lightning_dragon') {
-        // 主目标眩晕0.5秒，与雷电法师的攻击特效规则一致
-        applyHardControl(target, 'stun', 0.5);
-        const card = CARDS[attacker.cardId];
-        const chainRange = card.chainRange || 75;
-        const chainCount = card.chainCount || 3;
-        const chainPoints = [{ x: attacker.x, y: attacker.y }, { x: target.x, y: target.y }];
-        let currentTarget = target;
-        const hitIds = new Set([target.id]);
-
-        for (let i = 0; i < chainCount; i++) {
-            let best = null, bestDist = Infinity;
-            for (const e of game.entities) {
-                if (e.team === attacker.team || e.hp <= 0 || e._headHidden || e._stealthed) continue;
-                if (hitIds.has(e.id)) continue;
-                const d = dist(currentTarget, e);
-                if (d <= chainRange && d < bestDist) {
-                    bestDist = d;
-                    best = e;
-                }
-            }
-            if (!best) break;
-            const chainDmg = calcActualDmg(attacker.atk, attacker, best);
-            best.hp -= chainDmg;
-            spawnDmgNum(best.x, best.y - 20, chainDmg);
-            applyHardControl(best, 'stun', 0.5);
-            hitIds.add(best.id);
-            chainPoints.push({ x: best.x, y: best.y });
-            currentTarget = best;
-        }
-        game.lightningChains.push({
-            points: chainPoints,
-            timer: 0.3,
-            maxTimer: 0.3,
-            color: attacker.team === 'player' ? '#65d9ff' : '#b388ff'
+        chainLightning(attacker, target, {
+            chainRange: 75,
+            chainCount: 3,
+            skipStealthed: true,
+            color: attacker.team === 'player' ? '#65d9ff' : '#b388ff',
         });
     }
 
-    // ---- 雷电法师：连锁闪电 ----
+    // ---- 雷电法师：连锁闪电（最多2跳，50px范围，每跳 ×0.65^i 衰减）——chainLightning 统一骨架 ----
     if (attacker.cardId === 'lightning_wizard') {
-        // 主目标眩晕0.5秒💫
-        applyHardControl(target, 'stun', 0.5);
-
-        const card = CARDS[attacker.cardId];
-        const chainRange = card.chainRange || 50;
-        const chainCount = card.chainCount || 2;
-        const chainDmgMul = card.chainDmgMul || 0.65;
-
-        const chainPoints = [{ x: attacker.x, y: attacker.y }, { x: target.x, y: target.y }];
-        let currentTarget = target;
-        const hitIds = new Set([target.id]);
-
-        for (let i = 0; i < chainCount; i++) {
-            let best = null, bestDist = Infinity;
-            for (const e of game.entities) {
-                if (e.team === attacker.team || e.hp <= 0 || e._headHidden) continue;
-                if (hitIds.has(e.id)) continue;
-                const d = dist(currentTarget, e);
-                if (d <= chainRange && d < bestDist) {
-                    bestDist = d;
-                    best = e;
-                }
-            }
-            if (!best) break;
-            // 第 i+1 跳伤害 = atk × chainDmgMul^(i+1)，对每个连锁目标单独结算、吃目标自身减伤（框架第13条）
-            const chainDmg = calcActualDmg(attacker.atk * Math.pow(chainDmgMul, i + 1), attacker, best);
-            best.hp -= chainDmg;
-            spawnDmgNum(best.x, best.y - 20, chainDmg);
-            applyHardControl(best, 'stun', 0.5); // 连锁目标眩晕💫
-            hitIds.add(best.id);
-            chainPoints.push({ x: best.x, y: best.y });
-            currentTarget = best;
-        }
-
-        // 记录闪电链路径（至少连到1个额外目标才画）
-        if (chainPoints.length > 1) {
-            game.lightningChains.push({
-                points: chainPoints,
-                timer: 0.3,
-                maxTimer: 0.3
-            });
-        }
+        chainLightning(attacker, target, {
+            chainRange: 50,
+            chainCount: 2,
+            dmgMul: CARDS[attacker.cardId].chainDmgMul || 0.65,
+        });
     }
 
     // ---- 巫师：单体🫧气泡攻击 + 上🐛标记 ----
@@ -4720,6 +5328,17 @@ function attackTroop(attacker, target) {
         game.spellEffects.push({ x: target.x, y: target.y, char: '🫧', size: 22, timer: 0.4, maxTimer: 0.4 });
         target._wormMarkTimer = 5.0;  // 🐛标记持续5秒
         target._wormMarkTeam = attacker.team;  // 记录下标记的巫师阵营
+    }
+
+    // ---- 📖 读书人：暗红色「殺」字攻击特效 + 蓄力条（每4次攻击蓄满→清空并释放一次随机书灵技能）----
+    if (attacker.cardId === 'scholar') {
+        attacker._swingTimer = 0.3; // 挥书动画（render.js 用，与剑仙/狂战士同款通用计时）
+        game.spellEffects.push({ x: target.x, y: target.y - 30, char: '殺', size: 24, color: '#b71c1c', timer: 0.45, maxTimer: 0.45 });
+        attacker._scholarCharge = (attacker._scholarCharge || 0) + 1;
+        if (attacker._scholarCharge >= 4) {
+            attacker._scholarCharge = 0;
+            castScholarRandomSkill(attacker, target);
+        }
     }
 
     // ---- 超级骑士：近战攻击特效💥（大范围震击）----
@@ -4781,6 +5400,26 @@ function attackTroop(attacker, target) {
         return; // 穿透箭已处理伤害，不用再执行普通弹道
     }
 
+    // ---- 🪨 投石人：手抱巨石向前直线滚出（沿途58伤害+20px击退，每敌仅一次；滚105px后消失；不可对空；参考滚木）----
+    if (attacker.cardId === 'rock_thrower') {
+        const dx = target.x - attacker.x, dy = target.y - attacker.y;
+        const d = Math.hypot(dx, dy) || 1;
+        game.boulderRolls.push({
+            x: attacker.x, y: attacker.y,
+            dx: dx / d, dy: dy / d,          // 滚动方向单位向量（朝目标）
+            team: attacker.team,
+            ownerId: attacker.id,            // 命中结算统一走 calcActualDmg（吃攻击者实时狂暴/减伤）
+            damage: attacker.atk,
+            knockback: 20,
+            speed: 120,                      // 巨石慢滚（约0.9s滚完105px，给敌人走位空间）
+            distance: 105,                   // 滚动105px后碎裂消失
+            traveled: 0,
+            radius: 13,                      // 巨石本体半径（命中判定用）
+            hitCount: {},                    // 每个敌人最多结算两次（id → 已命中次数）
+        });
+        return; // 巨石已滚出，不走普通单发弹道
+    }
+
     // ---- 生成弹道/攻击特效 ----
     let projChar = null, projSize = 14, projColor = null;
     let projSpeed = 350 + rand() * 100;
@@ -4791,8 +5430,12 @@ function attackTroop(attacker, target) {
         projSpeed = 300;
         projTimer = 0.8;
         // 四角手里剑：旋转角度只用于视觉，不影响追踪弹道运动
-        // 采用发射时随机初始角，避免多个飞镖完全同相位
-        projIsNinjaDart = true;
+        // 采用发射时随机初始角，避免多个飞镖完全同相位（isNinjaDart 标记在弹道生成处统一挂载）
+    } else if (attacker.cardId === 'snowman') {
+        // ☃️ 雪人：⚪ 雪球（法术雪球等比缩小，通用 tracking 追踪弹道，索定建筑）
+        projChar = '⚪'; projSize = 12;
+        projSpeed = 260;
+        projTimer = 1.2;
     } else if (attacker.cardId === 'archer') {
         projChar = '།'; projSize = 14;
     } else if (attacker.cardId === 'cannon_tower') {
@@ -4802,6 +5445,11 @@ function attackTroop(attacker, target) {
         projChar = '🔵'; projSize = 16;
         projSpeed = 150;   // 弹道飞行速度慢
         projTimer = 0.8;   // 慢速弹道需要更长寿命
+    } else if (attacker.cardId === 'fire_furnace') {
+        // 🌋 火熔炉：🔴 熔岩弹丸（通用 tracking 追踪弹道，必中单体，可对空）
+        projChar = '🔴'; projSize = 13;
+        projSpeed = 300;
+        projTimer = 0.8;
     } else if (attacker.cardId === 'witch') {
         // 🧙‍♀️ 女巫：绿色能量球弹道（命中溅射）
         projChar = '🟢'; projSize = 16;
@@ -4911,9 +5559,23 @@ function attackTroop(attacker, target) {
             speed: 200, timer: 1.5, maxTimer: 1.5,
             isFireShard: true, fullAoe: true, dist: 0, maxDist: 135,
             damage: attacker.atk, aoeRadius: attacker.splash || 35,
+            burnDamage: 20, burnTimer: 1.0, // 🔥 爆裂点燃：1秒内共20灼烧伤害（参考火豆，重复命中只刷新）
             team: attacker.team, hitsAir: true, ownerId: attacker.id,
         });
         return; // 火球弹道已生成，不走普通单发弹道
+    }
+    // 💨 风人：💨直线风爆弹（不追踪，命中第一个敌人即生成风爆区；未命中飞到135终点也生成风爆区）
+    if (attacker.cardId === 'wind_man') {
+        const baseA = Math.atan2(target.y - attacker.y, target.x - attacker.x);
+        game.projectiles.push({
+            x: attacker.x, y: attacker.y,
+            char: '💨', size: 14, color: '#aec6e8',
+            vx: Math.cos(baseA), vy: Math.sin(baseA),
+            speed: 170, timer: 1.5, maxTimer: 1.5,
+            isWindBlast: true, dist: 0, maxDist: 135,
+            team: attacker.team, hitsAir: true, ownerId: attacker.id,
+        });
+        return; // 风爆弹已生成，不走普通单发弹道
     }
     if (attacker.cardId === 'jessie') {
         const baseA = Math.atan2(target.y - attacker.y, target.x - attacker.x);
@@ -5029,6 +5691,9 @@ function attackTroop(attacker, target) {
             proj.isNinjaDart = true;
             proj.spinOffset = rand() * Math.PI * 2;
         }
+        if (attacker.cardId === 'snowman') {
+            proj.isSnowBall = true; // ☃️ 雪球命中：❄️减速30%持续1.5秒（tracking 处理器结算）
+        }
         // 烟花炮手：火箭改为直线弹道（锁定发射方向不追踪；碰到敌人即伤害+分裂，飞满射程未命中则在最远点分裂）+ 发射即后坐力
         if (attacker.cardId === 'firework_gunner') {
             proj.isRocket = true;
@@ -5066,7 +5731,7 @@ function patrolOrbit(e, deltaSec) {
     const dx = e.x - e._patrolX, dy = e.y - e._patrolY;
     const distC = Math.hypot(dx, dy) || 1;
     // 巡逻速度与通用移动一致：吃减速/极速/狂暴因子
-    const speed = e.moveSpeed * (e.slowFactor || 1.0) * (e._poisonTimer > 0 ? 0.6 : 1.0) * (e._poisonSpellTimer > 0 ? 0.85 : 1.0) * (e._speedBoosted ? 2.0 : 1.0) * (e._charging ? (e.cardId === 'barbarian_battering_ram' ? 2.0 : 3.0) : 1.0) * rageMult(e);
+    const speed = e.moveSpeed * (e.slowFactor || 1.0) * (e._poisonTimer > 0 ? (e._poisonSlowFactor || 0.6) : 1.0) * (e._speedBoosted ? 2.0 : 1.0) * (e._charging ? (e.cardId === 'barbarian_battering_ram' ? 2.0 : 3.0) : 1.0) * rageMult(e);
     const step = speed * deltaSec;
     const rx = dx / distC, ry = dy / distC;                    // 径向单位向量（中心→成员）
     const tx = -ry * e._patrolDir, ty = rx * e._patrolDir;     // 切线单位向量（绕圈方向）
@@ -5083,9 +5748,7 @@ function patrolOrbit(e, deltaSec) {
 
 function applyPoison(target) {
     if (!target || target.hp <= 0) return;
-    target._poisonTimer = 4.0;
-    // 不重置累计伤害：重复命中只刷新持续时间，不叠加毒伤
-    if (target._poisonAccumulator === undefined) target._poisonAccumulator = 0;
+    applyPoisonDot(target, 4.0, 10, 0.6); // 🤢 时长累加、毒伤率10/s+自带减速40%（通用🤢模板）
 }
 
 function moveAwayFrom(entity, target, deltaSec) {
@@ -5113,6 +5776,14 @@ function moveToward(entity, tx, ty, deltaSec, opts) {
         if (det) { tx = det.x; ty = det.y; }
     }
 
+    // 🧭 全局导航寻路（导航层）：地面单位目的地被障碍挡住 → A* 计算完整绕行路径逐点跟随（直线可视则直奔）
+    //    （障碍来自 NAV_OBSTACLE_SOURCES 注册表：己方建筑 solid / 河道水域 deadly——A* 自动绕河上桥；敌方建筑不在源内，
+    //     目标即它，物理分离停在表面攻击。飞行/无移速豁免。替换链：烟引引导 → 河道改道 → 导航寻路，烟引点/桥头点被挡时同样寻路）
+    if (!entity.flying && entity.moveSpeed) {
+        const nav = navFollowPath(entity, tx, ty);
+        if (nav) { tx = nav.x; ty = nav.y; }
+    }
+
     const dx = tx - entity.x, dy = ty - entity.y;
     const len = Math.hypot(dx, dy);
 
@@ -5125,7 +5796,7 @@ function moveToward(entity, tx, ty, deltaSec, opts) {
     let speed = (entity.cardId === 'berserker' && entity._berserkTimer > 0)
         || (entity.cardId === 'sword_immortal' && entity._rideSword) ? 40 : entity.moveSpeed;
     if (!(opts && opts.pureSpeed)) {
-        speed = speed * (entity.slowFactor || 1.0) * (entity._poisonTimer > 0 ? 0.6 : 1.0) * (entity._poisonSpellTimer > 0 ? 0.85 : 1.0) * (entity._speedBoosted ? 2.0 : 1.0) * (entity._charging ? (entity.cardId === 'barbarian_battering_ram' ? 2.0 : 3.0) : 1.0) * rageMult(entity);
+        speed = speed * (entity.slowFactor || 1.0) * (entity._poisonTimer > 0 ? (entity._poisonSlowFactor || 0.6) : 1.0) * (entity._speedBoosted ? 2.0 : 1.0) * (entity._charging ? (entity.cardId === 'barbarian_battering_ram' ? 2.0 : 3.0) : 1.0) * rageMult(entity);
     }
     const step = speed * deltaSec;
 
@@ -5143,9 +5814,10 @@ function moveToward(entity, tx, ty, deltaSec, opts) {
     }
 }
 
-/** 🌉 测试双人（本机）河道改道（detect220）：地面单位与移动目的地分处减半河道两侧 → 改道走最近的桥
+/** 🌉 测试双人（本机）河道改道（detect220）——只决定"走哪座桥"（"怎么走过去"由导航寻路 A* 自动上桥，v11.70 分工收敛）：
+ *  地面单位与移动目的地分处减半河道两侧 → 改道走向最近桥的对岸桥头点
  *  - 目的地在河道带内（空中单位悬停河上）不算跨河——走近岸即可，不做无限改道
- *  - 桥选择=最近桥，记忆 _detourBridge/_detourTargetId（防 y≈350 两桥等距时目标微动来回翻转）；换目标自动重选
+ *  - 桥选择=最近桥，记忆 _detourBridge/_detourTargetId（防 y≈350 两桥等距时目标微动来回翻转——A* 无桥记忆，此决策语义必须留在这里）；换目标自动重选
  *  - 过河（与目的地同侧）记忆即清；目标失效由 clearChargeStates 兜底清理
  *  - 纯几何判定零随机（Lockstep 确定）；返回 null=不改道 */
 function riverDetourTarget(entity, tx, ty) {
@@ -5168,9 +5840,128 @@ function riverDetourTarget(entity, tx, ty) {
     return { x: entity.x < L ? R + 25 : L - 25, y: entity._detourBridge };  // 对岸桥头稍出岸：一过河界改道条件即消失
 }
 
-/** 🌊 测试双人（本机）岸边排斥框+桥面约束（detect220）：地面单位进入河道两侧框带（岸线±22）→ 向岸推回；
- *  桥面走廊内 y 向中心线夹紧（防 applySeparation 挤桥时把队友挤偏落水）。穿过整条框带落入水域核心的
- *  （只可能来自钩拉/击退/挤压等不经 moveToward 的位移）由主循环 checkRiverDrown 溺亡 */
+/** 🧭 全局导航障碍源（注册制）：新增障碍类型 → 往 NAV_OBSTACLE_SOURCES 注册一个收集函数 (entity)=>障碍数组 即可，导航核心零改动 */
+
+/** ① 己方建筑障碍（isStaticEntity 全集：堡垒/主塔/防御塔/兵营/收集器/木桩；敌方建筑不在源内=不绕） */
+function navObstaclesFromBuildings(entity) {
+    const out = [];
+    for (const b of game.entities) {
+        if (b.hp <= 0 || b.team !== entity.team || !isStaticEntity(b)) continue;
+        out.push({ key: 'bldg_' + b.id, shape: 'circle', solid: true, deadly: false, x: b.x, y: b.y, r: getCollisionRadius(b) });
+    }
+    return out;
+}
+
+/** ② 河道阻挡区（shrink220 缩窄图专属）：全河宽非桥段 = 桥间矩形段并集——x 用全河宽 [L,R] 而非落水核心 [L+G,R-G]：
+ *  网格外扩 NAV_GRID_PAD(25) 后阻挡区 [L-25,R+25] 完全覆盖岸边排斥框带 [L-G,L+G]，寻路可走区与推力区零重叠，
+ *  正常寻路行军永不进框带（v11.70 治本：旧版核心外扩只到 [647,753]，与框带 [628,772] 有 19px 重叠带——
+ *  "A* 认为可走、riverGuardPush 在推"持续对抗 → 桥头拐角/沿岸蹭行卡顿）。
+ *  y 段边界外推 NAV_GRID_PAD（v11.71，x 方向对齐的 y 方向镜像）：桥段 rect 边界=桥缘±(BRIDGE_HALF+PAD) →
+ *  光栅化外扩后阻挡边界恰好落回桥走廊边缘 by±BRIDGE_HALF，与框带豁免边界（|y-by|≤40）精确对齐——
+ *  旧版桥开口被外扩从 ±40 收窄到 ±15（可走格心只剩桥心线一排），marchFallback 走廊偏移 ±30 的目的地点
+ *  落在阻挡区内 → A* 每帧把单位拉回桥心线 vs 调用方 6~10px 精确到达判定死循环 → 桥上/桥头卡死；
+ *  修后桥面可走格心 3 排，桥走廊内一切目的地（走廊偏移点/追击点）全部可走。
+ *  deadly 而非 solid——"走哪座桥"由 riverDetourTarget 决策（最近桥记忆防翻转），"怎么走过去"由 A* 自动上桥；
+ *  落水判定 checkRiverDrown 仍是水域核心谓词（by±BRIDGE_HALF）不变 */
+function navObstaclesFromRiver(entity) {
+    if (!game.shrink220) return [];
+    const L = MODE_TEST_RIVER_LEFT, R = MODE_TEST_RIVER_RIGHT;
+    const out = [];
+    const P = NAV_GRID_PAD;
+    let y1 = 25;
+    for (const by of MODE_TEST_BRIDGE_YS) {
+        if (by - MODE_TEST_BRIDGE_HALF - P > y1) {
+            out.push({ key: 'river_' + out.length, shape: 'rect', solid: false, deadly: true, x1: L, y1, x2: R, y2: by - MODE_TEST_BRIDGE_HALF - P });
+        }
+        y1 = by + MODE_TEST_BRIDGE_HALF + P;
+    }
+    if (H - 25 > y1) {
+        out.push({ key: 'river_' + out.length, shape: 'rect', solid: false, deadly: true, x1: L, y1, x2: R, y2: H - 25 });
+    }
+    return out;
+}
+
+/** 障碍源注册表：新增障碍类型时在此数组加收集函数 */
+const NAV_OBSTACLE_SOURCES = [navObstaclesFromBuildings, navObstaclesFromRiver];
+
+// ══════ 🧭 全局导航寻路层（障碍源注册制 + 网格A* + 视线剪枝）══════
+
+/** 🧭 寻路网格缓存：签名（地图宽+障碍集合 key/r）变化才重建（建筑建毁/河道开关/换图），全单位共用一张 */
+const navGridState = { sig: '', grid: null, gw: 0, gh: 0 };
+
+/**
+ * 🧭 全局导航寻路（moveToward 导航层）：地面单位目的地被障碍挡住 → A* 计算完整绕行路径并逐点跟随。
+ * 替代旧"前瞻切向绕行"局部避障（路径不自然/贴面僵持/并排楼徘徊）——起点终点已知 → 一步算出全局路线：
+ * 0) 直线可视（当前位置→目的地不穿任何障碍膨胀体）→ 清缓存直奔（无障碍行军零开销、行为与无导航层完全一致）
+ * 1) 被挡 → 障碍光栅化成 NAV_GRID_CELL 网格（外扩 NAV_GRID_PAD；deadly 水域同标阻挡 → A* 自动绕河/上桥），
+ *    A* 八方向（禁对角穿角、octile 启发）→ 视线剪枝拉直成最少拐点路径 → 缓存跟随
+ * 2) 路径缓存：目的地偏移 ≤ NAV_REPATH_DIST 沿用旧路径（追击目标小幅移动不抖），超过才重算（重算从当前位置起）
+ * 3) 起点贴墙/终点在墙内 → 螺旋投影最近可走格（终点投影后尾点若可视真目的地则还原，保证调用方到达判定精确）
+ * 4) 纯几何零随机（A* 遍历序/平局打破固定，Lockstep 确定）；不可达（目标被围死等）→ null 直奔（物理分离兜底=旧行为）
+ * @returns {{x:number,y:number}|null} 本帧应朝其移动的路径点；null=直奔原目的地 */
+function navFollowPath(entity, tx, ty) {
+    // 收集障碍（注册表：己方建筑 solid / 河道水域 deadly）
+    const obstacles = [];
+    for (const src of NAV_OBSTACLE_SOURCES) {
+        for (const obs of src(entity)) obstacles.push(obs);
+    }
+    const pad = getCollisionRadius(entity) + NAV_CLEARANCE;
+
+    // 0) 直线可视 → 直奔（路径只为绕障而生）
+    let vis = true;
+    for (const obs of obstacles) {
+        if (navObstacleHit(obs, entity.x, entity.y, tx, ty, pad)) { vis = false; break; }
+    }
+    if (vis) {
+        if (entity._navPath) { entity._navPath = null; entity._navDest = null; entity._navIdx = 0; }
+        return null;
+    }
+
+    // 1) 网格缓存（签名=地图宽+障碍集合 key/r/x/y——未来注册"位置会动的障碍源"也能自动触发重建）
+    const sig = W + '|' + obstacles.map(o => o.key + ':' + (o.r || 0) + '@' + Math.round(o.x !== undefined ? o.x : (o.x1 + o.x2) / 2) + ',' + Math.round(o.y !== undefined ? o.y : (o.y1 + o.y2) / 2)).sort().join(',');
+    if (navGridState.sig !== sig) {
+        navGridState.gw = Math.ceil(W / NAV_GRID_CELL);
+        navGridState.gh = Math.ceil(H / NAV_GRID_CELL);
+        navGridState.grid = navBuildGrid(obstacles, navGridState.gw, navGridState.gh);
+        navGridState.sig = sig;
+    }
+
+    // 2) 路径缓存：目的地偏移 ≤ NAV_REPATH_DIST → 沿用
+    if (!entity._navPath || !entity._navDest
+        || Math.hypot(tx - entity._navDest.x, ty - entity._navDest.y) > NAV_REPATH_DIST
+        || entity._navIdx >= entity._navPath.length) {
+        const raw = navAStar(navGridState.grid, navGridState.gw, navGridState.gh, entity.x, entity.y, tx, ty);
+        if (raw && raw.length > 1) {
+            raw[0] = { x: entity.x, y: entity.y };   // 起点用实际位置（不从格心出发）
+            // 尾点还原为真目的地（投影格→目的地直线可视时；保证调用方"到达判定"基于真目标精确触发）
+            const lastPt = raw[raw.length - 1];
+            let lastVis = true;
+            for (const obs of obstacles) {
+                if (navObstacleHit(obs, lastPt.x, lastPt.y, tx, ty, pad)) { lastVis = false; break; }
+            }
+            if (lastVis) raw[raw.length - 1] = { x: tx, y: ty };
+            entity._navPath = navSmoothPath(raw, obstacles, pad);
+            entity._navIdx = 1;
+            entity._navDest = { x: tx, y: ty };
+        } else {
+            entity._navPath = null; entity._navDest = null; entity._navIdx = 0;   // 不可达 → 直奔兜底
+            return null;
+        }
+    }
+
+    // 3) 跟随：跳过已到达（<NAV_WAYPOINT_REACH）的路径点，返回当前应走的点
+    const path = entity._navPath;
+    while (entity._navIdx < path.length - 1
+        && Math.hypot(path[entity._navIdx].x - entity.x, path[entity._navIdx].y - entity.y) < NAV_WAYPOINT_REACH) {
+        entity._navIdx++;
+    }
+    return path[entity._navIdx];
+}
+
+/** 🌊 测试双人（本机）岸边排斥框+桥面约束（detect220）——纯落水保险丝（v11.70 收敛）：正常寻路行军不会进框带
+ *  （navObstaclesFromRiver 全河宽阻挡已覆盖框带，寻路可走区与推力区零重叠），推力只兜底钩拉/击退/挤压等
+ *  不经 moveToward 的异常位移。框带（岸线±22）内向岸推回；桥面走廊内 y 向中心线夹紧（防 applySeparation
+ *  挤桥时把队友挤偏落水）；穿过整条框带落入水域核心 → 主循环 checkRiverDrown 溺亡 */
 function riverGuardPush(entity, deltaSec) {
     const L = MODE_TEST_RIVER_LEFT, R = MODE_TEST_RIVER_RIGHT, G = MODE_TEST_RIVER_GUARD;
     const onBridge = MODE_TEST_BRIDGE_YS.some(by => Math.abs(entity.y - by) <= MODE_TEST_BRIDGE_HALF);
@@ -5194,9 +5985,12 @@ function riverGuardPush(entity, deltaSec) {
 
 /** 🌊 测试双人（本机）落水判定（detect220，主循环每帧、冻结判定前）：地面单位身处水域核心（穿过整条排斥框带）
  *  → 溺亡：hp=0 走统一死亡清理（亡语/死亡召唤/灵魂升级照常，与其他死法一致）+ 水花飞溅特效。
- *  无视护盾（落水非伤害）；冻结单位同样判定（在河里冻着也是在水里）；空中/非部队豁免 */
+ *  无视护盾（落水非伤害）；冻结单位同样判定（在河里冻着也是在水里）；空中/非部队豁免
+ *  （空中 = flying 单位 + 超骑抛物线跳跃滞空 `_leapJumping`——跳跃弧线掠过河面上空，身体坐标
+ *  穿越水域核心非桥段属正常飞行，v11.74 前会被逐帧判溺亡 = 空中落水；落地帧恢复正常判定，
+ *  落点安全性由跳跃发起处的落点防溺水夹紧保证） */
 function checkRiverDrown(e) {
-    if (!game.shrink220 || e.flying || e.type !== 'troop') return;
+    if (!game.shrink220 || e.flying || e.type !== 'troop' || e._leapJumping) return;
     const L = MODE_TEST_RIVER_LEFT, R = MODE_TEST_RIVER_RIGHT, G = MODE_TEST_RIVER_GUARD;
     if (e.x > L + G && e.x < R - G
         && MODE_TEST_BRIDGE_YS.every(by => Math.abs(e.y - by) > MODE_TEST_BRIDGE_HALF)) {
@@ -5212,7 +6006,7 @@ function spawnWaterSplash(x, y) {
     for (let i = 0; i < 7; i++) {
         drops.push({ a: -Math.PI / 2 + (i - 3) * 0.42, sp: 80 + (i % 3) * 30 });
     }
-    (game.splashFX = game.splashFX || []).push({ x, y, timer: MODE_TEST_SPLASH_T, maxTimer: MODE_TEST_SPLASH_T, drops });
+    game.splashFX.push({ x, y, timer: MODE_TEST_SPLASH_T, maxTimer: MODE_TEST_SPLASH_T, drops });
 }
 
 /** 🦔 反甲：攻击者在75px范围内攻击反甲巨人时，受到35伤害并眩晕0.5秒 */
@@ -5242,11 +6036,26 @@ function calcActualDmg(baseDmg, attacker, target) {
     // 反甲在统一伤害入口触发，覆盖近战即时伤害和弹道命中伤害
     triggerAntiArmor(attacker, target);
     let dmg = baseDmg;
+    game._lastDmgCrit = false; // 🥊 暴击标记复位（spawnDmgNum 读取后自动归位）
+    // 📖 读书人·閃：瞬移过程无敌（触发→落地之间不受任何伤害，护盾/生命均不结算，落地后恢复受击；
+    //    无敌窗口直接复用 _scholarBlinkTimer，冰冻暂停期间同样保持无敌直到落地）
+    if (target.cardId === 'scholar' && (target._scholarBlinkTimer || 0) > 0) return 0;
     if (attacker) {
         dmg *= rageMult(attacker);
         if ((attacker._iceMageAtkTimer || 0) > 0) dmg *= (attacker._iceMageAtkFactor || 0.4);
+        // 😱 恐惧：攻击力-25%（仅带攻击者的伤害结算；直接伤害/法术无攻击者不受影响）
+        if ((attacker._fearTimer || 0) > 0) dmg *= 0.75;
+        // 🥊 附魔暴击：20%概率双倍伤害（种子随机 rand()，Lockstep 两端一致）
+        if (attacker._enchantCrit && rand() < 0.2) {
+            dmg *= 2;
+            game._lastDmgCrit = true;
+        }
+        // 📖 读书人自带暴击率（基础20%，極期间40%）：暴击同样双倍伤害、金色飘字
+        if ((attacker._scholarCritRate || 0) > 0 && rand() < attacker._scholarCritRate) {
+            dmg *= 2;
+            game._lastDmgCrit = true;
+        }
     }
-    if (attacker) dmg *= rageMult(attacker);
     const reduction = target._damageReduction || 0;
     dmg = Math.floor(dmg * (1 - reduction));
     // ★ 通用护盾机制（任何单位 shield>0 即生效）：本次伤害全部由护盾吸收、不穿透生命；
@@ -5255,6 +6064,12 @@ function calcActualDmg(baseDmg, attacker, target) {
         target.shield = Math.max(0, target.shield - dmg);
         // ★ 主塔护盾破碎标记：由帧循环统一处理（召唤主塔守卫），不在结算函数内直接创建实体
         if (target.shield === 0 && target.type === 'main_tower') target._shieldJustBroke = true;
+        // 📖 读书人护盾破碎：头顶冒黄色「閃」字，0.6s后往攻击方向后面瞬移105px（update.js 帧循环结算瞬移）
+        if (target.shield === 0 && target.cardId === 'scholar' && !target._scholarShieldBroke) {
+            target._scholarShieldBroke = true;
+            target._scholarBlinkTimer = 0.6;
+            game.spellEffects.push({ x: target.x, y: target.y - 36, char: '閃', size: 26, color: '#ffd700', timer: 0.6, maxTimer: 0.6 });
+        }
         // 🛡️ 护盾吸收伤害也冒出数字（蓝色飘字，区别于红色扣血；统一收口在 calcActualDmg，所有调用处自动生效）
         spawnDmgNum(target.x, target.y - 20, dmg, false, true);
         return 0;
@@ -5273,8 +6088,11 @@ function grantShield(target, amount) {
 // ---- 伤害飘字：受击红字 / 治疗绿字 / 护盾蓝字，向上飘并淡出 ----
 function spawnDmgNum(x, y, amount, isHeal, isShield) {
     if (amount <= 0) return;
+    // 🥊 附魔暴击标记：calcActualDmg 命中暴击时置位，本函数读取后归位（护盾/治疗数字不吃暴击样式）
+    const crit = !isHeal && !isShield && game._lastDmgCrit === true;
+    game._lastDmgCrit = false;
     const amt = Math.round(amount);
-    const color = isShield ? '#4fc3f7' : (isHeal ? '#4caf50' : '#ff5252');
+    const color = isShield ? '#4fc3f7' : (isHeal ? '#4caf50' : (crit ? '#ffd54f' : '#ff5252'));
     // 同帧同位置合并：同一目标同一帧被多段命中时（猎人多弹同时命中/骑士冲锋普攻+冲锋伤），
     // 飘字叠加为总伤害，避免多个飘字重叠只看到单次伤害的误导（如猎人只显示45、骑士只显示80）
     const existing = game.dmgNumbers.find(n =>
@@ -5289,7 +6107,39 @@ function spawnDmgNum(x, y, amount, isHeal, isShield) {
         x: x, y: y,
         amount: amt,
         color: color,
+        crit: crit,        // 🥊 暴击飘字：金色显示（渲染层仅凭颜色区分）
         timer: 0.8, maxTimer: 0.8,
         _frame: game.time, // 记录创建帧（game.time 同一帧内不变）
     });
+}
+
+// ---- 疗豆自爆结算：单体25伤害（落点35px内最近1名敌人，命中判定圈同火豆自爆）+ 75px内友军恢复buff（4秒每秒40共160，不叠加只刷新）----
+// 跳跃落地（healJump 弹道）与死亡自爆（死亡规则）共用，保证两条路径结算一致；零随机（Lockstep 安全）
+function explodeHealBean(x, y, team, ownerId) {
+    // 单体伤害：35px内最近的一名敌人（AOE性质爆点：不判隐身/界域隐身，同火豆自爆与 AOE 惯例）
+    let hit = null, hitD = Infinity;
+    const atkEnt = game.entities.find(en => en.id === ownerId) || null;
+    for (let en of game.entities) {
+        if (en.team === team || en.hp <= 0 || en._headHidden) continue;
+        const d = Math.hypot(en.x - x, en.y - y);
+        if (d <= 35 && d < hitD) { hitD = d; hit = en; }
+    }
+    if (hit) {
+        const dmg = calcActualDmg(25, atkEnt, hit);
+        hit.hp -= dmg;
+        spawnDmgNum(hit.x, hit.y - 20, dmg);
+    }
+    // 治疗buff：75px内友军兵种/治疗兵（防御工事/建筑不可被治疗，同战斗天使/医疗兵惯例；重复施加只刷新持续时间，不叠加）
+    for (let a of game.entities) {
+        if (a.team !== team || a.hp <= 0) continue;
+        if (a.type !== 'troop' && a.type !== 'healer') continue; // 只给兵种加，堡垒/建筑不给
+        if (Math.hypot(a.x - x, a.y - y) > 75) continue;
+        a._healBuffTimer = 4;
+        a._healBuffPerSec = 40;
+        a._healBuffTickTimer = 1; // 预载累加器 → 下一帧即触发第1次治疗（同战斗天使首帧tick惯例）
+    }
+    // 特效：爆点 + 💚 + 绿色治疗范围环（75px 静态真实范围）
+    game.spellEffects.push({ x: x, y: y, char: '💥', size: 24, timer: 0.3, maxTimer: 0.3 });
+    game.spellEffects.push({ x: x, y: y, char: '💚', size: 35, timer: 0.5, maxTimer: 0.5 });
+    game.deployEffects.push({ x: x, y: y, radius: 75, timer: 0.4, maxTimer: 0.4, color: HEAL_RING_COLOR, static: true });
 }

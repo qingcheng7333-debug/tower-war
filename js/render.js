@@ -17,14 +17,39 @@ function draw(alpha) {
     // 临时把实体 x/y 投影到 [上一逻辑帧, 当前逻辑帧] 之间，draw 结束后 finally 恢复。
     // 这是 render.js「只读不写」原则的登记特例（与 update.js 圣水 DOM 特例对等），
     // 净副作用为零：绘制期间所有实体读取到的都是插值坐标（兵种/建筑/塔/离屏染色自动生效）。
+    // 同理覆盖非实体移动对象：弹道/伤害数字/滚木按 x/y，桶/箭雨/火球/火箭按 timer，
+    // 穿透箭/鱼线按 traveled（位置 = 锚点 + 方向×里程），30Hz 逻辑 → 60fps 视觉。
     const proj = [];
-    for (const e of game.entities) {
-        if (e.prevX === undefined) continue;   // 无插值基准（理论不发生）直接原样绘制
-        proj.push(e);
-        e._projX = e.x; e._projY = e.y;
-        e.x = e.prevX + (e.x - e.prevX) * (alpha || 0);
-        e.y = e.prevY + (e.y - e.prevY) * (alpha || 0);
-    }
+    const projXY = (o) => {
+        if (o.prevX === undefined) return;   // 本逻辑帧新生成，无插值基准，直接原样绘制
+        proj.push(o);
+        o._projX = o.x; o._projY = o.y;
+        o.x = o.prevX + (o.x - o.prevX) * (alpha || 0);
+        o.y = o.prevY + (o.y - o.prevY) * (alpha || 0);
+    };
+    const projTimer = (o) => {
+        if (o.prevTimer === undefined) return;
+        proj.push(o);
+        o._projTimer = o.timer;
+        o.timer = o.prevTimer + (o.timer - o.prevTimer) * (alpha || 0);
+    };
+    const projTraveled = (o) => {
+        if (o.prevTraveled === undefined) return;
+        proj.push(o);
+        o._projTraveled = o.traveled;
+        o.traveled = o.prevTraveled + (o.traveled - o.prevTraveled) * (alpha || 0);
+    };
+    for (const e of game.entities) projXY(e);
+    for (const p of game.projectiles) projXY(p);
+    for (const n of game.dmgNumbers) projXY(n);
+    for (const lg of game.logRolls) projXY(lg);
+    for (const b of game.goblinBarrels) projTimer(b);
+    for (const f of game.arrowRainFlights) projTimer(f);
+    for (const f of game.fireballFlights) projTimer(f);
+    for (const r of game.rocketFlights) projTimer(r);
+    for (const a of game.pierceArrows) projTraveled(a);
+    for (const l of game.fishingLines) projTraveled(l);
+    for (const b of game.boulderRolls) projXY(b);
     try {
         DC.clearRect(0, 0, W, H);
 
@@ -59,9 +84,9 @@ function draw(alpha) {
             DC.stroke();
         }
     }
-    // 🌊 河流动态水流层（缩窄图专属，纯渲染只读 game.time 相位，零随机零状态；标准模式保持静态斜纹）
+    // 🌊 河流动态水流层（缩窄图专属，纯渲染只读 renderClockSec 相位，零随机零状态；标准模式保持静态斜纹）
     if (game.shrink220) {
-        const tSec = game.time;
+        const tSec = renderClockSec;
         const rw = riverR - riverL, cx = (riverL + riverR) / 2;
         // ① 流动波纹：三层水平 sin 波纹整体随时间下移（速度/波长/振幅/相位错开 → 分层水流感）
         DC.lineWidth = 1.2;
@@ -175,16 +200,114 @@ function draw(alpha) {
     // ---- 🧭 烟引·放烟点特效（countdown 计时环 + active 持续烟雾发散）----
     drawSmokeGuideEffects();
 
+/** 🌪️ 龙卷风视觉（读书人小飓风 / 风人风爆区共用）：双向旋转虚线圈 + 内部薄雾 + 🌪️风眼 */
+function drawTornadoVisual(x, y, radius, alpha, withEye) {
+    if (withEye === undefined) withEye = true;
+    DC.save();
+    DC.globalAlpha = alpha;
+    // 旋风圈：两圈反向旋转的虚线圆弧（renderClockSec 驱动，纯渲染）
+    DC.setLineDash([9, 7]);
+    DC.lineDashOffset = -renderClockSec * 40;
+    DC.strokeStyle = 'rgba(200, 200, 205, 0.55)';
+    DC.lineWidth = 2.5;
+    DC.beginPath();
+    DC.arc(x, y, radius, 0, 2 * Math.PI);
+    DC.stroke();
+    DC.lineDashOffset = renderClockSec * 55;
+    DC.strokeStyle = 'rgba(160, 160, 170, 0.4)';
+    DC.lineWidth = 1.6;
+    DC.beginPath();
+    DC.arc(x, y, radius * 0.62, 0, 2 * Math.PI);
+    DC.stroke();
+    DC.setLineDash([]);
+    // 内部淡灰薄雾
+    DC.fillStyle = 'rgba(190, 190, 200, 0.10)';
+    DC.beginPath();
+    DC.arc(x, y, radius, 0, 2 * Math.PI);
+    DC.fill();
+    // 风眼：常显 🌪️（风人·扩散风场不画：风人本身即风眼）
+    if (withEye) {
+        DC.font = '22px sans-serif';
+        DC.textAlign = 'center';
+        DC.textBaseline = 'middle';
+        DC.fillText('🌪️', x, y);
+    }
+    DC.restore();
+}
+
+// ---- 📖 读书人·聚 小飓风（灰色旋风圈 + 常显🌪️风眼，随眼移动）----
+    for (const h of game.scholarHurricanes) {
+        drawTornadoVisual(h.x, h.y, h.radius, Math.min(1, h.timer / 0.5)); // 消散前0.5s淡出
+    }
+
+    // ---- 💨 风人·扩散 风场（135跟随风人；放大版旋风视觉，风人本身即风眼故不画🌪️）----
+    for (const f of game.windFields) {
+        drawTornadoVisual(f.x, f.y, f.radius, Math.min(1, f.timer / 0.5), false); // 消散前0.5s淡出
+    }
+
+    // ---- 💨 风人·风爆区（55范围 0.4s一跳4伤害，1.2s共3跳12伤害；无牵引不移动）----
+    for (const z of game.windZones) {
+        drawTornadoVisual(z.x, z.y, z.radius, Math.min(1, z.timer / 0.4)); // 消散前0.4s淡出
+    }
+
+    // ---- ☃️ 雪人·雪地轨迹（淡白软圆，消散前0.5s淡出）----
+    for (const t of game.snowTrails) {
+        const alpha = Math.min(1, t.timer / 0.5) * 0.3;
+        DC.fillStyle = `rgba(240, 248, 255, ${alpha})`;
+        DC.beginPath();
+        DC.arc(t.x, t.y, t.radius, 0, 2 * Math.PI);
+        DC.fill();
+        DC.strokeStyle = `rgba(210, 230, 250, ${alpha})`;
+        DC.lineWidth = 1;
+        DC.stroke();
+    }
+
+    // ---- 📖 读书人·鎮 ☁️雷云（影子×1.6 + 云体×1.6，70%透明度，云恒在影子正上方105px）----
+    for (const cloud of game.scholarClouds) {
+        const alpha = Math.min(1, cloud.timer / 0.5); // 消散前0.5s淡出
+        const bob = Math.sin(renderClockSec * 4 + cloud.timer) * 2.5; // 云体轻微浮动
+        DC.save();
+        DC.globalAlpha = alpha;
+        // 地面影子（与锁定敌人重叠/滑行中）
+        DC.fillStyle = 'rgba(30, 30, 60, 0.35)';
+        DC.beginPath();
+        DC.ellipse(cloud.sx, cloud.sy, 26, 9.6, 0, 0, 2 * Math.PI);
+        DC.fill();
+        // ☁️ 云体：影子正上方105px（召唤时影子与敌人重合=云在敌人头顶）
+        DC.globalAlpha = alpha * 0.7;
+        DC.font = '48px sans-serif';
+        DC.textAlign = 'center';
+        DC.textBaseline = 'middle';
+        DC.fillText('☁️', cloud.sx, cloud.sy - 105 + bob);
+        DC.restore();
+    }
+
     // ---- 绘制所有实体 ----
     for (let e of game.entities) {
         if (e.hp <= 0) continue;
         if (e.isCopy) { drawCopyUnit(e); continue; } // 🔷 复制体：本体建模整体染亮蓝+半透明（克隆法术/冥王召唤骷髅共用）
+        if (e._spiritClone) { drawCopyUnit(e, true); continue; } // 📖 靈·紫色克隆体：本体建模染紫+半透明（读书人书灵技能）
         // 🫥 领域隐身（黄泉·界域）：通用半透明虚影（所有兵种/建筑通用，幽灵隐身走自己的 drawGhost 逻辑）
         const realmHid = e._realmHidden;
         if (realmHid) DC.save();
         if (realmHid) DC.globalAlpha = 0.32;
+        // 🌿 藤蔓拽落·趴地压扁（仅原飞行单位 _vineFlyingOrig=true）：整体垂直压到70%贴地趴伏 + 微幅挣扎抖动；纯渲染动画（只读 renderClockSec）
+        const squash = vineSquashOf(e);
+        if (squash > 0) {
+            DC.save();
+            DC.translate(e.x + Math.sin(renderClockSec * 34) * 1.1 * squash, e.y);
+            DC.scale(1, 1 - 0.30 * squash);
+            DC.translate(-e.x, -e.y);
+        }
         drawUnitBody(e);
+        if (squash > 0) DC.restore();
         if (realmHid) DC.restore();
+    }
+
+    // ---- 🌿 藤蔓缠绕（视觉特效非buff）：被缠绕单位身体上的绿藤 —— _vineGroundTimer>0 时显示，剩余<0.35s 淡出=松藤 ----
+    for (let e of game.entities) {
+        if (e.hp <= 0 || !e._vineGroundTimer) continue;
+        drawVineWrap(e);
     }
 
     // ---- 通用状态图标系统：每个实体头顶绘制动态状态标识 ----
@@ -194,25 +317,53 @@ function draw(alpha) {
     }
 
     // ---- 🐾 绘制狂战士爆发·兽爪血痕（全局特效层：在所有实体/状态图标绘制之后，不被建模遮挡）----
-    if (game.clawEffects && game.clawEffects.length) {
+    if (game.clawEffects.length) {
         for (let s of game.clawEffects) {
+            const cyan = !!s.cyan; // 🗡️ 青色交叉刀痕（浪人反弹）：爪光与刀痕同为青色系
 
             const p = 1 - Math.min(s.timer / s.maxTimer, 1);   // 0→1
             const grow = 1 - (1 - p) * (1 - p);                // easeOut 猛然抓出
             const alpha = Math.sin(p * Math.PI);               // 抓出→消散
+
+            // 🗡️ 青色交叉刀痕的刀光垫底：不走红爪三缝，改为沿刀痕方向的叶形光带——
+            //    两端收尖汇聚成点（不是矩形长条），中央最宽；形状=刀痕等比放大再沿轴向微拉长
+            if (cyan) {
+                const sa = s.dir;                                    // 跟随刀痕走向（symmetric 无偏转）
+                const gx = Math.cos(sa), gy = Math.sin(sa);
+                const nx2 = -gy, ny2 = gx;                           // 法线方向（叶形宽度方向）
+                const half = 17 * (s.scale || 1.12) + 5;             // 半长 = 刀痕半长 + 两端各加长5px
+                const bowG = 5 * (s.scale || 1.12) * (s.bowSign || 1); // 叶形中心线弧偏移（与刀痕弧度同向同幅）
+                const cx = s.x - gy * bowG, cy2 = s.y + gx * bowG;   // (-gy,gx)=刀痕左法线 → 弧偏移向量
+                DC.save();
+                DC.shadowColor = 'rgba(80,235,225,0.9)';
+                DC.shadowBlur = 12;
+                // 双层叶形填充：外层宽而淡（光晕）+ 内层窄而亮（光芯），两端在叶尖汇聚成点，中心线带弧度
+                [[4.5, 0.3], [2.4, 0.75]].forEach(([w, al]) => {
+                    DC.fillStyle = `rgba(90,255,235,${alpha * al})`;
+                    DC.beginPath();
+                    DC.moveTo(s.x - gx * half, s.y - gy * half);
+                    DC.quadraticCurveTo(cx + nx2 * w, cy2 + ny2 * w, s.x + gx * half, s.y + gy * half);
+                    DC.quadraticCurveTo(cx - nx2 * w, cy2 - ny2 * w, s.x - gx * half, s.y - gy * half);
+                    DC.closePath();
+                    DC.fill();
+                });
+                DC.restore();
+                continue;
+            }
+
             const len = 16 * grow;                             // 爪痕长度
             const a = s.dir + (s.flip ? 0.55 : -0.55);         // 本组爪痕方向（左右交替倾斜）
             const nx = -Math.sin(a), ny = Math.cos(a);         // 垂直方向（三条缝错开）
             DC.save();
             DC.lineCap = 'round';
-            DC.shadowColor = 'rgba(255,20,45,0.9)';
+            DC.shadowColor = cyan ? 'rgba(80,235,225,0.9)' : 'rgba(255,20,45,0.9)';
             DC.shadowBlur = 12;
             [-3.5, 0, 3.5].forEach(off => {
                 const x0 = s.x + nx * off, y0 = s.y + ny * off;
                 const x1 = x0 + Math.cos(a) * len, y1 = y0 + Math.sin(a) * len;
                 // 双层绘制：外层宽淡红光晕 + 内层亮血痕
                 [[5, 0.35], [2.6, 1]].forEach(([lw, al]) => {
-                    DC.strokeStyle = `rgba(255,18,40,${alpha * al})`;
+                    DC.strokeStyle = cyan ? `rgba(90,255,235,${alpha * al})` : `rgba(255,18,40,${alpha * al})`;
                     DC.lineWidth = lw;
                     DC.beginPath();
                     DC.moveTo(x0, y0);
@@ -225,7 +376,7 @@ function draw(alpha) {
     }
 
     // ---- 🌊 落水水花（测试双人河道溺亡；update 生成+衰减，此处只读绘制；detect220 变体才有数据）----
-    if (game.splashFX && game.splashFX.length) {
+    if (game.splashFX.length) {
         for (let s of game.splashFX) {
             const p = 1 - Math.min(s.timer / s.maxTimer, 1);   // 0→1
             const fade = Math.sin(p * Math.PI);                // 淡入→消散
@@ -268,7 +419,7 @@ function draw(alpha) {
             // 🥷 四角弯刃手里剑：中心空心圆环 + 四个弯曲尖刃，飞行中持续自转
             const r = p.size * 0.23;
             const outer = p.size * 0.62;
-            const spin = game.time * 16 + (p.spinOffset || 0);
+            const spin = renderClockSec * 16 + (p.spinOffset || 0);
             DC.save();
             DC.translate(p.x, p.y);
             DC.rotate(spin);
@@ -339,8 +490,8 @@ function draw(alpha) {
             DC.beginPath();
             DC.arc(p.x - r * 0.3, p.y - r * 0.3, r * 0.35, 0, 2 * Math.PI);
             DC.fill();
-        } else if (p.isMortar || p.isBomber || p.isFireJump) {
-            // 迫击炮🪨 / 哥布林爆破手🧨 / 火豆跳跃🔥：抛物线弹体（无轨迹虚线）
+        } else if (p.isMortar || p.isBomber || p.isFireJump || p.isHealJump) {
+            // 迫击炮🪨 / 哥布林爆破手🧨 / 火豆跳跃🔥 / 疗豆跳跃💚：抛物线弹体（无轨迹虚线）
             DC.font = `${p.size}px sans-serif`;
             DC.textAlign = 'center';
             DC.textBaseline = 'middle';
@@ -348,7 +499,7 @@ function draw(alpha) {
         } else if (p.isRocket) {
             // 烟花火箭：🚀 + 沿飞行方向拖出橙色尾焰（直线弹道用vx/vy，追踪弹道用tx/ty）
             const ang = (p.vx !== undefined) ? Math.atan2(p.vy, p.vx) : Math.atan2(p.ty - p.y, p.tx - p.x);
-            const f = 5 + 3 * Math.sin(game.time * 30);
+            const f = 5 + 3 * Math.sin(renderClockSec * 30);
             DC.strokeStyle = 'rgba(255,140,0,0.8)';
             DC.lineWidth = 3;
             DC.beginPath();
@@ -366,7 +517,7 @@ function draw(alpha) {
             const r = p.size / 2 * 0.65; // 整体缩小约1/3
             const ang = Math.atan2(p.vy, p.vx);
             // 短尾迹（沿飞行反方向，随时间闪烁；金色变体闪金）
-            DC.strokeStyle = `rgba(${gold ? '255,210,90' : '140,200,255'},${0.3 + 0.15 * Math.sin(game.time * 25)})`;
+            DC.strokeStyle = `rgba(${gold ? '255,210,90' : '140,200,255'},${0.3 + 0.15 * Math.sin(renderClockSec * 25)})`;
             DC.lineWidth = 2.5;
             DC.beginPath();
             DC.moveTo(p.x - Math.cos(ang) * 3, p.y - Math.sin(ang) * 3);
@@ -383,12 +534,12 @@ function draw(alpha) {
             DC.arc(p.x, p.y, glowR, 0, 2 * Math.PI);
             DC.fill();
             // ⚡ 跳动电弧（3~4道，围绕球体随机折线，每帧抖动，永不重样；金色变体金色电弧）
-            const arcCount = 3 + Math.floor((Math.sin(game.time * 31) + 1)); // 3~4道交替
+            const arcCount = 3 + Math.floor((Math.sin(renderClockSec * 31) + 1)); // 3~4道交替
             DC.strokeStyle = gold ? '#ffd766' : '#bfe3ff';
             DC.lineWidth = 1.2;
             for (let k = 0; k < arcCount; k++) {
                 // 每道电弧起始角随时间+随机数跳动
-                const seedA = game.time * 22 + k * 2.4;
+                const seedA = renderClockSec * 22 + k * 2.4;
                 const a0 = (Math.sin(seedA) * 0.5 + k / arcCount) * 2 * Math.PI;
                 let ax = p.x + Math.cos(a0) * r, ay = p.y + Math.sin(a0) * r; // 起点：球面
                 const a1 = a0 + (Math.random() - 0.5) * 1.6 + Math.PI;        // 终点方向：穿过球心到对面附近
@@ -404,7 +555,7 @@ function draw(alpha) {
                 DC.stroke();
             }
             // 电弧亮光（每次跳动球体外圈闪一下，金色变体闪金）
-            DC.strokeStyle = `rgba(${gold ? '255,215,100' : '191,227,255'},${0.25 + 0.2 * Math.sin(game.time * 25)})`;
+            DC.strokeStyle = `rgba(${gold ? '255,215,100' : '191,227,255'},${0.25 + 0.2 * Math.sin(renderClockSec * 25)})`;
             DC.lineWidth = 1;
             DC.beginPath();
             DC.arc(p.x, p.y, r * 1.5, 0, 2 * Math.PI);
@@ -481,7 +632,7 @@ function draw(alpha) {
             // ❄️ 寒冰法师冰锥：独特几何冰晶锥体（沿飞行方向旋转，棱面+尾部冰晶分叉+尖端高光）
             //    + 寒气尾迹（渐隐飘带，随时间浮动）+ 冰蓝光晕
             const ang = Math.atan2(p.vy, p.vx);
-            const fl = 2 + 1.5 * Math.sin(game.time * 18); // 尾迹寒气飘动幅度
+            const fl = 2 + 1.5 * Math.sin(renderClockSec * 18); // 尾迹寒气飘动幅度
             DC.save();
             // 外层寒气光晕（冰蓝渐变）
             const glowGrad = DC.createRadialGradient(p.x, p.y, 0, p.x, p.y, 14);
@@ -494,7 +645,7 @@ function draw(alpha) {
             DC.fill();
             // 寒气尾迹：沿飞行反方向飘出的渐隐冰雾（主尾迹+细尾迹，随时间浮动）
             const bx = Math.cos(ang), by = Math.sin(ang);
-            DC.strokeStyle = `rgba(190,235,255,${0.4 + 0.15 * Math.sin(game.time * 15)})`;
+            DC.strokeStyle = `rgba(190,235,255,${0.4 + 0.15 * Math.sin(renderClockSec * 15)})`;
             DC.lineWidth = 2;
             DC.beginPath();
             DC.moveTo(p.x - bx * 6, p.y - by * 6);
@@ -503,7 +654,7 @@ function draw(alpha) {
                 p.x - bx * 21 + by * fl * 1.5, p.y - by * 21 - bx * fl * 1.5
             );
             DC.stroke();
-            DC.strokeStyle = `rgba(225,246,255,${0.55 + 0.2 * Math.sin(game.time * 20 + 1)})`;
+            DC.strokeStyle = `rgba(225,246,255,${0.55 + 0.2 * Math.sin(renderClockSec * 20 + 1)})`;
             DC.lineWidth = 1;
             DC.beginPath();
             DC.moveTo(p.x - bx * 5, p.y - by * 5);
@@ -588,7 +739,7 @@ function draw(alpha) {
             const spin = (p._returning ? -1 : 1);
             DC.save();
             DC.translate(p.x, p.y);
-            DC.rotate(ang + game.time * 16 * spin);
+            DC.rotate(ang + renderClockSec * 16 * spin);
             DC.font = `${p.size}px sans-serif`;
             DC.textAlign = 'center';
             DC.textBaseline = 'middle';
@@ -626,7 +777,7 @@ function draw(alpha) {
             DC.stroke();
             DC.restore();
             // 微光（🕊️御剑金剑：金色光晕更大更亮）
-            DC.globalAlpha = (p.gold ? 0.55 : 0.35) + Math.sin(game.time * 8) * 0.15;
+            DC.globalAlpha = (p.gold ? 0.55 : 0.35) + Math.sin(renderClockSec * 8) * 0.15;
             DC.strokeStyle = swordCol;
             DC.lineWidth = p.gold ? 9 : 4;
             DC.beginPath();
@@ -674,7 +825,7 @@ function draw(alpha) {
     }
 
     // ---- 绘制渔夫鱼线（棕色线条·参照游侠穿透箭渐变渲染）----
-    if (game.fishingLines) {
+    if (game.fishingLines.length) {
         for (const l of game.fishingLines) {
             let tipX, tipY, tailX, tailY;
             if (l.pulling && l.targetId) {
@@ -860,7 +1011,7 @@ function draw(alpha) {
             // ── 一缕金光：金色透明圆锥（顶点在上，向下散开，圆锥底与神庙底座同平面并罩住底座）──
             const beamTop = s.y - 44, beamBottom = s.y + 9;
             const coneHalf = 13;   // 圆锥底半径（神庙底座半宽9，外扩罩住）
-const breathe = 0.8 + 0.2 * Math.sin(game.tick / 3.6); // 微呼吸（🔗 联机确定性：tick 相位替代墙钟）
+const breathe = 0.8 + 0.2 * Math.sin(renderClockSec * 30 / 3.6); // 微呼吸（渲染时钟相位）
             const beamGrad = DC.createLinearGradient(0, beamTop, 0, beamBottom);
             beamGrad.addColorStop(0, `rgba(255, 236, 150, ${0.7 * alpha * breathe})`);
             beamGrad.addColorStop(0.45, `rgba(255, 215, 0, ${0.3 * alpha * breathe})`);
@@ -961,6 +1112,31 @@ const breathe = 0.8 + 0.2 * Math.sin(game.tick / 3.6); // 微呼吸（🔗 联�
             // 前方翻出的新土
             DC.fillStyle = '#8B5A2B';
             DC.fillRect(s.x + 8 * grow, s.y + 6, 6 * grow, 4 * grow);
+            DC.globalAlpha = 1;
+        } else if (s.type === 'skeleton_dig') {
+            // 🪦 骷髅破土土堆（矿工 miner_dig 小号版：土堆随时间从无到有隆起成型，期满骷髅破土时消失）
+            const k = Math.min(1, Math.max(0, 1 - s.timer / s.maxTimer)); // 0→1 隆起进度
+            const grow = k;
+            const sc = 0.68; // 骷髅体型缩放（矿工土堆 r12 → r8）
+            DC.globalAlpha = grow;
+            // 土丘（上半圆弓形，埋入地下感；半径随隆起放大）
+            DC.fillStyle = '#8B5A2B';
+            DC.beginPath();
+            DC.arc(s.x, s.y + 5, 12 * sc * grow, Math.PI, Math.PI * 2);
+            DC.closePath();
+            DC.fill();
+            DC.strokeStyle = 'rgba(0,0,0,0.25)';
+            DC.lineWidth = 1;
+            DC.stroke();
+            // 土块细节（随土丘一起缩放，从中心向外展开）
+            DC.fillStyle = '#a07040';
+            DC.fillRect(s.x - 7 * sc * grow, s.y + 1, 5 * sc * grow, 4 * sc * grow);
+            DC.fillRect(s.x + 3 * sc * grow, s.y + 2, 4 * sc * grow, 3 * sc * grow);
+            DC.fillStyle = '#6e4423';
+            DC.fillRect(s.x - 2 * sc * grow, s.y + 4, 3 * sc * grow, 3 * sc * grow);
+            // 前方翻出的新土
+            DC.fillStyle = '#8B5A2B';
+            DC.fillRect(s.x + 8 * sc * grow, s.y + 4, 6 * sc * grow, 4 * sc * grow);
             DC.globalAlpha = 1;
         } else if (s.type === 'balloon_bomb') {
             // 🎈 气球兵炸弹下落特效：前60%时间💣从 y0 下落到 y1（脚下阴影处），后40%💥在落点放大淡出
@@ -1153,7 +1329,7 @@ const breathe = 0.8 + 0.2 * Math.sin(game.tick / 3.6); // 微呼吸（🔗 联�
     }
     DC.textBaseline = 'alphabetic';
 
-    // ---- 🔥 火球术：从主塔抛物线飞向落点（火球本体随高度变大 + 拖尾 + 地面阴影）----
+    // ---- 🔥 火球术 / ❄️ 雪球：从主塔抛物线飞向落点（本体随高度变大 + 拖尾 + 地面阴影；雪球复用弹道，冰系配色）----
     for (let f of game.fireballFlights) {
         const k = Math.min(1, Math.max(0, 1 - f.timer / f.maxTimer)); // 0→1 飞行进度
         const d0 = Math.max(1, Math.hypot(f.x1 - f.x0, f.y1 - f.y0));
@@ -1169,7 +1345,8 @@ const breathe = 0.8 + 0.2 * Math.sin(game.tick / 3.6); // 微呼吸（🔗 联�
         DC.ellipse(bx, by, 9 * (1 - lift * 0.3), 4, 0, 0, Math.PI * 2);
         DC.fill();
         DC.globalAlpha = 1;
-        // 拖尾小火苗（沿轨迹后方2颗，随飞行渐隐）
+        // 拖尾小标记（沿轨迹后方2颗，随飞行渐隐；雪球❄️/火球🔥）
+        const trailCh = f.snow ? '❄️' : '🔥';
         DC.font = 'bold 15px sans-serif';
         DC.textAlign = 'center';
         DC.textBaseline = 'middle';
@@ -1178,12 +1355,25 @@ const breathe = 0.8 + 0.2 * Math.sin(game.tick / 3.6); // 微呼吸（🔗 联�
             const tx = f.x0 + (f.x1 - f.x0) * kk;
             const ty = f.y0 + (f.y1 - f.y0) * kk - arcH * Math.sin(kk * Math.PI);
             DC.globalAlpha = 0.35 * (1 - t * 0.3) * (1 - lift * 0.5);
-            DC.fillText('🔥', tx, ty);
+            DC.fillText(trailCh, tx, ty);
         }
         DC.globalAlpha = 1;
-        // 火球本体（越飞越高越大，落地前最亮）
-        DC.font = `bold ${Math.round(26 + lift * 10)}px sans-serif`;
-        DC.fillText('🔥', bx, arcY);
+        // 本体（越飞越高越大）：雪球=白色实心球+❄️小标；火球=🔥
+        if (f.snow) {
+            const r = 10 + lift * 5;
+            DC.beginPath();
+            DC.arc(bx, arcY, r, 0, Math.PI * 2);
+            DC.fillStyle = '#f4fbff';
+            DC.fill();
+            DC.strokeStyle = '#9fd4f5';
+            DC.lineWidth = 2;
+            DC.stroke();
+            DC.font = `bold ${Math.round(12 + lift * 4)}px sans-serif`;
+            DC.fillText('❄️', bx, arcY + 1);
+        } else {
+            DC.font = `bold ${Math.round(26 + lift * 10)}px sans-serif`;
+            DC.fillText('🔥', bx, arcY);
+        }
     }
     DC.textBaseline = 'alphabetic';
 
@@ -1335,6 +1525,48 @@ const breathe = 0.8 + 0.2 * Math.sin(game.tick / 3.6); // 微呼吸（🔗 联�
         DC.restore();
     }
 
+    // ---- 🪨 投石人巨石：滚动的圆石（本色圆体 + 随滚动角旋转的裂纹刻痕 + 身后扬尘；只打地面）----
+    for (const b of game.boulderRolls) {
+        const rollAng = b.traveled / b.radius; // 滚动角 = 路程/半径（纯视觉自转）
+        // 地面阴影
+        DC.fillStyle = 'rgba(0,0,0,0.22)';
+        DC.beginPath();
+        DC.ellipse(b.x, b.y + b.radius * 0.75, b.radius * 0.85, b.radius * 0.38, 0, 0, 2 * Math.PI);
+        DC.fill();
+        // 身后扬尘（2颗小点，随渲染时钟抖动）
+        for (let k = 0; k < 2; k++) {
+            const ph = (renderClockSec * 6 + k * 0.5) % 1;
+            DC.globalAlpha = 0.35 * (1 - ph);
+            DC.fillStyle = '#b8a98f';
+            DC.beginPath();
+            DC.arc(b.x - b.dx * (b.radius + 4 + ph * 7) + Math.sin(renderClockSec * 9 + k * 4) * 2,
+                   b.y - b.dy * (b.radius + 4 + ph * 7) - ph * 3, 2 - ph, 0, 2 * Math.PI);
+            DC.fill();
+        }
+        DC.globalAlpha = 1;
+        DC.save();
+        DC.translate(b.x, b.y);
+        DC.rotate(rollAng);
+        // 石体
+        DC.fillStyle = '#8d8d93';
+        DC.beginPath();
+        DC.arc(0, 0, b.radius, 0, 2 * Math.PI);
+        DC.fill();
+        DC.strokeStyle = '#5c5c63';
+        DC.lineWidth = 1.5;
+        DC.stroke();
+        // 表面裂纹刻痕（旋转可见滚动感）+ 高光
+        DC.strokeStyle = 'rgba(60,60,68,0.7)';
+        DC.lineWidth = 1.2;
+        DC.beginPath(); DC.moveTo(-b.radius * 0.55, -2); DC.lineTo(-b.radius * 0.1, 3); DC.lineTo(b.radius * 0.35, 0); DC.stroke();
+        DC.beginPath(); DC.arc(b.radius * 0.3, -b.radius * 0.45, 2.2, 0, Math.PI); DC.stroke();
+        DC.fillStyle = 'rgba(255,255,255,0.3)';
+        DC.beginPath();
+        DC.arc(-b.radius * 0.35, -b.radius * 0.35, b.radius * 0.28, 0, 2 * Math.PI);
+        DC.fill();
+        DC.restore();
+    }
+
     // ---- 绘制炸弹💣（单位死后留下的，如攻城人/气球兵）----
     for (let b of game.bombs) {
         const progress = b.timer / b.maxTimer;
@@ -1392,6 +1624,22 @@ const breathe = 0.8 + 0.2 * Math.sin(game.tick / 3.6); // 微呼吸（🔗 联�
         DC.fill();
     }
 
+    // ---- 🪦 骷髅召唤墓土圈（淡紫色持续范围提示，呼吸脉动；走渲染时钟不影响联机）----
+    for (const z of game.skeletonSummonZones) {
+        const pulse = 0.8 + 0.2 * Math.sin(renderClockSec * 3.5);
+        DC.fillStyle = `rgba(186,104,200,${0.10 * pulse})`;
+        DC.beginPath();
+        DC.arc(z.x, z.y, z.radius, 0, 2 * Math.PI);
+        DC.fill();
+        DC.strokeStyle = `rgba(200,140,220,${0.5 * pulse})`;
+        DC.lineWidth = 1.5;
+        DC.setLineDash([7, 6]);
+        DC.beginPath();
+        DC.arc(z.x, z.y, z.radius, 0, 2 * Math.PI);
+        DC.stroke();
+        DC.setLineDash([]);
+    }
+
     // ---- 绘制伤害飘字（受击红字 / 治疗绿字，向上飘并淡出）----
     DC.textAlign = 'center';
     DC.font = 'bold 13px sans-serif';
@@ -1406,247 +1654,16 @@ const breathe = 0.8 + 0.2 * Math.sin(game.tick / 3.6); // 微呼吸（🔗 联�
     DC.globalAlpha = 1;
 
     // ---- 通用部署预览：选中卡牌时显示己方半场白色浅光框 + 鼠标位置范围圈/十字准心 ----
-    // ---- 根据堡垒摧毁数计算双方的可部署区边界 ----
-    let playerRightBoundary = riverL;
-    if (game.bastionsLost.ai >= 2) playerRightBoundary = game.shrink220 ? MODE_TEST_AI_BASTION_TOP.x : AI_BASTION_TOP.x; // 🧪测试双人：堡垒线随整图缩窄（shrink220 地图类 gate；模板1 标准图走标准值）
-    else if (game.bastionsLost.ai >= 1) playerRightBoundary = riverR;
-
-    let aiLeftBoundary = riverR;
-    if (game.bastionsLost.player >= 2) aiLeftBoundary = PLAYER_BASTION_TOP.x;
-    else if (game.bastionsLost.player >= 1) aiLeftBoundary = riverL;
-
-    // 蓝方（下方玩家）——技能卡（已部署精英）不生成部署预览，选中只作高亮/双击释放用
-    if (game.uiState.selectedCardId && CARDS[game.uiState.selectedCardId] && !isSkillCardState('player', game.uiState.selectedCardId)) {
-        const card = CARDS[game.uiState.selectedCardId];
-        // 🔮 法术预览：同步显示场上【敌方】法术屏障的庇护范围（紫色圈提示禁放区域）
-        if (card.type === 'spell') drawBarrierRanges('player');
-        // 🔮 屏障卡部署预览：同步显示场上【我方】已有屏障的庇护范围（紫色圈）
-        if (game.uiState.selectedCardId === 'spell_barrier') drawOwnBarrierRanges('player');
-        // 🧭 烟引：阶段1（pending 放烟中）→ 虚线箭头+友军🧭闪烁虚影；阶段0 → 极速同款大圈(85)
-        //    镜像烟引 pending 中选中镜像卡 → 同样走「下烟」虚线预览（镜像卡=下烟载体）
-        const playerSmokeIsMirror = game.uiState.selectedCardId === 'mirror';
-        const playerSmokePending = getSmokePending('player', playerSmokeIsMirror);
-        if (game.uiState.selectedCardId === 'smoke_guide' || (playerSmokeIsMirror && playerSmokePending)) {
-            if (playerSmokePending) drawSmokeReleasePreview('player', playerSmokeIsMirror);
-            else drawSmokeGuideRangePreview('player');
-        } else {
-        // ★ 镜像法术：预览跟随被镜像的卡牌（镜像矿工→全屏白框、镜像迫击炮→射程圈+盲区内圈、镜像法术→淡红环等）
-        let previewCard = card;
-        let previewCardId = game.uiState.selectedCardId;
-        if (previewCardId === 'mirror' && getMirrorCopiedCard('player') && CARDS[getMirrorCopiedCard('player')]) {
-            previewCard = CARDS[getMirrorCopiedCard('player')];
-            previewCardId = getMirrorCopiedCard('player');
-        }
-        // 整片可部署区域白色浅光框（法术/任意部署卡全屏，非法术动态边界渐隐；halfOnly 法术如滚木按军队规则限己方半场）
-        if ((previewCard.type === 'spell' && !previewCard.halfOnly) || previewCard.anywhere) {
-            drawDeployZoneFrame(0, W, false);
-        } else {
-            drawDeployZoneFrame(0, playerRightBoundary, true);
-        }
-        // 鼠标位置部署指示器（范围圈/十字准心 + 颜色区分；治疗范围预览用绿色；塔类显示射程圈+最小射程内圈；小屋显示出兵范围）
-        const hasRadius = previewCard.type === 'spell' || previewCard.deploySpell || previewCard.healRadius
-            || (previewCard.type === 'tower' && previewCard.range)
-            || (previewCardId === 'goblin_hut' && previewCard.spawnRange);
-        const isSpellLike = previewCard.type === 'spell';
-        const canPlace = (isSpellLike && !previewCard.halfOnly)
-            ? !isSpellBlockedByBarrier('player', game.uiState.mouseX, game.uiState.mouseY) // 🔮 法术预览：鼠标在敌方屏障庇护区内→不可部署（预览变红）
-            : canDeployHere(previewCardId, 'player', game.uiState.mouseX, game.uiState.mouseY, game.entities, game.bastionsLost.ai, game.bastionsLost.player, riverL, riverR)
-              && !(isSpellLike && isSpellBlockedByBarrier('player', game.uiState.mouseX, game.uiState.mouseY)); // 半场法术（滚木）仍受屏障庇护限制
-        // ⛺ 营地：显示索敌圈+巡逻轨道范围预览（与悬停一致，替代十字准心）
-        if (previewCardId === 'camp') {
-            // 🪏 拆除模式：鼠标移到己方已部署营地上 → 部署预览变为拆除图标
-            const ownCamp = game.entities.find(e => e.cardId === 'camp' && e.team === 'player' && e.hp > 0
-                && Math.abs(e.x - game.uiState.mouseX) <= 15 && Math.abs(e.y - game.uiState.mouseY) <= 15);
-            if (ownCamp) {
-                drawDemolishPreview(game.uiState.mouseX, game.uiState.mouseY, ownCamp);
-            } else {
-                drawCampDeployPreview(game.uiState.mouseX, game.uiState.mouseY, previewCard, canPlace, false);
-            }
-        } else if (previewCardId === 'spell_barrier') {
-            // 🔮 法术屏障：显示庇护范围圈预览（与悬停一致，替代十字准心）
-            const barrierR = previewCard.barrierRange || 200;
-            DC.beginPath();
-            DC.arc(game.uiState.mouseX, game.uiState.mouseY, barrierR, 0, 2 * Math.PI);
-            DC.fillStyle = canPlace ? 'rgba(138,123,255,0.12)' : 'rgba(255,80,80,0.12)';
-            DC.fill();
-            DC.setLineDash([8, 6]);
-            DC.strokeStyle = canPlace ? 'rgba(138,123,255,0.8)' : 'rgba(255,80,80,0.8)';
-            DC.lineWidth = 1.5;
-            DC.stroke();
-            DC.setLineDash([]);
-        } else if (previewCardId === 'log') {
-            // 🪵 滚木：部署预览 = 大致法术影响范围（长=滚动距离560px × 宽=剑仙攻击范围直径65px），起始处画小木头示意
-            const rollDist = previewCard.rollDistance || 560;
-            const halfW = previewCard.radius || 32.5;
-            const x0 = game.uiState.mouseX; // 蓝方向右滚
-            DC.fillStyle = canPlace ? 'rgba(180,130,70,0.15)' : 'rgba(255,80,80,0.15)';
-            DC.fillRect(x0, game.uiState.mouseY - halfW, rollDist, halfW * 2);
-            DC.setLineDash([6, 4]);
-            DC.strokeStyle = canPlace ? 'rgba(180,130,70,0.8)' : 'rgba(255,80,80,0.8)';
-            DC.lineWidth = 2;
-            DC.strokeRect(x0, game.uiState.mouseY - halfW, rollDist, halfW * 2);
-            DC.setLineDash([]);
-            // 滚动方向箭头
-            DC.fillStyle = canPlace ? 'rgba(180,130,70,0.9)' : 'rgba(255,80,80,0.9)';
-            DC.font = '16px sans-serif';
-            DC.textAlign = 'center';
-            DC.textBaseline = 'middle';
-            DC.fillText('→', x0 + rollDist / 2, game.uiState.mouseY);
-            // 起始位置小木头示意（竖直长65厚7）
-            const ll = previewCard.logLength || 65;
-            const lw = (previewCard.logWidth || 7) / 2;
-            DC.fillStyle = '#7a4a21';
-            DC.strokeStyle = '#4a2c10';
-            DC.lineWidth = 1.5;
-            DC.fillRect(x0 - lw, game.uiState.mouseY - ll / 2, lw * 2, ll);
-            DC.strokeRect(x0 - lw, game.uiState.mouseY - ll / 2, lw * 2, ll);
-            DC.textAlign = 'left';
-            DC.textBaseline = 'alphabetic';
-        } else if (hasRadius) {
-            const radius = previewCard.type === 'spell' ? previewCard.radius
-                : previewCard.deploySpell ? previewCard.deploySpell.radius
-                : (previewCard.healRadius || (previewCardId === 'goblin_hut' ? previewCard.spawnRange : previewCard.range));
-            const isHeal = !!previewCard.healRadius && !previewCard.deploySpell; // 战斗天使登场治疗范围
-            DC.beginPath();
-            DC.arc(game.uiState.mouseX, game.uiState.mouseY, radius, 0, 2 * Math.PI);
-            DC.fillStyle = isHeal
-                ? (canPlace ? 'rgba(46,204,113,0.18)' : 'rgba(255,0,0,0.15)')
-                : (canPlace ? 'rgba(255,255,0,0.2)' : 'rgba(255,0,0,0.15)');
-            DC.fill();
-            DC.strokeStyle = isHeal ? (canPlace ? '#2ecc71' : '#ef4444') : (canPlace ? '#facc15' : '#ef4444');
-            DC.lineWidth = 2;
-            DC.setLineDash([]);
-            DC.stroke();
-            // 塔类最小射程内圈（如迫击炮75px近身盲区）
-            if (previewCard.type === 'tower' && previewCard.minRange) {
-                DC.beginPath();
-                DC.arc(game.uiState.mouseX, game.uiState.mouseY, previewCard.minRange, 0, 2 * Math.PI);
-                DC.setLineDash([2, 4]);
-                DC.strokeStyle = canPlace ? 'rgba(255,120,80,0.8)' : 'rgba(255,80,80,0.8)';
-                DC.lineWidth = 1.5;
-                DC.stroke();
-                DC.setLineDash([]);
-            }
-        } else {
-            drawCrosshair(game.uiState.mouseX, game.uiState.mouseY, canPlace ? '#facc15' : '#ef4444');
-        }
-        }
+    // （原蓝红两份 ~120 行手抄分支收敛为 drawDeployPreviewBody；半场边界/配色/滚木方向差异全部参数化）
+    // 🕊️ 技能卡选中 → 法术释放模式预览（全屏白框 + 作用单位头顶⚠️大图标），不走普通部署预览
+    if (game.uiState.selectedCardId && CARDS[game.uiState.selectedCardId]) {
+        if (!isSkillCardState('player', game.uiState.selectedCardId)) drawDeployPreviewBody('player', riverL, riverR);
+        else drawSkillCastPreview('player');
     }
-    // 红方（上方玩家）— 双人本地模式（技能卡不生成部署预览）
-    if (game.uiState.selectedCardId2 && CARDS[game.uiState.selectedCardId2] && !isSkillCardState('ai', game.uiState.selectedCardId2)) {
-        const card = CARDS[game.uiState.selectedCardId2];
-        // 🔮 法术预览：同步显示场上【敌方】法术屏障的庇护范围（紫色圈提示禁放区域）
-        if (card.type === 'spell') drawBarrierRanges('ai');
-        // 🔮 屏障卡部署预览：同步显示场上【我方】已有屏障的庇护范围（紫色圈）
-        if (game.uiState.selectedCardId2 === 'spell_barrier') drawOwnBarrierRanges('ai');
-        // 🧭 烟引：阶段1（pending 放烟中）→ 虚线箭头+友军🧭闪烁虚影；阶段0 → 极速同款大圈(85)
-        //    镜像烟引 pending 中选中镜像卡 → 同样走「下烟」虚线预览（镜像卡=下烟载体）
-        const aiSmokeIsMirror = game.uiState.selectedCardId2 === 'mirror';
-        const aiSmokePending = getSmokePending('ai', aiSmokeIsMirror);
-        if (game.uiState.selectedCardId2 === 'smoke_guide' || (aiSmokeIsMirror && aiSmokePending)) {
-            if (aiSmokePending) drawSmokeReleasePreview('ai', aiSmokeIsMirror);
-            else drawSmokeGuideRangePreview('ai');
-        } else {
-        let previewCard = card;
-        let previewCardId = game.uiState.selectedCardId2;
-        if (previewCardId === 'mirror' && getMirrorCopiedCard('ai') && CARDS[getMirrorCopiedCard('ai')]) {
-            previewCard = CARDS[getMirrorCopiedCard('ai')];
-            previewCardId = getMirrorCopiedCard('ai');
-        }
-        // 整片可部署区域白色浅光框（法术/任意部署卡全屏，非法术动态边界渐隐；halfOnly 法术如滚木按军队规则限己方半场）
-        if ((previewCard.type === 'spell' && !previewCard.halfOnly) || previewCard.anywhere) {
-            drawDeployZoneFrame(0, W, false);
-        } else {
-            drawDeployZoneFrame(aiLeftBoundary, W, true);
-        }
-        // 鼠标位置部署指示器（治疗范围预览用绿色；塔类显示射程圈+最小射程内圈；小屋显示出兵范围）
-        const hasRadius = previewCard.type === 'spell' || previewCard.deploySpell || previewCard.healRadius
-            || (previewCard.type === 'tower' && previewCard.range)
-            || (previewCardId === 'goblin_hut' && previewCard.spawnRange);
-        const isSpellLike = previewCard.type === 'spell';
-        const canPlace = (isSpellLike && !previewCard.halfOnly)
-            ? !isSpellBlockedByBarrier('ai', game.uiState.mouseX, game.uiState.mouseY) // 🔮 法术预览：鼠标在敌方屏障庇护区内→不可部署（预览变红）
-            : canDeployHere(previewCardId, 'ai', game.uiState.mouseX, game.uiState.mouseY, game.entities, game.bastionsLost.ai, game.bastionsLost.player, riverL, riverR)
-              && !(isSpellLike && isSpellBlockedByBarrier('ai', game.uiState.mouseX, game.uiState.mouseY)); // 半场法术（滚木）仍受屏障庇护限制
-        // ⛺ 营地：显示索敌圈+巡逻轨道范围预览（与悬停一致，替代十字准心）
-        if (previewCardId === 'camp') {
-            // 🪏 拆除模式：鼠标移到己方已部署营地上 → 部署预览变为拆除图标
-            const ownCamp = game.entities.find(e => e.cardId === 'camp' && e.team === 'ai' && e.hp > 0
-                && Math.abs(e.x - game.uiState.mouseX) <= 15 && Math.abs(e.y - game.uiState.mouseY) <= 15);
-            if (ownCamp) {
-                drawDemolishPreview(game.uiState.mouseX, game.uiState.mouseY, ownCamp);
-            } else {
-                drawCampDeployPreview(game.uiState.mouseX, game.uiState.mouseY, previewCard, canPlace, true);
-            }
-        } else if (previewCardId === 'spell_barrier') {
-            // 🔮 法术屏障：显示庇护范围圈预览（红方配色，替代十字准心）
-            const barrierR = previewCard.barrierRange || 200;
-            DC.beginPath();
-            DC.arc(game.uiState.mouseX, game.uiState.mouseY, barrierR, 0, 2 * Math.PI);
-            DC.fillStyle = canPlace ? 'rgba(224,106,176,0.12)' : 'rgba(255,107,157,0.2)';
-            DC.fill();
-            DC.setLineDash([8, 6]);
-            DC.strokeStyle = canPlace ? 'rgba(224,106,176,0.8)' : '#ff6b9d';
-            DC.lineWidth = 1.5;
-            DC.stroke();
-            DC.setLineDash([]);
-        } else if (previewCardId === 'log') {
-            // 🪵 滚木：部署预览 = 大致法术影响范围（长=滚动距离560px × 宽=剑仙攻击范围直径65px），起始处画小木头示意
-            const rollDist = previewCard.rollDistance || 560;
-            const halfW = previewCard.radius || 32.5;
-            const x0 = game.uiState.mouseX; // 红方向左滚
-            DC.fillStyle = canPlace ? 'rgba(224,106,176,0.12)' : 'rgba(255,107,157,0.2)';
-            DC.fillRect(x0 - rollDist, game.uiState.mouseY - halfW, rollDist, halfW * 2);
-            DC.setLineDash([6, 4]);
-            DC.strokeStyle = canPlace ? 'rgba(224,106,176,0.8)' : '#ff6b9d';
-            DC.lineWidth = 2;
-            DC.strokeRect(x0 - rollDist, game.uiState.mouseY - halfW, rollDist, halfW * 2);
-            DC.setLineDash([]);
-            // 滚动方向箭头
-            DC.fillStyle = canPlace ? 'rgba(224,106,176,0.9)' : '#ff6b9d';
-            DC.font = '16px sans-serif';
-            DC.textAlign = 'center';
-            DC.textBaseline = 'middle';
-            DC.fillText('←', x0 - rollDist / 2, game.uiState.mouseY);
-            // 起始位置小木头示意（竖直长65厚7）
-            const ll = previewCard.logLength || 65;
-            const lw = (previewCard.logWidth || 7) / 2;
-            DC.fillStyle = '#7a4a21';
-            DC.strokeStyle = '#4a2c10';
-            DC.lineWidth = 1.5;
-            DC.fillRect(x0 - lw, game.uiState.mouseY - ll / 2, lw * 2, ll);
-            DC.strokeRect(x0 - lw, game.uiState.mouseY - ll / 2, lw * 2, ll);
-            DC.textAlign = 'left';
-            DC.textBaseline = 'alphabetic';
-        } else if (hasRadius) {
-            const radius = previewCard.type === 'spell' ? previewCard.radius
-                : previewCard.deploySpell ? previewCard.deploySpell.radius
-                : (previewCard.healRadius || (previewCardId === 'goblin_hut' ? previewCard.spawnRange : previewCard.range));
-            const isHeal = !!previewCard.healRadius && !previewCard.deploySpell;
-            DC.beginPath();
-            DC.arc(game.uiState.mouseX, game.uiState.mouseY, radius, 0, 2 * Math.PI);
-            DC.fillStyle = isHeal
-                ? (canPlace ? 'rgba(46,204,113,0.2)' : 'rgba(255,150,200,0.2)')
-                : (canPlace ? 'rgba(255,255,255,0.2)' : 'rgba(255,150,200,0.2)');
-            DC.fill();
-            DC.strokeStyle = isHeal ? (canPlace ? '#2ecc71' : '#ff6b9d') : (canPlace ? '#ffffff' : '#ff6b9d');
-            DC.lineWidth = 2;
-            DC.setLineDash([]);
-            DC.stroke();
-            // 塔类最小射程内圈（如迫击炮75px近身盲区）
-            if (previewCard.type === 'tower' && previewCard.minRange) {
-                DC.beginPath();
-                DC.arc(game.uiState.mouseX, game.uiState.mouseY, previewCard.minRange, 0, 2 * Math.PI);
-                DC.setLineDash([2, 4]);
-                DC.strokeStyle = canPlace ? 'rgba(255,120,80,0.8)' : 'rgba(255,150,200,0.8)';
-                DC.lineWidth = 1.5;
-                DC.stroke();
-                DC.setLineDash([]);
-            }
-        } else {
-            drawCrosshair(game.uiState.mouseX, game.uiState.mouseY, canPlace ? '#ffffff' : '#ff6b9d');
-        }
-    }
+    // 红方（上方玩家）— 双人本地模式
+    if (game.uiState.selectedCardId2 && CARDS[game.uiState.selectedCardId2]) {
+        if (!isSkillCardState('ai', game.uiState.selectedCardId2)) drawDeployPreviewBody('ai', riverL, riverR);
+        else drawSkillCastPreview('ai');
     }
 
     // ---- 游戏结束画面 ----
@@ -1693,12 +1710,12 @@ const breathe = 0.8 + 0.2 * Math.sin(game.tick / 3.6); // 微呼吸（🔗 联�
 
     // ---- 🌑 黄泉·刀痕（最顶层：在所有实体/特效/名字/血条之后绘制，不被任何东西遮挡）----
     //    红色系对称渐变「暗→亮→暗」，纤细微弧，红色辉光增强存在感（不加粗线条）
-    if (game.clawEffects && game.clawEffects.length) {
+    if (game.clawEffects.length) {
         for (let s of game.clawEffects) {
             if (!s.yomiSlash) continue;
             const sp = 1 - Math.min(s.timer / s.maxTimer, 1);
             const sAlpha = Math.sin(sp * Math.PI);              // 演出过程中轻微淡出（收尾更顺）
-            const sa = s.dir - 0.7;                             // 相对攻击方向斜切-40°
+            const sa = s.dir - (s.symmetric ? 0 : 0.7);         // 相对攻击方向斜切-40°（交叉刀痕用给定方向，不偏转）
             const ca = Math.cos(sa), sn = Math.sin(sa);
             // 两段式单向演出：
             //   出场(0~0.5)：尾端（出来的一端）固定，尖端从尾端一路划向终点 → 从一端滑到另一端
@@ -1706,8 +1723,11 @@ const breathe = 0.8 + 0.2 * Math.sin(game.tick / 3.6); // 微呼吸（🔗 联�
             const ph = sp < 0.5 ? 'in' : 'out';
             const k = (ph === 'in' ? sp / 0.5 : (sp - 0.5) / 0.5);
             const ek = 1 - (1 - k) * (1 - k) * (1 - k);         // easeOutCubic：划出/退场都先快后慢
-            const tailBaseX = s.x - ca * 20, tailBaseY = s.y - sn * 20;  // 尾端（出来的一端）
-            const tipEndX = s.x + ca * 30, tipEndY = s.y + sn * 30;      // 尖端（结束的一端）
+            const sc = s.scale || 1;                            // 整体缩放（交叉刀痕 1.12）
+            const tailLen = (s.symmetric ? 17 : 20) * sc;       // 交叉刀痕：中心对称等长（几何中心=锚点，两道交叉点即中心）
+            const tipLen = (s.symmetric ? 17 : 30) * sc;
+            const tailBaseX = s.x - ca * tailLen, tailBaseY = s.y - sn * tailLen;  // 尾端（出来的一端）
+            const tipEndX = s.x + ca * tipLen, tipEndY = s.y + sn * tipLen;        // 尖端（结束的一端）
             let curTailX = tailBaseX, curTailY = tailBaseY;
             let curTipX = tailBaseX + (tipEndX - tailBaseX) * ek, curTipY = tailBaseY + (tipEndY - tailBaseY) * ek;
             if (ph === 'out') {
@@ -1719,7 +1739,8 @@ const breathe = 0.8 + 0.2 * Math.sin(game.tick / 3.6); // 微呼吸（🔗 联�
             const tipX = curTipX, tipY = curTipY;
             const mx = (tailX + tipX) / 2, my = (tailY + tipY) / 2;
             const lenK = ph === 'in' ? ek : 1 - ek;
-            const bowX2 = -sn * 5 * lenK, bowY2 = ca * 5 * lenK;  // 弧高随长度增减（出场增长、离场收缩）
+            const bowH = 5 * sc * lenK * (s.bowSign || 1);          // 弧高随长度增减；bowSign 控制弯曲方向（默认向左法线）
+            const bowX2 = -sn * bowH, bowY2 = ca * bowH;  // （出场增长、离场收缩）
             const arcPath = () => {
                 DC.beginPath();
                 DC.moveTo(tailX, tailY);
@@ -1730,16 +1751,24 @@ const breathe = 0.8 + 0.2 * Math.sin(game.tick / 3.6); // 微呼吸（🔗 联�
             DC.lineCap = 'round';
             DC.globalAlpha = sAlpha;
             // ① 黑影紧贴整个刀痕（深红黑细边，比主线宽1px，勾勒轮廓让亮红更突出）
-            DC.strokeStyle = 'rgba(40,0,10,0.92)';
+            DC.strokeStyle = s.cyan ? 'rgba(0,25,30,0.92)' : 'rgba(40,0,10,0.92)';
             DC.lineWidth = 3.2;
             arcPath();
-            // ② 高亮红色对称渐变主线（暗→亮→暗，中间最亮，纤细微弧）
+            // ② 高亮对称渐变主线（暗→亮→暗，中间最亮，纤细微弧；默认红 / cyan 青色变体）
             const grad = DC.createLinearGradient(tailX, tailY, tipX, tipY);
-            grad.addColorStop(0, 'rgba(255,80,100,0)');
-            grad.addColorStop(0.28, 'rgba(255,70,95,0.6)');
-            grad.addColorStop(0.5, 'rgba(255,215,225,1)');
-            grad.addColorStop(0.72, 'rgba(255,70,95,0.6)');
-            grad.addColorStop(1, 'rgba(255,80,100,0)');
+            if (s.cyan) {
+                grad.addColorStop(0, 'rgba(90,255,235,0)');
+                grad.addColorStop(0.28, 'rgba(80,235,225,0.6)');
+                grad.addColorStop(0.5, 'rgba(228,255,252,1)');
+                grad.addColorStop(0.72, 'rgba(80,235,225,0.6)');
+                grad.addColorStop(1, 'rgba(90,255,235,0)');
+            } else {
+                grad.addColorStop(0, 'rgba(255,80,100,0)');
+                grad.addColorStop(0.28, 'rgba(255,70,95,0.6)');
+                grad.addColorStop(0.5, 'rgba(255,215,225,1)');
+                grad.addColorStop(0.72, 'rgba(255,70,95,0.6)');
+                grad.addColorStop(1, 'rgba(255,80,100,0)');
+            }
             DC.strokeStyle = grad;
             DC.lineWidth = 2.2;
             arcPath();
@@ -1750,7 +1779,11 @@ const breathe = 0.8 + 0.2 * Math.sin(game.tick / 3.6); // 微呼吸（🔗 联�
     // ---- 悬停 UI（必须在 draw 内部最后一步调用）----
         drawHoverUI();
     } finally {
-        for (const e of proj) { e.x = e._projX; e.y = e._projY; }  // 恢复逻辑坐标
+        for (const o of proj) {  // 恢复逻辑坐标
+            if (o._projX !== undefined) { o.x = o._projX; o.y = o._projY; }
+            if (o._projTimer !== undefined) o.timer = o._projTimer;
+            if (o._projTraveled !== undefined) o.traveled = o._projTraveled;
+        }
     }
 }
 
@@ -1803,7 +1836,11 @@ function drawMainTower(b) {
  * 通用实现：在离屏画布上调用与本体完全相同的绘制函数 → 整体染成亮蓝色 → 半透明贴回主画布
  * 复制体不显示名字/血条/进度条等标签：离屏绘制时包装 fillText（文字）与 fillRect（扁条）跳过
  */
-function drawCopyUnit(e) {
+function drawCopyUnit(e, spirit) {
+    // spirit=true → 📖 靈·紫色克隆体（读书人书灵技能）；默认亮蓝（克隆法术/冥王骷髅）
+    const tintStops = spirit
+        ? { top: '#e1b3ff', mid: '#b366ff', bottom: '#8a2be2', alpha: 0.6 }
+        : { top: '#7ff4ff', mid: '#00d9ff', bottom: '#00a8d9', alpha: 0.5 };
     // 0) 包装离屏 ctx：隐藏名字等文字（fillText→no-op）、隐藏血条/进度条（成对扁矩形→跳过）
     const _ft = copyCtx.fillText.bind(copyCtx);
     const _fr = copyCtx.fillRect.bind(copyCtx);
@@ -1830,18 +1867,18 @@ function drawCopyUnit(e) {
     // 还原离屏 ctx 的包装方法
     copyCtx.fillText = _ft;
     copyCtx.fillRect = _fr;
-    // 2) 整体染成亮蓝色（source-in 只保留建模形状，垂直渐变增加立体感）
+    // 2) 整体染色（source-in 只保留建模形状，垂直渐变增加立体感）：亮蓝=克隆法术复制体 / 紫=靈克隆体
     copyCtx.globalCompositeOperation = 'source-in';
     const g = copyCtx.createLinearGradient(0, 0, 0, COPY_CANVAS_SIZE);
-    g.addColorStop(0, '#7ff4ff');
-    g.addColorStop(0.5, '#00d9ff');
-    g.addColorStop(1, '#00a8d9');
+    g.addColorStop(0, tintStops.top);
+    g.addColorStop(0.5, tintStops.mid);
+    g.addColorStop(1, tintStops.bottom);
     copyCtx.fillStyle = g;
     copyCtx.fillRect(0, 0, COPY_CANVAS_SIZE, COPY_CANVAS_SIZE);
     copyCtx.globalCompositeOperation = 'source-over';
-    // 3) 以 50% 透明度贴回主画布（建模半透明，下方战场可见；无名字/血条）
+    // 3) 以半透明贴回主画布（建模半透明，下方战场可见；无名字/血条）
     DC.save();
-    DC.globalAlpha = 0.5;
+    DC.globalAlpha = tintStops.alpha;
     DC.drawImage(copyCanvas, e.x - COPY_CANVAS_SIZE / 2, e.y - COPY_CANVAS_SIZE / 2);
     DC.restore();
 }
@@ -1856,11 +1893,13 @@ function drawUnitBody(e) {
         else if (e.cardId === 'fly_swarm') drawFlySwarm(e);
         else if (e.cardId === 'large_fly') drawLargeFly(e);
         else if (e.cardId === 'lightning_wizard') drawLightningWizard(e);
+        else if (e.cardId === 'fire_furnace') drawFireFurnace(e);
         else if (e.cardId === 'ice_mage') drawIceMage(e);
         else if (e.cardId === 'fire_mage') drawFireMage(e);
         else if (e.cardId === 'phoenix') drawPhoenix(e);
         else if (e.cardId === 'ice_bean') drawIceBean(e);
         else if (e.cardId === 'fire_bean') drawFireBean(e);
+        else if (e.cardId === 'heal_bean') drawHealBean(e);
         else if (e.cardId === 'ghost') drawGhost(e);
         else if (e.cardId === 'miner') drawMiner(e);
         else if (e.cardId === 'ranger') drawRanger(e);
@@ -1881,9 +1920,15 @@ function drawUnitBody(e) {
         // barbarian 使用 drawUnitBody() 内已有的专属模型分支
         else if (e.cardId === 'bow_queen') drawBowQueen(e);
         else if (e.cardId === 'fat_tiger') drawFatTiger(e);
+        else if (e.cardId === 'rock_thrower') drawRockThrower(e);
+        else if (e.cardId === 'enchant_giant') drawEnchantGiant(e);
+        else if (e.cardId === 'valkyrie') drawValkyrie(e);
         else if (e.cardId === 'ronin') drawRonin(e);
         else if (e.cardId === 'sword_immortal') drawSwordImmortal(e);
         else if (e.cardId === 'yomi') drawYomi(e);
+        else if (e.cardId === 'scholar') drawScholar(e);
+        else if (e.cardId === 'wind_man') drawWindMan(e);
+        else if (e.cardId === 'snowman') drawSnowMan(e);
         else if (e.cardId === 'fisherman') drawFisherman(e);
         else if (e.cardId === 'shadow_assassin') drawShadowAssassin(e);
         else if (e.cardId === 'battle_angel') drawBattleAngel(e);
@@ -1912,7 +1957,7 @@ function drawUnitBody(e) {
         else if (e.cardId === 'lava_hound') drawLavaHound(e);
         else if (e.cardId === 'lava_pup') drawLavaPup(e);
         else if (e.cardId === 'balloon') drawBalloon(e);
-        else if (e.flying) drawDragon(e);
+        else if (CARDS[e.cardId] && CARDS[e.cardId].flying) drawDragon(e); // 🌿 飞龙等通用飞行模板：按卡牌身份识别，藤蔓落地 flying 临时=false 时不被画成通用圆形
         else drawTroop(e);
     } else if (e.type === 'healer') {
         drawHealer(e);
@@ -1927,6 +1972,50 @@ function drawUnitBody(e) {
     }
 }
 
+/** 🌿 藤蔓拽落·趴地压扁系数（0=正常，1=完全趴伏）：仅原飞行单位（entities.js 落地时记录 _vineFlyingOrig=true）；
+ *  前0.25s"啪"压下、最后0.25s弹回，中段恒定趴伏；纯渲染层（只读计时器字段），联机两端一致 */
+function vineSquashOf(e) {
+    if (!(e._vineGroundTimer > 0) || !e._vineFlyingOrig) return 0;
+    const dur = (CARDS.vine && CARDS.vine.groundDuration) || 2.5;
+    return Math.min(1, (dur - e._vineGroundTimer) / 0.25) * Math.min(1, e._vineGroundTimer / 0.25);
+}
+
+/** 🌿 藤蔓缠绕特效（视觉非buff，头顶状态图标只有眩晕💫）：被缠单位身体上一圈绿藤缓缓旋转"缠紧"；
+ *  读 _vineGroundTimer 剩余时长驱动：剩余 <0.35s 快速淡出=松藤，为 0 不画（计时由 update.js 帧推进）；
+ *  纯渲染层动画（只读 renderClockSec 相位），不入逻辑层，不影响联机逻辑一致性 */
+function drawVineWrap(unit) {
+    const remain = unit._vineGroundTimer || 0;
+    if (remain <= 0 || unit.hp <= 0) return;
+    const fade = Math.min(1, remain / 0.35);
+    const t = renderClockSec * 2.6;
+    const s = vineSquashOf(unit);
+    const cx = unit.x, cy = unit.y - 3 + 1.7 * s;   // 趴伏时缠绕圈随身体贴地下移
+    // 缠绕半径贴身体外沿：受击半径外扩一点（兵种多 7~16），无则兜底 11
+    const baseR = (typeof getHitRadius === 'function' ? getHitRadius(unit) : 0) || 10;
+    const rr = Math.max(8, Math.min(18, baseR + 4));
+    const squashY = 1 - 0.30 * s;                    // 与趴地压扁同系数（70%），藤圈贴合被压扁的身体
+    DC.save();
+    DC.lineCap = 'round';
+    for (let i = 0; i < 3; i++) {
+        const rot = t + i * (Math.PI * 2 / 3);
+        // 双层描边：深绿主藤 + 亮绿高光；椭圆倾斜角随时间旋转 → "缓缓缠紧"感
+        for (const [lw, col, al] of [[3, '30,120,50', 0.9], [1.3, '150,230,120', 1]]) {
+            DC.strokeStyle = `rgba(${col},${(al * fade).toFixed(3)})`;
+            DC.lineWidth = lw;
+            DC.beginPath();
+            DC.ellipse(cx, cy, rr, rr * 0.85 * squashY, rot, 0.25, Math.PI * 1.5);
+            DC.stroke();
+        }
+        // 每根藤的起始端冒一片小叶芽
+        const leafA = rot + 0.25;
+        DC.fillStyle = `rgba(90,180,80,${(0.9 * fade).toFixed(3)})`;
+        DC.beginPath();
+        DC.ellipse(cx + Math.cos(leafA) * rr * 1.05, cy + Math.sin(leafA) * rr * 0.85 * squashY, 2.3, 1.3, leafA, 0, Math.PI * 2);
+        DC.fill();
+    }
+    DC.restore();
+}
+
 /* ═══════════════════════════════════════════
  * 通用绘制样板（第一层提取：零视觉变化）
  *  drawUnitShadow —— 椭圆阴影
@@ -1939,6 +2028,18 @@ function drawUnitShadow(unit, dy, rx, ry, alpha) {
     DC.beginPath();
     DC.ellipse(unit.x, unit.y + dy, rx, ry, 0, 0, 2 * Math.PI);
     DC.fill();
+}
+
+/** 🎯 攻击范围白虚线圈（drawBuilding 各建筑共用；showRange 才画，minRange 内圈由调用方按需补画） */
+function drawRangeCircle(b, showRange) {
+    if (!showRange || !b.range) return;
+    DC.beginPath();
+    DC.arc(b.x, b.y, b.range, 0, 2 * Math.PI);
+    DC.setLineDash([5, 5]);
+    DC.strokeStyle = 'rgba(255,255,255,0.6)';
+    DC.lineWidth = 1.5;
+    DC.stroke();
+    DC.setLineDash([]);
 }
 
 /** 名称 + 血条（o: name, nameY, barY, barW=30, barH=4, font, color, baseline, barColor） */
@@ -2114,7 +2215,7 @@ function drawSmokeGuideEffects() {
             // ★ 渐变系数：全程≈1（烟雾完整），仅最后0.5秒内从1线性降到0（快速消失，不再一直慢慢变淡）
             const fadeSec = 0.5; // 最后0.5秒渐变消失
             const fade = Math.min(1, remain / (fadeSec / sg.maxTimer));
-const t = game.tick / 30;   // 🔗 联机确定性：tick 相位替代 performance.now()（烟雾滚动动画）
+const t = renderClockSec;   // 渲染时钟相位（烟雾滚动动画，60fps 平滑；视觉层不影响联机逻辑一致性）
             const smokeR = CARDS.smoke_guide.smokeRadius || 12;
 
             // 中心浓烟（脉动，缩小版）
@@ -2221,7 +2322,7 @@ function drawSmokeReleasePreview(team, isMirror) {
     const units = game.entities.filter(e => pend.unitIds.includes(e.id) && e.hp > 0 && e.team === team);
 
     // 友军 🧭 闪烁虚影 + 与鼠标虚线相连
-const bob = Math.sin(game.tick / 9) * 4;   // 🔗 联机确定性：tick 相位
+const bob = Math.sin(renderClockSec * 30 / 9) * 4;   // 渲染时钟相位（视觉动画；联机只保证逻辑一致，渲染相位无需对齐）
     DC.setLineDash([5, 5]);
     DC.strokeStyle = canPlace ? 'rgba(255,255,255,0.6)' : 'rgba(255,80,80,0.6)';
     DC.lineWidth = 2;
@@ -2230,7 +2331,7 @@ const bob = Math.sin(game.tick / 9) * 4;   // 🔗 联机确定性：tick 相位
         DC.moveTo(unit.x, unit.y - 26 + bob);
         DC.lineTo(mx, my);
         DC.stroke();
-DC.globalAlpha = 0.45 + 0.35 * Math.sin(game.tick / 5.4 + unit.id);   // 🔗 联机确定性：tick 相位
+DC.globalAlpha = 0.45 + 0.35 * Math.sin(renderClockSec * 30 / 5.4 + unit.id);   // 渲染时钟相位（视觉动画；联机只保证逻辑一致，渲染相位无需对齐）
         DC.font = '24px sans-serif';
         DC.textAlign = 'center';
         DC.textBaseline = 'middle';
@@ -2243,6 +2344,29 @@ DC.globalAlpha = 0.45 + 0.35 * Math.sin(game.tick / 5.4 + unit.id);   // 🔗 �
     DC.font = '30px sans-serif';
     DC.fillStyle = canPlace ? 'rgba(255,255,255,0.95)' : 'rgba(255,80,80,0.95)';
     DC.fillText('⬇️', mx, my - 14);
+}
+
+/** 🕊️ 技能卡选中预览（法术释放模式）：法术同款全屏白框 + 作用单位（本体/镜像精英）头顶⚠️大图标闪烁（烟引🧭同款悬浮样式） */
+function drawSkillCastPreview(team) {
+    const selKey = team === 'player' ? 'selectedCardId' : 'selectedCardId2';
+    const selectedId = game.uiState[selKey];
+    const s = resolveSkillState(team, selectedId);
+    if (!s || s.mode !== 'skill') return;
+    // 法术同款全屏白框（技能无落点：点击战场任意位置即释放）
+    drawDeployZoneFrame(0, W, false);
+    // 作用单位 = 技能所属精英（本体槽找本体、镜像槽找镜像精英；📖靈克隆体不算真身）
+    const isMirrorSlot = s.mirror;
+    const realCardId = isMirrorSlot ? s.skillKey.slice(7) : selectedId;
+    const unit = game.entities.find(e => e.cardId === realCardId && e.team === team && e.hp > 0 && !e.isCopy && !e._spiritClone
+        && (isMirrorSlot ? e.isMirrored : !e.isMirrored));
+    if (!unit) return;
+    const bob = Math.sin(renderClockSec * 30 / 9) * 4;   // 渲染时钟相位（与烟引🧭同款）
+    DC.globalAlpha = 0.45 + 0.35 * Math.sin(renderClockSec * 30 / 5.4 + unit.id);
+    DC.font = '24px sans-serif';
+    DC.textAlign = 'center';
+    DC.textBaseline = 'middle';
+    DC.fillText('⚠️', unit.x, unit.y - 30 + bob);
+    DC.globalAlpha = 1;
 }
 
 /** 绘制地面兵种（圆形 + 名称 + 血条） */
@@ -2708,6 +2832,12 @@ function drawLittlePrince(unit) {
     const isPlayer = unit.team === 'player';
     const headColor = isPlayer ? '#3498db' : '#e67e22';
 
+    // ── 整体建模缩小 0.8（保持原比例；名字/血条不缩放，见函数尾部）──
+    DC.save();
+    DC.translate(unit.x, unit.y);
+    DC.scale(0.8, 0.8);
+    DC.translate(-unit.x, -unit.y);
+
     // ── 大圆头 ──
     DC.fillStyle = headColor;
     DC.beginPath();
@@ -2829,7 +2959,9 @@ function drawLittlePrince(unit) {
 
     DC.restore();
 
-    // 名称 + 血条
+    DC.restore();  // 结束整体缩小 0.8
+
+    // 名称 + 血条（不缩放，保持与其他单位一致的大小）
     drawNameBar(unit, {
         name: CARDS[unit.cardId]?.name || '',
         nameY: unit.y - 24,
@@ -3060,7 +3192,7 @@ function drawJessie(unit) {
         DC.lineWidth = 1;
         DC.stroke();
         // 红色飘带（绑在丸子与头的连接处：从丸子底部沿头侧向下飘，随时间轻轻摆动）
-        const swing = Math.sin(game.time * 6 + (ox > 0 ? 1.3 : 0)) * 1.5; // 左右错相位摆动
+        const swing = Math.sin(renderClockSec * 6 + (ox > 0 ? 1.3 : 0)) * 1.5; // 左右错相位摆动
         DC.strokeStyle = '#e74c3c';
         DC.lineWidth = 1.6;
         DC.lineCap = 'round';
@@ -3310,7 +3442,7 @@ function drawBowQueen(unit) {
     const isStealthed = unit._stealthed;
     if (isStealthed) {
         DC.globalAlpha = 0.35;
-        const pulse = 0.9 + 0.1 * Math.sin(game.time * 4);
+        const pulse = 0.9 + 0.1 * Math.sin(renderClockSec * 4);
         DC.fillStyle = isPlayer ? 'rgba(150,200,255,0.15)' : 'rgba(200,150,255,0.15)';
         DC.beginPath();
         DC.arc(unit.x, unit.y, 16 * pulse, 0, 2 * Math.PI);
@@ -3574,6 +3706,255 @@ function drawFatTiger(unit) {
     });
 }
 
+/** 绘制投石人（紫色胖体型参照飞斧胖虎：大圆头 + 方块身；双手怀抱一颗巨石，攻击时巨石滚出） */
+function drawRockThrower(unit) {
+    const isPlayer = unit.team === 'player';
+    const headColor    = isPlayer ? '#6c3483' : '#4a235a';   // 紫色圆头
+    const bodyColor    = isPlayer ? '#5b2c6f' : '#3b1a4d';   // 深紫方块身
+    const accentColor  = isPlayer ? '#a569bd' : '#7d3c98';   // 亮紫（腰带/耳内）
+    const outlineColor = 'rgba(210,160,255,0.85)';
+    const rockColor    = '#8d8d93';
+    const rockDark     = '#5c5c63';
+
+    // ── 宽厚身体（投石人壮硕 20x15）──
+    DC.fillStyle = bodyColor;
+    DC.fillRect(unit.x - 10, unit.y + 1, 20, 15);
+    DC.strokeStyle = outlineColor;
+    DC.lineWidth = 1;
+    DC.strokeRect(unit.x - 10, unit.y + 1, 20, 15);
+
+    // 亮紫腰带
+    DC.fillStyle = accentColor;
+    DC.fillRect(unit.x - 10, unit.y + 10, 20, 2.5);
+
+    // ── 圆头（r6，紧贴身体上沿不悬空）──
+    DC.fillStyle = headColor;
+    DC.beginPath();
+    DC.arc(unit.x, unit.y - 5, 6, 0, 2 * Math.PI);
+    DC.fill();
+    DC.strokeStyle = outlineColor;
+    DC.lineWidth = 1.5;
+    DC.stroke();
+    // 头部高光
+    DC.fillStyle = 'rgba(255,255,255,0.35)';
+    DC.beginPath();
+    DC.arc(unit.x - 2, unit.y - 7, 1.8, 0, 2 * Math.PI);
+    DC.fill();
+
+    // ── 两侧尖耳朵（竖起的三角耳，内衬亮紫）──
+    DC.fillStyle = headColor;
+    DC.beginPath();
+    DC.moveTo(unit.x - 5, unit.y - 8.5);
+    DC.lineTo(unit.x - 8.5, unit.y - 14.5);
+    DC.lineTo(unit.x - 1.8, unit.y - 9.8);
+    DC.closePath();
+    DC.fill();
+    DC.beginPath();
+    DC.moveTo(unit.x + 5, unit.y - 8.5);
+    DC.lineTo(unit.x + 8.5, unit.y - 14.5);
+    DC.lineTo(unit.x + 1.8, unit.y - 9.8);
+    DC.closePath();
+    DC.fill();
+    DC.strokeStyle = outlineColor;
+    DC.lineWidth = 1;
+    DC.beginPath();
+    DC.moveTo(unit.x - 5, unit.y - 8.5);
+    DC.lineTo(unit.x - 8.5, unit.y - 14.5);
+    DC.lineTo(unit.x - 1.8, unit.y - 9.8);
+    DC.closePath();
+    DC.stroke();
+    DC.beginPath();
+    DC.moveTo(unit.x + 5, unit.y - 8.5);
+    DC.lineTo(unit.x + 8.5, unit.y - 14.5);
+    DC.lineTo(unit.x + 1.8, unit.y - 9.8);
+    DC.closePath();
+    DC.stroke();
+    DC.fillStyle = accentColor;
+    DC.beginPath();
+    DC.moveTo(unit.x - 5.1, unit.y - 9.2);
+    DC.lineTo(unit.x - 7.1, unit.y - 13);
+    DC.lineTo(unit.x - 3.6, unit.y - 9.7);
+    DC.closePath();
+    DC.fill();
+    DC.beginPath();
+    DC.moveTo(unit.x + 5.1, unit.y - 9.2);
+    DC.lineTo(unit.x + 7.1, unit.y - 13);
+    DC.lineTo(unit.x + 3.6, unit.y - 9.7);
+    DC.closePath();
+    DC.fill();
+
+    // ── 🪨 怀抱巨石（腹前抱着，滚出攻击时手上为空）──
+    const boulderOut = game.boulderRolls.some(b => b.ownerId === unit.id);
+    if (!boulderOut) {
+        // 双臂（宽身两侧伸向巨石）
+        DC.fillStyle = headColor;
+        DC.beginPath(); DC.arc(unit.x - 11, unit.y + 11, 3.2, 0, 2 * Math.PI); DC.fill();
+        DC.beginPath(); DC.arc(unit.x + 11, unit.y + 11, 3.2, 0, 2 * Math.PI); DC.fill();
+        // 巨石本体 + 裂纹
+        DC.fillStyle = rockColor;
+        DC.beginPath();
+        DC.arc(unit.x, unit.y + 12, 8, 0, 2 * Math.PI);
+        DC.fill();
+        DC.strokeStyle = rockDark;
+        DC.lineWidth = 1.2;
+        DC.stroke();
+        DC.beginPath(); DC.moveTo(unit.x - 4.5, unit.y + 10); DC.lineTo(unit.x - 1, unit.y + 13); DC.lineTo(unit.x + 4, unit.y + 10.5); DC.stroke();
+        DC.fillStyle = 'rgba(255,255,255,0.28)';
+        DC.beginPath();
+        DC.arc(unit.x - 2.6, unit.y + 9.6, 2.1, 0, 2 * Math.PI);
+        DC.fill();
+    }
+
+    // 名称 + 血条（同胖虎位置）
+    drawNameBar(unit, {
+        name: '投石人',
+        nameY: unit.y - 24,
+        barY: unit.y - 20,
+    });
+}
+
+/** 绘制附魔巨人（剑士放大型：石质身躯 + 发光符文 + 手持🪓；比剑士大一号） */
+function drawEnchantGiant(unit) {
+    const isPlayer = unit.team === 'player';
+    const headColor   = isPlayer ? '#546e7a' : '#455a64';   // 石质灰蓝圆头
+    const bodyColor   = isPlayer ? '#37474f' : '#2f3b40';   // 深石色方块身
+    const accentColor = isPlayer ? '#4dd0e1' : '#ba68c8';   // 符文发光（我方青 / 敌方紫）
+    const outlineColor = 'rgba(200,240,255,0.8)';
+    const glow = 0.6 + 0.4 * Math.abs(Math.sin(renderClockSec * 3)); // 符文呼吸
+
+    // ── 宽厚身体（剑士 12x11 放大 → 15x13）──
+    DC.fillStyle = bodyColor;
+    DC.fillRect(unit.x - 7.5, unit.y + 1, 15, 13);
+    DC.strokeStyle = outlineColor;
+    DC.lineWidth = 1;
+    DC.strokeRect(unit.x - 7.5, unit.y + 1, 15, 13);
+
+    // 胸口符文（✦ 三点阵，呼吸发光）
+    DC.fillStyle = accentColor;
+    DC.globalAlpha = glow;
+    DC.fillRect(unit.x - 3.5, unit.y + 4, 2, 2);
+    DC.fillRect(unit.x + 1.5, unit.y + 4, 2, 2);
+    DC.fillRect(unit.x - 1, unit.y + 8, 2, 2);
+    DC.globalAlpha = 1;
+
+    // ── 大圆头（剑士同款造型 r11）──
+    DC.fillStyle = headColor;
+    DC.beginPath();
+    DC.arc(unit.x, unit.y - 6, 11, 0, 2 * Math.PI);
+    DC.fill();
+    DC.strokeStyle = outlineColor;
+    DC.lineWidth = 1.5;
+    DC.stroke();
+    // 头部高光
+    DC.fillStyle = 'rgba(255,255,255,0.3)';
+    DC.beginPath();
+    DC.arc(unit.x - 4, unit.y - 9.5, 3.6, 0, 2 * Math.PI);
+    DC.fill();
+    // 额头符文（竖条）
+    DC.fillStyle = accentColor;
+    DC.globalAlpha = glow;
+    DC.fillRect(unit.x - 1, unit.y - 11, 2, 4.5);
+    DC.globalAlpha = 1;
+
+    // ── 双臂 ──
+    DC.fillStyle = headColor;
+    DC.beginPath(); DC.arc(unit.x - 9.5, unit.y + 8, 3.4, 0, 2 * Math.PI); DC.fill();
+    DC.beginPath(); DC.arc(unit.x + 9.5, unit.y + 8, 3.4, 0, 2 * Math.PI); DC.fill();
+
+    // ── 🪓 手持巨斧（朝向目标）──
+    {
+        let angle = 0;
+        if (unit.targetId) {
+            const target = game.entities.find(en => en.id === unit.targetId && en.hp > 0);
+            if (target) angle = Math.atan2(target.y - unit.y, target.x - unit.x);
+        }
+        DC.save();
+        DC.translate(unit.x + 3, unit.y + 5);
+        DC.rotate(angle);
+        DC.font = '16px sans-serif';
+        DC.textAlign = 'center';
+        DC.textBaseline = 'middle';
+        DC.fillText('🪓', 12, 0);
+        DC.restore();
+    }
+
+    // 名称 + 血条
+    drawNameBar(unit, {
+        name: '附魔巨人',
+        nameY: unit.y - 25,
+        barY: unit.y - 21,
+    });
+}
+
+/** 绘制瓦基里（剑士基底改进：大圆头+方块身放大一号，北欧辫发+手持🪓；攻击时整体旋转一圈） */
+function drawValkyrie(unit) {
+    const isPlayer = unit.team === 'player';
+    const headColor = isPlayer ? '#3498db' : '#e67e22';
+    const bodyColor = isPlayer ? '#2980b9' : '#c0392b';
+    const hairColor = isPlayer ? '#e67e22' : '#d35400';      // 北欧金红发辫
+
+    // ── 攻击旋斧：斧头绕身飞速转两圈（纯特效，_spinTimer 由攻击置位、update 衰减；身体不转）──
+    const spinT = (unit._spinTimer || 0) > 0 ? unit._spinTimer / 0.35 : null; // 1→0
+    const spinAng = spinT !== null ? (1 - spinT) * Math.PI * 4 : null;        // 两整圈
+
+    // ── 方块身（剑士同款 12x11 + 皮革腰带）──
+    DC.fillStyle = bodyColor;
+    DC.fillRect(unit.x - 6, unit.y + 2, 12, 11);
+    DC.strokeStyle = 'rgba(255,255,255,0.5)';
+    DC.lineWidth = 1;
+    DC.strokeRect(unit.x - 6, unit.y + 2, 12, 11);
+    DC.fillStyle = '#5d4037';
+    DC.fillRect(unit.x - 6, unit.y + 8, 12, 2.2);
+
+    // ── 大圆头（剑士同款 r10）──
+    DC.fillStyle = headColor;
+    DC.beginPath();
+    DC.arc(unit.x, unit.y - 4, 10, 0, 2 * Math.PI);
+    DC.fill();
+    DC.strokeStyle = 'white';
+    DC.lineWidth = 1.5;
+    DC.stroke();
+
+    // ── 北欧辫发（头顶中分双辫垂两侧）──
+    DC.fillStyle = hairColor;
+    DC.beginPath();
+    DC.arc(unit.x, unit.y - 12, 4, Math.PI, 0);
+    DC.fill();
+    DC.beginPath(); DC.arc(unit.x - 9, unit.y - 2, 2.6, 0, 2 * Math.PI); DC.fill();
+    DC.beginPath(); DC.arc(unit.x + 9, unit.y - 2, 2.6, 0, 2 * Math.PI); DC.fill();
+
+    // ── 🪓 斧头：静止时持于右肩；攻击时绕身飞速转两圈（带残影弧线）──
+    DC.font = '13px sans-serif';
+    DC.textAlign = 'center';
+    DC.textBaseline = 'middle';
+    if (spinAng !== null) {
+        const orbitR = 13;
+        const ax = unit.x + Math.cos(spinAng) * orbitR;
+        const ay = unit.y + Math.sin(spinAng) * orbitR;
+        // 残影弧线（落后斧头约140°的渐隐弧）
+        DC.strokeStyle = 'rgba(255,255,255,0.5)';
+        DC.lineWidth = 2;
+        DC.beginPath();
+        DC.arc(unit.x, unit.y, orbitR, spinAng - 2.4, spinAng);
+        DC.stroke();
+        // 斧头本体（沿轨道切向甩动）
+        DC.save();
+        DC.translate(ax, ay);
+        DC.rotate(spinAng + Math.PI / 2);
+        DC.fillText('🪓', 0, 0);
+        DC.restore();
+    } else {
+        DC.fillText('🪓', unit.x + 10, unit.y + 3);
+    }
+
+    // 名称 + 血条（不随旋转）
+    drawNameBar(unit, {
+        name: '瓦基里',
+        nameY: unit.y - 24,
+        barY: unit.y - 18,
+    });
+}
+
 /** 绘制浪人（米色斗笠 + 圆头 + 方块身 + 右上方斜背武士刀，参照剑士/骑士几何风格） */
 function drawRonin(unit) {
     const isPlayer = unit.team === 'player';
@@ -3716,8 +4097,8 @@ function drawYomi(unit) {
     const baseAng = -44 * Math.PI / 180;
     const ang = isPlayer ? (Math.PI - baseAng) : baseAng;  // 竖轴镜像：蓝方 π-(-44°)=+44°左上
     const shk = stabT > 0 ? (stabT / 0.3) * 2.0 : 0;
-    const ofx = shk * (Math.sin(game.time * 67) * 1.0 + Math.sin(game.time * 41) * 0.6);
-    const ofy = shk * (Math.cos(game.time * 53) * 1.0 + Math.sin(game.time * 83) * 0.5);
+    const ofx = shk * (Math.sin(renderClockSec * 67) * 1.0 + Math.sin(renderClockSec * 41) * 0.6);
+    const ofy = shk * (Math.cos(renderClockSec * 53) * 1.0 + Math.sin(renderClockSec * 83) * 0.5);
     const px = unit.x + (isPlayer ? 4 : -4) * SC + ofx, py = unit.y + 4 * SC + ofy;   // 持刀点整体平移抖动（蓝方镜像到右侧）
     const dx = Math.cos(ang), dy = Math.sin(ang);
     const bladeLen = 24, handleLen = 7.5;
@@ -3770,7 +4151,7 @@ function drawYomi(unit) {
 
 function drawSwordImmortal(unit) {
     const isPlayer = unit.team === 'player';
-    const floatOffset = Math.sin(game.time * 3) * 2;          // 御剑微微上下浮动
+    const floatOffset = Math.sin(renderClockSec * 3) * 2;          // 御剑微微上下浮动
     const robeColor = isPlayer ? '#7fd8d0' : '#e8a08a';       // 道袍主色（蓝方青白 / 红方绯红）
     const trimColor = isPlayer ? '#e8f8f5' : '#fdebd0';       // 衣领/飘带镶边
     const swordColor = isPlayer ? '#d5f5ec' : '#f9e79f';      // 剑身（发光浅色）
@@ -3889,7 +4270,7 @@ function drawSwordImmortal(unit) {
     DC.fill();
 
     // ── 飘带（身侧一缕，随风摆动）──
-    const wave = Math.sin(game.time * 4) * 2;
+    const wave = Math.sin(renderClockSec * 4) * 2;
     DC.strokeStyle = trimColor;
     DC.lineWidth = 2;
     DC.beginPath();
@@ -3898,7 +4279,7 @@ function drawSwordImmortal(unit) {
     DC.stroke();
 
     // ── 剑光流光（跟随仙剑位置/姿态，微微呼吸；御剑攻击时脉冲放大；🕊️ 御剑期间金色）──
-    DC.globalAlpha = 0.3 + Math.sin(game.time * 5) * 0.12 + (rideAtk ? 0.3 : 0);
+    DC.globalAlpha = 0.3 + Math.sin(renderClockSec * 5) * 0.12 + (rideAtk ? 0.3 : 0);
     DC.fillStyle = rideAtk ? '#ffffff' : (unit._rideSword ? '#ffd700' : swordColor);
     DC.beginPath();
     if (SWORD_IMMORTAL_LEGACY) {
@@ -3953,7 +4334,7 @@ function drawSwordImmortal(unit) {
             DC.stroke();
             DC.restore();
             // 微光（🕊️御剑金剑：金色光晕更大）
-            DC.globalAlpha = 0.3 + Math.sin(game.time * 6 + s.angle) * 0.15;
+            DC.globalAlpha = 0.3 + Math.sin(renderClockSec * 6 + s.angle) * 0.15;
             DC.fillStyle = unit._rideSword ? 'rgba(255,215,0,0.85)' : (isPlayer ? 'rgba(213,245,236,0.8)' : 'rgba(249,231,159,0.8)');
             DC.beginPath();
             DC.arc(sx, sy, unit._rideSword ? 4 : 3, 0, 2 * Math.PI);
@@ -4154,6 +4535,222 @@ function drawSuperKnight(unit) {
         // 蓄力条（通用模板，涨满即跳）+ 特殊金色加粗"蓄力"字样
         drawChargeBar(unit, 1 - prog, '#ffd700', '蓄力', { color: '#ffd700', font: 'bold 8px sans-serif' });
     }
+}
+
+/** 绘制读书人（📖 黄泉基底改：青灰长衫+金滚边+方巾帽+圆框眼镜，武器换为手持书卷，攻击时持书前递抖动） */
+function drawScholar(unit) {
+    const isPlayer = unit.team === 'player';
+    const bodyColor = isPlayer ? '#33465c' : '#26333f';   // 青灰长衫（敌方更深）
+    const trimColor = isPlayer ? '#c9a84c' : '#a8873c';   // 金色滚边/腰带
+    const SC = 1.1;
+
+    // ── 几何同黄泉：头圆 R=6*SC 圆心 hy=y-9*SC；梯形上底半宽4.5*SC 下底半宽5.4*SC
+    //    身体稍压矮（20*SC → 17.5*SC，头位置不动只压身体）──
+    const R = 6 * SC;
+    const hy = unit.y - 9 * SC;
+    const topY = hy + Math.sqrt(R * R - Math.pow(4.5 * SC, 2));
+    const botY = topY + 17.5 * SC;
+
+    // ── 梯形长衫身子 ──
+    DC.fillStyle = bodyColor;
+    DC.beginPath();
+    DC.moveTo(unit.x - 4.5 * SC, topY);
+    DC.lineTo(unit.x + 4.5 * SC, topY);
+    DC.lineTo(unit.x + 5.4 * SC, botY);
+    DC.lineTo(unit.x - 5.4 * SC, botY);
+    DC.closePath();
+    DC.fill();
+
+    // ── 头圆（同黄泉：纯色无缝一体）──
+    DC.fillStyle = bodyColor;
+    DC.beginPath();
+    DC.arc(unit.x, hy, R, 0, 2 * Math.PI);
+    DC.fill();
+
+    // ── 配饰：白色交领 V 字（长衫领口）──
+    DC.strokeStyle = 'rgba(240, 236, 220, 0.85)';
+    DC.lineWidth = 1.2;
+    DC.beginPath();
+    DC.moveTo(unit.x - 2.6 * SC, topY + 2);
+    DC.lineTo(unit.x, topY + 7 * SC);
+    DC.lineTo(unit.x + 2.6 * SC, topY + 2);
+    DC.stroke();
+    // 金色腰封横线 + 垂坠绶带
+    DC.strokeStyle = trimColor;
+    DC.lineWidth = 1.4;
+    DC.beginPath();
+    DC.moveTo(unit.x - 5.1 * SC, botY - 6 * SC);
+    DC.lineTo(unit.x + 5.1 * SC, botY - 6 * SC);
+    DC.stroke();
+    DC.lineWidth = 1;
+    DC.beginPath();
+    DC.moveTo(unit.x + 1.5 * SC, botY - 6 * SC);
+    DC.lineTo(unit.x + 2.2 * SC, botY - 2 * SC);
+    DC.stroke();
+    // 衣摆金色滚边（底缘细线）
+    DC.beginPath();
+    DC.moveTo(unit.x - 5.2 * SC, botY - 1);
+    DC.lineTo(unit.x + 5.2 * SC, botY - 1);
+    DC.stroke();
+
+    // ── 头顶方巾帽（学士帽：扁菱形顶 + 中央小结）──
+    DC.fillStyle = isPlayer ? '#22303f' : '#1a232c';
+    DC.beginPath();
+    DC.moveTo(unit.x, hy - R - 2.5);
+    DC.lineTo(unit.x + 5.2 * SC, hy - R + 1.5);
+    DC.lineTo(unit.x, hy - R + 4.5);
+    DC.lineTo(unit.x - 5.2 * SC, hy - R + 1.5);
+    DC.closePath();
+    DC.fill();
+    DC.fillStyle = trimColor;
+    DC.beginPath();
+    DC.arc(unit.x, hy - R + 1.5, 1, 0, 2 * Math.PI);
+    DC.fill();
+
+    // ── 手持书卷（独立最上层；攻击时整本书向前递出抖动，双频叠加同黄泉挥刀）──
+    const stabT = unit._swingTimer || 0;
+    const shk = stabT > 0 ? (stabT / 0.3) * 2.2 : 0;
+    const ofx = shk * (Math.sin(renderClockSec * 67) * 1.0 + Math.sin(renderClockSec * 41) * 0.6);
+    const ofy = shk * (Math.cos(renderClockSec * 53) * 1.0 + Math.sin(renderClockSec * 83) * 0.5);
+    const dir = isPlayer ? 1 : -1;                  // 蓝右红左镜像
+    const px = unit.x + dir * 5 * SC + ofx, py = unit.y + 2 * SC + ofy;
+    // 🌸 極期间：书卷泛粉色光晕（呼吸脉动，画在书卷下层）
+    if ((unit._extremeTimer || 0) > 0) {
+        const glowR = 13 + Math.sin(renderClockSec * 6) * 2;
+        const glow = DC.createRadialGradient(px, py, 2, px, py, glowR);
+        glow.addColorStop(0, 'rgba(255, 138, 216, 0.55)');
+        glow.addColorStop(1, 'rgba(255, 138, 216, 0)');
+        DC.fillStyle = glow;
+        DC.beginPath();
+        DC.arc(px, py, glowR, 0, 2 * Math.PI);
+        DC.fill();
+    }
+    DC.save();
+    DC.translate(px, py);
+    DC.rotate(dir * -0.5);                          // 书卷斜持
+    // 封面（深棕红）
+    DC.fillStyle = '#6b3a2a';
+    DC.fillRect(-3.2, -8, 6.4, 14);
+    // 书页白边（开口侧三层细条）
+    DC.fillStyle = '#f2ecd8';
+    DC.fillRect(dir > 0 ? 3.2 : -4.8, -7, 1.6, 12);
+    DC.fillStyle = '#ddd5bc';
+    DC.fillRect(dir > 0 ? 3.2 : -4.8, -3.5, 1.6, 1);
+    DC.fillRect(dir > 0 ? 3.2 : -4.8, 0.5, 1.6, 1);
+    // 封面金纹（书名签）
+    DC.strokeStyle = trimColor;
+    DC.lineWidth = 0.9;
+    DC.strokeRect(-1.8, -5.5, 2.6, 6);
+    DC.restore();
+
+    // ── 名称 + 血条（通用）+ 蓄力条（通用蓄力条：血条正上方，金色的书灵蓄力进度）──
+    drawNameBar(unit, {
+        name: '读书人',
+        nameY: unit.y - 27,
+        barY: unit.y - 13,
+    });
+    drawChargeBar(unit, Math.min(4, unit._scholarCharge || 0) / 4, '#ffd54f');
+}
+
+/** 绘制风人（💨 纯渲染旋转龙卷为身体（不用emoji），上方上下浮动的白色小圆为头+两个黑色小点眼睛） */
+function drawWindMan(unit) {
+    const bob = Math.sin(renderClockSec * 3 + unit.id * 0.7) * 3;   // 头部上下浮动（渲染时钟相位）
+    const windColor = unit.team === 'player' ? 'rgba(215, 238, 255, 0.9)' : 'rgba(255, 228, 222, 0.9)';
+
+    // ── 飞行单位地面影子（其他飞行单位同款）──
+    drawUnitShadow(unit, 16, 13, 5, 0.3);
+
+    // ── 灰白色光晕（贴着身体，整体静态不浮动）──
+    const glow = DC.createRadialGradient(unit.x, unit.y, 4, unit.x, unit.y, 20);
+    glow.addColorStop(0, 'rgba(238, 238, 238, 0.4)');
+    glow.addColorStop(1, 'rgba(238, 238, 238, 0)');
+    DC.fillStyle = glow;
+    DC.beginPath();
+    DC.ellipse(unit.x, unit.y, 17, 21, 0, 0, 2 * Math.PI);
+    DC.fill();
+
+    // ── 龙卷风身体：4 段错相旋转的椭圆弧（上宽下窄倒锥形，整体静止不移动；偏白色系；不用emoji，纯渲染建模）──
+    DC.save();
+    DC.lineCap = 'round';
+    for (let i = 0; i < 4; i++) {
+        const yy = unit.y - 8 + i * 5.5;                            // 自上而下铺排
+        const w = 12 - i * 2.4;                                     // 大的在上、小的在下
+        const dirS = i % 2 === 0 ? 1 : -1;                          // 相邻层反向旋转
+        const a0 = renderClockSec * (3.2 + i * 0.9) * dirS + i * 1.7;
+        DC.strokeStyle = windColor;
+        DC.lineWidth = 2.4 - i * 0.3;
+        DC.beginPath();
+        DC.ellipse(unit.x, yy, w, w * 0.32, 0, a0, a0 + Math.PI * 1.45);
+        DC.stroke();
+    }
+    DC.restore();
+
+    // ── 白色小圆头（下移一档，保留上下浮动）+ 两个黑色小点眼睛 ──
+    const headY = unit.y - 11 + bob;
+    DC.fillStyle = '#f5f5f5';
+    DC.beginPath();
+    DC.arc(unit.x, headY, 6, 0, 2 * Math.PI);
+    DC.fill();
+    DC.strokeStyle = 'rgba(0, 0, 0, 0.25)';
+    DC.lineWidth = 1;
+    DC.stroke();
+    DC.fillStyle = '#222';
+    DC.beginPath();
+    DC.arc(unit.x - 2.2, headY - 0.5, 1, 0, 2 * Math.PI);
+    DC.fill();
+    DC.beginPath();
+    DC.arc(unit.x + 2.2, headY - 0.5, 1, 0, 2 * Math.PI);
+    DC.fill();
+
+    // ── 名称 + 血条 ──
+    drawNameBar(unit, {
+        name: '风人',
+        nameY: headY - 10,
+        barY: unit.y - 13,
+    });
+}
+
+/** 绘制雪人（☃️ 双球雪人：下身大圆+头圆+黑点眼+橙萝卜鼻，索定建筑的冰雪辅助） */
+function drawSnowMan(unit) {
+    const isPlayer = unit.team === 'player';
+    const bodyColor = '#f0f4f8';
+    const rimColor = isPlayer ? 'rgba(130, 175, 220, 0.55)' : 'rgba(235, 170, 160, 0.55)';
+    // 下身（大圆）
+    DC.fillStyle = bodyColor;
+    DC.beginPath();
+    DC.arc(unit.x, unit.y + 4, 11, 0, 2 * Math.PI);
+    DC.fill();
+    DC.strokeStyle = rimColor;
+    DC.lineWidth = 1.2;
+    DC.stroke();
+    // 头（小圆）
+    DC.beginPath();
+    DC.arc(unit.x, unit.y - 10, 7, 0, 2 * Math.PI);
+    DC.fill();
+    DC.stroke();
+    // 黑点眼睛
+    DC.fillStyle = '#222';
+    DC.beginPath();
+    DC.arc(unit.x - 2.4, unit.y - 11.5, 1, 0, 2 * Math.PI);
+    DC.fill();
+    DC.beginPath();
+    DC.arc(unit.x + 2.4, unit.y - 11.5, 1, 0, 2 * Math.PI);
+    DC.fill();
+    // 胡萝卜鼻（朝敌方方向的小三角）
+    const nose = isPlayer ? 6 : -6;
+    DC.fillStyle = '#e67e22';
+    DC.beginPath();
+    DC.moveTo(unit.x, unit.y - 10.5);
+    DC.lineTo(unit.x + nose, unit.y - 9.5);
+    DC.lineTo(unit.x, unit.y - 8.5);
+    DC.closePath();
+    DC.fill();
+    // 名称 + 血条
+    drawNameBar(unit, {
+        name: '雪人',
+        nameY: unit.y - 22,
+        barY: unit.y - 13,
+    });
 }
 
 /** 绘制巫师（大扁三角巫师帽 + 小圆身体，哥布林大小） */
@@ -4455,7 +5052,7 @@ function drawUnicorn(unit) {
     const maneColor = isPlayer ? '#aed6f1' : '#f5b041';   // 鬃毛/尾巴（淡阵营色）
     const hornColor = '#f4d03f';                          // 金色独角
     const sleeping  = !!unit._isSleeping;
-    const t = game.time;
+    const t = renderClockSec;
 
     // ═══ 沉睡形态：卧姿 + 闭眼 + 💤飘浮 ═══
     if (sleeping) {
@@ -4642,7 +5239,7 @@ function drawUnicorn(unit) {
         DC.lineWidth = 1.5;
         for (let i = -1; i <= 1; i++) {
             const ox = -dy * i * 6, oy = dx * i * 6;              // 垂直于冲刺方向的偏移
-            const wob = Math.sin(game.time * 40 + i * 2.1) * 2.5; // 高频摆动相位
+            const wob = Math.sin(renderClockSec * 40 + i * 2.1) * 2.5; // 高频摆动相位
             DC.beginPath();
             DC.moveTo(unit.x - dx * 16 + ox, unit.y - dy * 16 + oy);
             DC.lineTo(unit.x - dx * (30 + wob) + ox, unit.y - dy * (30 + wob) + oy);
@@ -4657,8 +5254,8 @@ function drawUnicorn(unit) {
 function drawHatchedDragon(unit) {
     const isPlayer = unit.team === 'player';
     const size = 18;   // 比飞龙(size=14)大一圈
-    const floatOffset = Math.sin(game.time * 2.5) * 4;  unit._floatY = floatOffset; // 上下浮动
-    const wingFlap = Math.sin(game.time * 4) * 3;       // 翅膀拍动
+    const floatOffset = Math.sin(renderClockSec * 2.5) * 4;  unit._floatY = floatOffset; // 上下浮动
+    const wingFlap = Math.sin(renderClockSec * 4) * 3;       // 翅膀拍动
 
     // ── 影子（随地面，不浮动）──
     drawUnitShadow(unit, 24, 18, 8, 0.3);
@@ -4849,7 +5446,7 @@ function drawBerserker(unit) {
     // 💥 爆发状态变量（虚影/身体变暗/血红眼睛共用）：淡入淡出进度 + 浮动高度
     const berserkT = unit._berserkTimer > 0 ? Math.min(unit._berserkTimer, 6.0) : 0;
     const berserkAlpha = berserkT > 0 ? Math.min(1, (6 - berserkT) / 0.3, berserkT / 0.3) : 0;
-    const ghostY = unit.y + Math.sin(game.time * 2.5) * 2.5;   // 虚影微微上下浮动
+    const ghostY = unit.y + Math.sin(renderClockSec * 2.5) * 2.5;   // 虚影微微上下浮动
 
     // 💥 爆发·施法蓄力（0.6s）：脚下红色蓄力圈收缩，蓄满瞬间爆发
     if (unit._berserkCast > 0) {
@@ -5054,7 +5651,7 @@ function drawMonk(unit) {
     // 🧘 超脱状态：全身冒起青色光晕（仅 _transcendTimer>0 的5秒期间；0.6s前摇无光晕），呼吸脉动包裹全身
     const transcendTimer = unit._transcendTimer || 0;
     if (transcendTimer > 0) {
-        const auraR = 20 + Math.sin(game.time * 4) * 1.5;
+        const auraR = 20 + Math.sin(renderClockSec * 4) * 1.5;
         DC.beginPath();
         DC.arc(unit.x, unit.y - 4, auraR, 0, 2 * Math.PI);
         DC.fillStyle = 'rgba(0, 229, 255, 0.16)';
@@ -5485,7 +6082,7 @@ function drawAntiArmorGiant(unit) {
     const thornRadius = CARDS[unit.cardId]?.thornsRadius || 75;
 
     // 🦔 反甲范围：淡色小环，低频呼吸式渐变闪烁（不使用高频闪烁）
-    const pulse = 0.5 + 0.5 * Math.sin(game.time * 1.6);
+    const pulse = 0.5 + 0.5 * Math.sin(renderClockSec * 1.6);
     DC.save();
     // 最暗时完全消失，最亮时提高透明度和线宽，保持低频呼吸感
     DC.globalAlpha = pulse * 0.38;
@@ -5912,11 +6509,11 @@ function drawSiegeMan(unit) {
 function drawImmunityDisciple(unit) {
     const isPlayer = unit.team === 'player';
     const size = 11;  // 比飞龙(size=14)小一圈
-    const floatOffset = Math.sin(game.time * 3) * 3; unit._floatY = floatOffset;
+    const floatOffset = Math.sin(renderClockSec * 3) * 3; unit._floatY = floatOffset;
 
     // ── ✨ 白色柔和光环（以攻击范围为界，平缓脉动）──
     const auraRadius = 108;
-    const pulse = 0.95 + 0.05 * Math.sin(game.time * 2.0); // 更慢更柔的呼吸
+    const pulse = 0.95 + 0.05 * Math.sin(renderClockSec * 2.0); // 更慢更柔的呼吸
     const r = auraRadius * pulse;
 
     // 外圈光环（极淡填充+柔和描边）
@@ -5972,12 +6569,12 @@ function drawImmunityDisciple(unit) {
 function drawBattleAngel(unit) {
     const isPlayer = unit.team === 'player';
     const size = 12;  // 圆身半径
-    const floatOffset = Math.sin(game.time * 3) * 3; unit._floatY = floatOffset;
+    const floatOffset = Math.sin(renderClockSec * 3) * 3; unit._floatY = floatOffset;
 
     // ── 💚 治疗光环（仅治疗持续期间显示：登场/攻击触发后亮起，1.2秒后消失）──
     if (unit._healActive > 0) {
         const auraRadius = CARDS.battle_angel.healRadius || 75;
-        const pulse = 0.95 + 0.05 * Math.sin(game.time * 2.0); // 更慢更柔的呼吸
+        const pulse = 0.95 + 0.05 * Math.sin(renderClockSec * 2.0); // 更慢更柔的呼吸
         const r = auraRadius * pulse;
 
         // 外圈光环（极淡填充+柔和描边）
@@ -6100,7 +6697,7 @@ function drawHades(unit) {
 function drawDragon(unit) {
     const isPlayer = unit.team === 'player';
     const size = 14;
-    const floatOffset = Math.sin(game.time * 3) * 3;   unit._floatY = floatOffset; // 上下浮动
+    const floatOffset = Math.sin(renderClockSec * 3) * 3;   unit._floatY = floatOffset; // 上下浮动
 
     // 影子（椭圆投影，不随浮动，保持在地面）
     drawUnitShadow(unit, 20, 16, 8, 0.3);
@@ -6129,13 +6726,13 @@ function drawDragon(unit) {
 function drawInfernoDragon(unit) {
     const isPlayer = unit.team === 'player';
     const size = 14;
-    const floatOffset = Math.sin(game.time * 3) * 3;
+    const floatOffset = Math.sin(renderClockSec * 3) * 3;
     unit._floatY = floatOffset;
     drawUnitShadow(unit, 20, 16, 8, 0.3);
     const y = unit.y + floatOffset;
 
     // 少量装饰置于身体后方：小翅膀略微向外斜、放大，并做扇动效果
-    const wingFlap = Math.sin(game.time * 9) * 2.5;
+    const wingFlap = Math.sin(renderClockSec * 9) * 2.5;
     DC.fillStyle = isPlayer ? '#7d1f16' : '#4a1010';
     DC.beginPath();
     DC.moveTo(unit.x - 6, y - 5);
@@ -6225,11 +6822,11 @@ function drawInfernoDragon(unit) {
 /** 绘制雷龙：参考飞龙/地狱飞龙的倒三角轮廓，整体蓝配色，加入雷角、蓝色翼膜和电弧纹路 */
 function drawLightningDragon(unit) {
     const size = 14;
-    const floatOffset = Math.sin(game.time * 3) * 3;
+    const floatOffset = Math.sin(renderClockSec * 3) * 3;
     unit._floatY = floatOffset;
     drawUnitShadow(unit, 20, 16, 8, 0.3);
     const y = unit.y + floatOffset;
-    const flap = Math.sin(game.time * 9) * 2.5;
+    const flap = Math.sin(renderClockSec * 9) * 2.5;
     const player = unit.team === 'player';
     const body = player ? '#1976d2' : '#283593';
     const wing = player ? '#42a5f5' : '#3949ab';
@@ -6296,7 +6893,7 @@ function drawLightningDragon(unit) {
 function drawLavaHound(unit) {
     const isPlayer = unit.team === 'player';
     const size = 16;   // 比飞龙(size=14)大，同巨人圆身
-    const floatOffset = Math.sin(game.time * 3) * 3;   unit._floatY = floatOffset; // 上下浮动
+    const floatOffset = Math.sin(renderClockSec * 3) * 3;   unit._floatY = floatOffset; // 上下浮动
 
     // 影子（椭圆投影，不随浮动，保持在地面）
     drawUnitShadow(unit, 22, 20, 9, 0.3);
@@ -6361,7 +6958,7 @@ function drawLavaHound(unit) {
 function drawLavaPup(unit) {
     const isPlayer = unit.team === 'player';
     const size = 8;    // 骷髅大小（熔岩猎犬16等比缩小）
-    const floatOffset = Math.sin(game.time * 3) * 2;   unit._floatY = floatOffset; // 上下浮动（小单位浮动略小）
+    const floatOffset = Math.sin(renderClockSec * 3) * 2;   unit._floatY = floatOffset; // 上下浮动（小单位浮动略小）
 
     // 影子（椭圆投影，不随浮动）
     drawUnitShadow(unit, 11, 10, 4.5, 0.25);
@@ -6426,7 +7023,7 @@ function drawLavaPup(unit) {
 function drawBalloon(unit) {
     const isPlayer = unit.team === 'player';
     const size = 15;   // 气囊半径（比飞龙14再大一点点）
-    const floatOffset = Math.sin(game.time * 3) * 3;   unit._floatY = floatOffset; // 上下浮动
+    const floatOffset = Math.sin(renderClockSec * 3) * 3;   unit._floatY = floatOffset; // 上下浮动
 
     // 影子（椭圆投影，不随浮动，保持在地面）
     drawUnitShadow(unit, 24, 20, 8, 0.3);
@@ -6531,6 +7128,98 @@ function drawLightningWizard(unit) {
     });
 }
 
+/** 绘制火熔炉（行走的熔炉：石座 + 鼓形铁炉体 + 灶口喷焰 + 顶部烟囱，体型与雷电法师相当） */
+function drawFireFurnace(unit) {
+    const isPlayer = unit.team === 'player';
+    const bodyColor = isPlayer ? '#8d3b2f' : '#5d2a22';
+    const darkColor = isPlayer ? '#5b241b' : '#3d1a14';
+    const trimColor = isPlayer ? '#e67e22' : '#c0562f';
+    const flicker = 0.75 + 0.25 * Math.sin(renderClockSec * 11) * Math.sin(renderClockSec * 5.3); // 炉火跳动（渲染时钟，60fps 平滑）
+
+    // ── 石座 ──
+    DC.fillStyle = '#4a4a52';
+    DC.fillRect(unit.x - 9, unit.y + 6, 18, 8);
+    DC.strokeStyle = 'rgba(255,255,255,0.35)';
+    DC.lineWidth = 1;
+    DC.strokeRect(unit.x - 9, unit.y + 6, 18, 8);
+
+    // ── 鼓形炉体（上收口的圆弧罐）──
+    DC.fillStyle = bodyColor;
+    DC.beginPath();
+    DC.moveTo(unit.x - 8, unit.y - 10);
+    DC.quadraticCurveTo(unit.x - 12, unit.y + 2, unit.x - 8, unit.y + 7);
+    DC.lineTo(unit.x + 8, unit.y + 7);
+    DC.quadraticCurveTo(unit.x + 12, unit.y + 2, unit.x + 8, unit.y - 10);
+    DC.closePath();
+    DC.fill();
+    DC.strokeStyle = darkColor;
+    DC.lineWidth = 1;
+    DC.stroke();
+
+    // ── 铁箍两条 ──
+    DC.strokeStyle = trimColor;
+    DC.lineWidth = 1.2;
+    DC.beginPath(); DC.moveTo(unit.x - 10, unit.y + 2); DC.lineTo(unit.x + 10, unit.y + 2); DC.stroke();
+    DC.beginPath(); DC.moveTo(unit.x - 9, unit.y - 6); DC.lineTo(unit.x + 9, unit.y - 6); DC.stroke();
+
+    // ── 灶口（拱形炉门 + 双层跳动火焰）──
+    DC.fillStyle = '#1a0d08';
+    DC.beginPath();
+    DC.moveTo(unit.x - 4.5, unit.y + 6);
+    DC.lineTo(unit.x - 4.5, unit.y);
+    DC.quadraticCurveTo(unit.x, unit.y - 4.5, unit.x + 4.5, unit.y);
+    DC.lineTo(unit.x + 4.5, unit.y + 6);
+    DC.closePath();
+    DC.fill();
+    DC.fillStyle = `rgba(255,140,40,${0.75 * flicker})`;
+    DC.beginPath();
+    DC.moveTo(unit.x - 3.2, unit.y + 5.5);
+    DC.quadraticCurveTo(unit.x - 3.6, unit.y + 1.5, unit.x, unit.y - 1.5 - flicker * 1.5);
+    DC.quadraticCurveTo(unit.x + 3.6, unit.y + 1.5, unit.x + 3.2, unit.y + 5.5);
+    DC.closePath();
+    DC.fill();
+    DC.fillStyle = `rgba(255,220,120,${0.8 * flicker})`;
+    DC.beginPath();
+    DC.moveTo(unit.x - 1.6, unit.y + 5.5);
+    DC.quadraticCurveTo(unit.x - 2, unit.y + 3, unit.x, unit.y + 1);
+    DC.quadraticCurveTo(unit.x + 2, unit.y + 3, unit.x + 1.6, unit.y + 5.5);
+    DC.closePath();
+    DC.fill();
+
+    // ── 顶部烟囱 + 火星（上飘小点，相位错开）──
+    DC.fillStyle = darkColor;
+    DC.fillRect(unit.x - 2.5, unit.y - 16, 5, 7);
+    DC.fillStyle = trimColor;
+    DC.fillRect(unit.x - 3.5, unit.y - 17.5, 7, 2.5);
+    for (let k = 0; k < 2; k++) {
+        const ph = (renderClockSec * 0.9 + k * 0.5) % 1;
+        DC.globalAlpha = 0.7 * (1 - ph);
+        DC.fillStyle = k === 0 ? '#ffb347' : '#ff6b35';
+        DC.fillRect(unit.x - 1 + Math.sin(renderClockSec * 7 + k * 3) * 2, unit.y - 19 - ph * 8, 1.6, 1.6);
+    }
+    DC.globalAlpha = 1;
+
+    // 炉体高光弧
+    DC.strokeStyle = 'rgba(255,255,255,0.25)';
+    DC.lineWidth = 1;
+    DC.beginPath();
+    DC.arc(unit.x - 4, unit.y - 2, 6, Math.PI * 0.7, Math.PI * 1.35);
+    DC.stroke();
+
+    // ── 名称 + 血条 ──
+    drawNameBar(unit, {
+        name: '火熔炉',
+        nameY: unit.y - 28,
+        barY: unit.y - 14,
+    });
+
+    // 火豆蹦出倒计时（召唤进度条，通用蓄力条）
+    const card = CARDS[unit.cardId];
+    if (card && card.spawnInterval) {
+        drawChargeBar(unit, (unit.spawnTimer || 0) / card.spawnInterval, '#ff8c42');
+    }
+}
+
 /** 绘制寒冰法师（雷电法师基底的紧凑蓝灰变体：小头小身 + 蓝发 + 冰晶法杖） */
 function drawIceMage(unit) {
     const isPlayer = unit.team === 'player';
@@ -6576,7 +7265,7 @@ function drawIceMage(unit) {
     // 摇晃：攻击时（_wandWaveTimer=0.3s）0→1→0 包络，幅度加大；日常还有轻微摆动
     const waveT = unit._wandWaveTimer || 0;
     const wave = waveT > 0 ? Math.sin((1 - Math.min(waveT / 0.3, 1)) * Math.PI) : 0;
-    const swing = Math.sin(game.tick / 30 * 2) * 0.04 + wave * 0.25 * Math.sin(game.tick / 2.5);
+    const swing = Math.sin(renderClockSec * 2) * 0.04 + wave * 0.25 * Math.sin(renderClockSec * 12);
     ang += swing;
     const pX = Math.cos(ang), pY = Math.sin(ang);
     const len = 40;   // 杆再次加长（28→40）
@@ -6599,7 +7288,7 @@ function drawIceMage(unit) {
     // 冰锥头冒寒气：2颗小冰粒沿法杖方向向上漂（tick 相位确定性；攻击摇晃时寒气更浓）
     const boost = waveT > 0 ? 1.6 : 1.0;
     for (let i = 0; i < 2; i++) {
-        const ph = ((game.tick / 30 * 0.7 + i * 0.5) % 1);
+        const ph = ((renderClockSec * 0.7 + i * 0.5) % 1);
         const mx = tipX + Math.cos(ang + 1.8) * (4 + ph * 12);
         const my = tipY + Math.sin(ang + 1.8) * (4 + ph * 12) - ph * 5;
         DC.globalAlpha = 0.55 * (1 - ph) * boost;
@@ -6657,7 +7346,7 @@ function drawFireMage(unit) {
     let ang = unit._wandAng !== undefined ? unit._wandAng : -1.2;
     const waveT = unit._wandWaveTimer || 0;
     const wave = waveT > 0 ? Math.sin((1 - Math.min(waveT / 0.3, 1)) * Math.PI) : 0;
-    const swing = Math.sin(game.tick / 30 * 2) * 0.04 + wave * 0.25 * Math.sin(game.tick / 2.5);
+    const swing = Math.sin(renderClockSec * 2) * 0.04 + wave * 0.25 * Math.sin(renderClockSec * 12);
     ang += swing;
     const pX = Math.cos(ang), pY = Math.sin(ang);
     const len = 40;
@@ -6679,7 +7368,7 @@ function drawFireMage(unit) {
     // 火焰头冒火星：2颗小火星沿法杖方向向上漂（攻击摇晃时火星更浓）
     const boost = waveT > 0 ? 1.6 : 1.0;
     for (let i = 0; i < 2; i++) {
-        const ph = ((game.tick / 30 * 0.7 + i * 0.5) % 1);
+        const ph = ((renderClockSec * 0.7 + i * 0.5) % 1);
         const mx = tipX + Math.cos(ang + 1.8) * (4 + ph * 12);
         const my = tipY + Math.sin(ang + 1.8) * (4 + ph * 12) - ph * 5;
         DC.globalAlpha = 0.55 * (1 - ph) * boost;
@@ -6697,8 +7386,8 @@ function drawLightningBolt(x1, y1, x2, y2) {
     const segments = Math.max(5, Math.floor(len / 6));
     const nx = -dy / len;
     const ny = dx / len;
-    // 🔗 联机确定性：抖动种子取自端点坐标 + 逻辑帧相位（联机两端闪电形状一致；每 2 tick 换形状保持视觉闪动）
-    let jSeed = ((x1 * 73856093) ^ (y1 * 19349663) ^ (x2 * 83492791) ^ (Math.floor(game.tick / 2) * 126271)) >>> 0;
+    // 抖动种子取自端点坐标 + 渲染时钟相位（每 1/15 秒换形状保持视觉闪动；渲染层不影响联机逻辑一致性）
+    let jSeed = ((x1 * 73856093) ^ (y1 * 19349663) ^ (x2 * 83492791) ^ (Math.floor(renderClockSec * 15) * 126271)) >>> 0;
 
     // 外层主闪电
     DC.beginPath();
@@ -6738,8 +7427,8 @@ function drawDeployThunderbolt(x1, y1, x2, y2, alpha) {
     if (len < 1) return;
     const segments = Math.max(8, Math.floor(len / 5));
     const nx = -dy / len, ny = dx / len;
-    // 🔗 联机确定性：抖动种子取自端点坐标 + 视觉帧相位（联机两端形状一致；每 2 tick 换形状保持闪动感）
-    let jSeed = ((x1 * 73856093) ^ (y1 * 19349663) ^ (x2 * 83492791) ^ (Math.floor(game.tick / 2) * 126271)) >>> 0;
+    // 抖动种子取自端点坐标 + 渲染时钟相位（每 1/15 秒换形状保持闪动感；渲染层不影响联机逻辑一致性）
+    let jSeed = ((x1 * 73856093) ^ (y1 * 19349663) ^ (x2 * 83492791) ^ (Math.floor(renderClockSec * 15) * 126271)) >>> 0;
 
     // 外层主闪电（更粗）
     DC.strokeStyle = `rgba(180, 220, 255, ${alpha})`;
@@ -6777,7 +7466,7 @@ function drawDeployThunderbolt(x1, y1, x2, y2, alpha) {
 /** 绘制暗夜女巫（暗紫色 + 蝙蝠翅膀感） */
 function drawNightWitch(unit) {
     const isPlayer = unit.team === 'player';
-    const pulse = 0.8 + 0.2 * Math.sin(game.time * 3);
+    const pulse = 0.8 + 0.2 * Math.sin(renderClockSec * 3);
 
     // 暗紫色光晕
     DC.fillStyle = isPlayer ? '#6a0dad' : '#4a0072';
@@ -6841,7 +7530,7 @@ function drawNightWitch(unit) {
 /** 绘制女巫（紫罗兰圆身 + 深紫尖顶宽檐帽 + 金色眼睛 + 右斜扫帚，区别于暗夜女巫的菱形蝙蝠造型） */
 function drawWitch(unit) {
     const isPlayer = unit.team === 'player';
-    const pulse = 0.8 + 0.2 * Math.sin(game.time * 3);
+    const pulse = 0.8 + 0.2 * Math.sin(renderClockSec * 3);
 
     // 紫罗兰光晕
     DC.fillStyle = isPlayer ? '#5b2c6f' : '#3d1a52';
@@ -6917,7 +7606,7 @@ function drawWitch(unit) {
 /** 绘制蝙蝠（小巧飞行单位） */
 function drawBat(unit) {
     const isPlayer = unit.team === 'player';
-    const flap = Math.sin(game.time * 12) * 3; // 翅膀拍动
+    const flap = Math.sin(renderClockSec * 12) * 3; // 翅膀拍动
 
     // 影子（很小）
     drawUnitShadow(unit, 8, 8, 4, 0.2);
@@ -6959,8 +7648,8 @@ function drawBat(unit) {
 /** 绘制苍蝇（苍蝇海：小圆身+快速拍动的半透明双翅+触角+红眼，飞行浮动） */
 function drawFlySwarm(unit) {
     const isPlayer = unit.team === 'player';
-    const flap = Math.sin(game.time * 16) * 2.5; // 翅膀快速拍动
-    const floatOffset = Math.sin(game.time * 4 + unit.id) * 1.5; unit._floatY = floatOffset; // 浮动
+    const flap = Math.sin(renderClockSec * 16) * 2.5; // 翅膀快速拍动
+    const floatOffset = Math.sin(renderClockSec * 4 + unit.id) * 1.5; unit._floatY = floatOffset; // 浮动
 
     // 影子（很小）
     drawUnitShadow(unit, 8, 8, 4, 0.2);
@@ -7006,8 +7695,8 @@ function drawFlySwarm(unit) {
 /** 绘制大苍蝇：参考苍蝇海并放大，加入厚重胸甲、巨大复眼和带纹理的翼膜 */
 function drawLargeFly(unit) {
     const isPlayer = unit.team === 'player';
-    const flap = Math.sin(game.time * 13) * 2.2;
-    const floatOffset = Math.sin(game.time * 3.5 + unit.id) * 1.5;
+    const flap = Math.sin(renderClockSec * 13) * 2.2;
+    const floatOffset = Math.sin(renderClockSec * 3.5 + unit.id) * 1.5;
     unit._floatY = floatOffset;
     const x = unit.x;
     const y = unit.y + floatOffset;
@@ -7079,81 +7768,75 @@ function drawLargeFly(unit) {
     });
 }
 
-/** 绘制冰豆（冰蓝色小圆豆 + ❄️ 标记，不能移动） */
-function drawIceBean(unit) {
+/** 🫘 冰豆/火豆/疗豆 绘制三胞胎统一实现（同构：脉动光晕→豆身→高光→边框→血条，仅配色不同；原三份 ~38 行手抄收敛于此） */
+function drawBean(unit, palette) {
     const isPlayer = unit.team === 'player';
-    const pulse = 0.85 + 0.15 * Math.sin(game.time * 2);
+    const pulse = 0.85 + 0.15 * Math.sin(renderClockSec * 2);
 
-    // 寒冰光晕
-    DC.fillStyle = 'rgba(100,200,255,0.2)';
+    // 光晕
+    DC.fillStyle = palette.glow;
     DC.beginPath();
     DC.arc(unit.x, unit.y, 13 * pulse, 0, 2 * Math.PI);
     DC.fill();
 
-    // 冰蓝色豆子身体
-    DC.fillStyle = isPlayer ? '#74b9ff' : '#a29bfe';
+    // 豆子身体
+    DC.fillStyle = isPlayer ? palette.bodyPlayer : palette.bodyEnemy;
     DC.beginPath();
     DC.arc(unit.x, unit.y, 6, 0, 2 * Math.PI);
     DC.fill();
 
-    // 白色高光
-    DC.fillStyle = 'rgba(255,255,255,0.5)';
+    // 高光
+    DC.fillStyle = palette.highlight;
     DC.beginPath();
     DC.arc(unit.x - 1.5, unit.y - 1.5, 1.5, 0, 2 * Math.PI);
     DC.fill();
 
-    // 白色边框
-    DC.strokeStyle = 'rgba(255,255,255,0.8)';
+    // 边框
+    DC.strokeStyle = palette.border;
     DC.lineWidth = 1.5;
     DC.beginPath();
     DC.arc(unit.x, unit.y, 6, 0, 2 * Math.PI);
     DC.stroke();
 
-    // 名称 + 血条（受伤才显示；❄️ 身份标记已移入状态栏常驻显示，血条用通用位置）
+    // 名称 + 血条（受伤才显示；身份标记已移入状态栏常驻显示，血条用通用位置）
     drawNameBar(unit, {
-        name: '冰豆',
+        name: palette.name,
         nameY: unit.y - 12,
         barY: unit.y - 12,
         baseline: 'alphabetic',
     });
 }
 
+/** 绘制冰豆（冰蓝色小圆豆 + ❄️ 标记，不能移动） */
+function drawIceBean(unit) {
+    drawBean(unit, {
+        name: '冰豆',
+        glow: 'rgba(100,200,255,0.2)',
+        bodyPlayer: '#74b9ff', bodyEnemy: '#a29bfe',
+        highlight: 'rgba(255,255,255,0.5)',
+        border: 'rgba(255,255,255,0.8)',
+    });
+}
+
 /** 绘制火豆（橙红色小圆豆 + 🔥 标记，快速移动自爆） */
 function drawFireBean(unit) {
-    const isPlayer = unit.team === 'player';
-    const pulse = 0.85 + 0.15 * Math.sin(game.time * 2);
-
-    // 火焰光晕
-    DC.fillStyle = 'rgba(255,150,50,0.2)';
-    DC.beginPath();
-    DC.arc(unit.x, unit.y, 13 * pulse, 0, 2 * Math.PI);
-    DC.fill();
-
-    // 橙红色豆子身体
-    DC.fillStyle = isPlayer ? '#ff6b35' : '#e74c3c';
-    DC.beginPath();
-    DC.arc(unit.x, unit.y, 6, 0, 2 * Math.PI);
-    DC.fill();
-
-    // 黄色高光
-    DC.fillStyle = 'rgba(255,255,100,0.5)';
-    DC.beginPath();
-    DC.arc(unit.x - 1.5, unit.y - 1.5, 1.5, 0, 2 * Math.PI);
-    DC.fill();
-
-    // 橙色边框
-    DC.strokeStyle = 'rgba(255,200,50,0.8)';
-    DC.lineWidth = 1.5;
-    DC.beginPath();
-    DC.arc(unit.x, unit.y, 6, 0, 2 * Math.PI);
-    DC.stroke();
-
-    // 名称 + 血条（受伤才显示；🔥 身份标记已移入状态栏常驻显示，血条用通用位置）
-    drawNameBar(unit, {
+    drawBean(unit, {
         name: '火豆',
-        nameY: unit.y - 12,
-        barY: unit.y - 12,
-        baseline: 'alphabetic',
+        glow: 'rgba(255,150,50,0.2)',
+        bodyPlayer: '#ff6b35', bodyEnemy: '#e74c3c',
+        highlight: 'rgba(255,255,100,0.5)',
+        border: 'rgba(255,200,50,0.8)',
+    });
+}
+
+/** 绘制疗豆（绿色小圆豆 + 💚 标记，快速移动自爆治疗；建模照抄火豆换配色） */
+function drawHealBean(unit) {
+    drawBean(unit, {
+        name: '疗豆',
+        glow: 'rgba(80,220,120,0.2)',
+        bodyPlayer: '#2ecc71', bodyEnemy: '#27ae60',
+        highlight: 'rgba(200,255,220,0.5)',
+        border: 'rgba(120,255,160,0.8)',
     });
 }
 
@@ -7161,9 +7844,9 @@ function drawFireBean(unit) {
 function drawPhoenix(unit) {
     const isPlayer = unit.team === 'player';
     const dir = isPlayer ? 1 : -1;                                 // 🪞 红方镜像：头部/喙/翅膀/尾羽左右翻转
-    const pulse = 0.9 + 0.1 * Math.sin(game.time * 2.5);          // 火焰呼吸脉动
-    const flap = Math.sin(game.time * 8) * 2;                     // 翅膀扇动
-    const floatOffset = Math.sin(game.time * 3 + unit.id) * 4;    // 浮动加大（±4），与影子拉开距离
+    const pulse = 0.9 + 0.1 * Math.sin(renderClockSec * 2.5);          // 火焰呼吸脉动
+    const flap = Math.sin(renderClockSec * 8) * 2;                     // 翅膀扇动
+    const floatOffset = Math.sin(renderClockSec * 3 + unit.id) * 4;    // 浮动加大（±4），与影子拉开距离
     unit._floatY = floatOffset;
     const x = unit.x, y = unit.y + floatOffset;
 
@@ -7175,7 +7858,7 @@ function drawPhoenix(unit) {
     DC.beginPath(); DC.arc(x, y, 15 * pulse, 0, Math.PI * 2); DC.fill();
 
     // 尾羽（火焰流苏，随风飘动）
-    const tailWave = Math.sin(game.time * 5) * 1.5;
+    const tailWave = Math.sin(renderClockSec * 5) * 1.5;
     DC.strokeStyle = isPlayer ? '#ff9f43' : '#e67e22';
     DC.lineWidth = 2.2;
     DC.beginPath();
@@ -7241,7 +7924,7 @@ function drawPhoenix(unit) {
  *
  *  内置状态：
  *    - _stealthed        → 🌫️（隐身）
- *    - 冰豆/火豆         → ❄️/🔥（身份标记，常驻显示）
+ *    - 冰豆/火豆/疗豆     → ❄️/🔥/💚（身份标记，常驻显示）
  *    - slowTimer > 0     → ❄️（减速，冰豆自身常驻❄️不重复画）
  *  扩展：未来只需在 icons 数组中 push 新 icon 即可
  *  ═══════════════════════════════════════════ */
@@ -7259,6 +7942,9 @@ function drawStatusIcon(entity) {
     }
     if (entity.cardId === 'fire_bean') {
         icons.push('🔥');
+    }
+    if (entity.cardId === 'heal_bean') {
+        icons.push('💚');
     }
 
     // 减速状态（冰豆自身常驻❄️，不重复画）
@@ -7281,9 +7967,19 @@ function drawStatusIcon(entity) {
         icons.push('⚡');
     }
 
+    // 🥊 附魔暴击（附魔巨人施加，死亡才掉）
+    if (entity._enchantCrit) {
+        icons.push('🥊');
+    }
+
     // 😡 狂暴状态（狂暴法术：攻速/移速/蓄力/出兵+30%）
     if (entity._rageTimer > 0) {
         icons.push('😡');
+    }
+
+    // 👁️ 靈·紫色克隆体（读书人书灵技能：被灵化的克隆体，40s寿命）
+    if (entity._spiritClone) {
+        icons.push('👁️');
     }
 
     // 🐴 骑士冲锋状态
@@ -7321,14 +8017,24 @@ function drawStatusIcon(entity) {
         icons.push('🔥');
     }
 
-    // 🤢 中毒状态（忍者飞镖命中 / 毒药法术领域；不叠加，只刷新持续时间）
-    if (entity._poisonTimer > 0 || entity._poisonSpellTimer > 0) {
+    // ❤️‍🩹 疗豆恢复buff（疗豆自爆施加：持续回血中，图标复用常驻自回❤️‍🩹）
+    if (entity._healBuffTimer > 0) {
+        icons.push('❤️‍🩹');
+    }
+
+    // 😱 恐惧状态（攻击力/攻速-25%）
+    if (entity._fearTimer > 0) {
+        icons.push('😱');
+    }
+
+    // 🤢 中毒状态（通用🤢模板：忍者毒镖/毒药法术领域/拟风传播等，时长累加、强度取最强）
+    if (entity._poisonTimer > 0) {
         icons.push('🤢');
     }
 
     // 🧭 烟引·pending 闪烁 buff（原烟引/镜像烟引分别记账）
     if (entity._smokePendingBuff || entity._smokePendingBuffMirror) {
-if (Math.sin(game.tick / 5.4) > 0) icons.push('🧭');   // 🔗 联机确定性：tick 相位
+if (Math.sin(renderClockSec * 30 / 5.4) > 0) icons.push('🧭');   // 渲染时钟相位（视觉动画；联机只保证逻辑一致，渲染相位无需对齐）
     }
     // 🧭 烟引引导状态（朝烟点前进中，稳显）
     if (entity._smokeGuide) {
@@ -7361,7 +8067,7 @@ function drawTram(unit) {
     const ballColor = isPlayer ? '#b2ebf2' : '#e1bee7';
     const glowColor = isPlayer ? 'rgba(0, 229, 255, 0.25)' : 'rgba(255, 64, 255, 0.25)';
     // 电磁脉冲浮动（参考电磁塔小圆球发光）
-    const pulse = 0.9 + 0.1 * Math.sin(game.time * 6);
+    const pulse = 0.9 + 0.1 * Math.sin(renderClockSec * 6);
 
     // ── 大圆（幽灵同体型 r=10）──
     DC.fillStyle = bodyColor;
@@ -7521,7 +8227,7 @@ function drawShadowAssassin(unit) {
     if (isStealthed) {
         // ---- 突袭隐身：暗淡半透明 + 紫色光晕（参考幽灵隐身）----
         DC.globalAlpha = 0.35;
-        const pulse = 0.9 + 0.1 * Math.sin(game.time * 6);
+        const pulse = 0.9 + 0.1 * Math.sin(renderClockSec * 6);
         DC.fillStyle = isPlayer ? 'rgba(160,120,255,0.18)' : 'rgba(255,120,160,0.18)';
         DC.beginPath();
         DC.arc(unit.x, unit.y, 14 * pulse, 0, 2 * Math.PI);
@@ -7592,14 +8298,14 @@ function drawGhost(unit) {
     const isStealthed = unit._stealthed;
 
     // 上下浮动偏移（幽灵本体浮动）
-    const floatOffset = Math.sin(game.time * 3) * 3; unit._floatY = floatOffset;
+    const floatOffset = Math.sin(renderClockSec * 3) * 3; unit._floatY = floatOffset;
 
     if (isStealthed) {
         // ---- 隐身状态：暗淡半透明 + 飘忽光晕 + 浮动 ----
         DC.globalAlpha = 0.3;
 
         // 幽灵光晕（跟随浮动）
-        const pulse = 0.9 + 0.1 * Math.sin(game.time * 3);
+        const pulse = 0.9 + 0.1 * Math.sin(renderClockSec * 3);
         DC.fillStyle = isPlayer ? 'rgba(150,200,255,0.15)' : 'rgba(200,150,255,0.15)';
         DC.beginPath();
         DC.arc(unit.x, unit.y + floatOffset, 14 * pulse, 0, 2 * Math.PI);
@@ -7666,7 +8372,7 @@ function drawFireworkGunner(unit) {
     const darkColor = isPlayer ? '#7b241c' : '#5b2c6f';
     const accent = '#f39c12';
     // 开火后坐力小抖动
-    const shake = (unit._recoilTimer > 0) ? Math.sin(game.time * 45) * 1.5 : 0;
+    const shake = (unit._recoilTimer > 0) ? Math.sin(renderClockSec * 45) * 1.5 : 0;
     const x = unit.x + shake;
 
     // ── 主体圆（幽灵同体型 r=10 打底）──
@@ -7707,7 +8413,7 @@ function drawFireworkGunner(unit) {
     DC.fillRect(x - 8, unit.y - 9, 16, 3);
 
     // ── 脚下推进小火苗（橙色闪烁）──
-    const flame = 0.6 + 0.4 * Math.sin(game.time * 12);
+    const flame = 0.6 + 0.4 * Math.sin(renderClockSec * 12);
     DC.fillStyle = `rgba(243,156,18,${0.5 + 0.5 * flame})`;
     DC.beginPath();
     DC.arc(x, unit.y + 10, 3.5 * flame + 1, 0, 2 * Math.PI);
@@ -8175,7 +8881,7 @@ function drawElectroCannon(unit) {
 
     // ── 满蓄时炮口脉动白光 ──
     if (unit._chargeTimer >= unit._chargeMax) {
-        const pulse = 0.7 + 0.3 * Math.sin(game.tick / 6);   // 🔗 联机确定性：tick 相位（周期 200ms→6 tick）
+        const pulse = 0.7 + 0.3 * Math.sin(renderClockSec * 5);   // 渲染时钟相位（周期 200ms）
         const glowR = 7 + 3 * pulse;
         const grad = DC.createRadialGradient(26, 0, 1, 26, 0, glowR);
         grad.addColorStop(0, `rgba(255,255,255,${0.95 * pulse})`);
@@ -8316,17 +9022,7 @@ function drawBuilding(b, showRange) {
         DC.restore();
 
         // 攻击范围虚线
-        if (showRange && b.range) {
-            DC.beginPath();
-            DC.arc(b.x, b.y, b.range, 0, 2 * Math.PI);
-            DC.setLineDash([5, 5]);
-            DC.strokeStyle = 'rgba(255,255,255,0.6)';
-            DC.lineWidth = 1.5;
-            DC.stroke();
-            DC.setLineDash([]);
-        }
-
-        const name = CARDS[b.cardId]?.name || '';
+        drawRangeCircle(b, showRange);
 
         drawNameBar(b, { barY: b.y - 18 });
 
@@ -8398,17 +9094,7 @@ function drawBuilding(b, showRange) {
         DC.restore();
 
         // 攻击范围虚线
-        if (showRange && b.range) {
-            DC.beginPath();
-            DC.arc(b.x, b.y, b.range, 0, 2 * Math.PI);
-            DC.setLineDash([5, 5]);
-            DC.strokeStyle = 'rgba(255,255,255,0.6)';
-            DC.lineWidth = 1.5;
-            DC.stroke();
-            DC.setLineDash([]);
-        }
-
-        const name = CARDS[b.cardId]?.name || '';
+        drawRangeCircle(b, showRange);
 
         drawNameBar(b, { barY: b.y - 18 });
 
@@ -8466,26 +9152,16 @@ function drawBuilding(b, showRange) {
         DC.restore();
 
         // 攻击范围虚线：外圈射程 + 内圈最小射程（近身打不到）
-        if (showRange && b.range) {
+        drawRangeCircle(b, showRange);
+        if (showRange && b.minRange) {
             DC.beginPath();
-            DC.arc(b.x, b.y, b.range, 0, 2 * Math.PI);
-            DC.setLineDash([5, 5]);
-            DC.strokeStyle = 'rgba(255,255,255,0.6)';
-            DC.lineWidth = 1.5;
+            DC.arc(b.x, b.y, b.minRange, 0, 2 * Math.PI);
+            DC.setLineDash([2, 4]);
+            DC.strokeStyle = 'rgba(255,120,80,0.5)';
+            DC.lineWidth = 1.2;
             DC.stroke();
             DC.setLineDash([]);
-            if (b.minRange) {
-                DC.beginPath();
-                DC.arc(b.x, b.y, b.minRange, 0, 2 * Math.PI);
-                DC.setLineDash([2, 4]);
-                DC.strokeStyle = 'rgba(255,120,80,0.5)';
-                DC.lineWidth = 1.2;
-                DC.stroke();
-                DC.setLineDash([]);
-            }
         }
-
-        const name = CARDS[b.cardId]?.name || '';
 
         drawNameBar(b, { barY: b.y - 18 });
 
@@ -8505,7 +9181,7 @@ function drawBuilding(b, showRange) {
         DC.strokeRect(b.x - 15, b.y - 15, 30, 30);
 
         // ── 中间小圆形（魔法核心，上下浮动）──
-        const floatOff = Math.sin(game.time * 3) * 2;
+        const floatOff = Math.sin(renderClockSec * 3) * 2;
         DC.fillStyle = circleColor;
         DC.beginPath();
         DC.arc(b.x, b.y + floatOff, 7, 0, 2 * Math.PI);
@@ -8515,17 +9191,7 @@ function drawBuilding(b, showRange) {
         DC.stroke();
 
         // 攻击范围虚线
-        if (showRange && b.range) {
-            DC.beginPath();
-            DC.arc(b.x, b.y, b.range, 0, 2 * Math.PI);
-            DC.setLineDash([5, 5]);
-            DC.strokeStyle = 'rgba(255,255,255,0.6)';
-            DC.lineWidth = 1.5;
-            DC.stroke();
-            DC.setLineDash([]);
-        }
-
-        const name = CARDS[b.cardId]?.name || '';
+        drawRangeCircle(b, showRange);
 
         drawNameBar(b, { barY: b.y - 18 });
 
@@ -8573,17 +9239,7 @@ function drawBuilding(b, showRange) {
         }
 
         // 攻击范围虚线
-        if (showRange && b.range) {
-            DC.beginPath();
-            DC.arc(b.x, b.y, b.range, 0, 2 * Math.PI);
-            DC.setLineDash([5, 5]);
-            DC.strokeStyle = 'rgba(255,255,255,0.6)';
-            DC.lineWidth = 1.5;
-            DC.stroke();
-            DC.setLineDash([]);
-        }
-
-        const name = CARDS[b.cardId]?.name || '';
+        drawRangeCircle(b, showRange);
 
         drawNameBar(b, { barY: b.y - 18 });
 
@@ -8667,17 +9323,7 @@ function drawBuilding(b, showRange) {
         }
 
         // 攻击范围虚线
-        if (showRange && b.range) {
-            DC.beginPath();
-            DC.arc(b.x, b.y, b.range, 0, 2 * Math.PI);
-            DC.setLineDash([5, 5]);
-            DC.strokeStyle = 'rgba(255,255,255,0.6)';
-            DC.lineWidth = 1.5;
-            DC.stroke();
-            DC.setLineDash([]);
-        }
-
-        const name = CARDS[b.cardId]?.name || '';
+        drawRangeCircle(b, showRange);
 
         drawNameBar(b, { barY: b.y - 18 });
 
@@ -8748,8 +9394,6 @@ function drawBuilding(b, showRange) {
         }
 
         // ── 名字 ──
-        const name = CARDS[b.cardId]?.name || '';
-
         drawNameBar(b, { barY: b.y - 18 });
 
         return; // ← 哥布林牢笼绘制完毕
@@ -8793,7 +9437,7 @@ function drawBuilding(b, showRange) {
             && Math.hypot(en.x - b.x, en.y - b.y) <= hutRange);
         if (!hasEnemy) {
             const sleepX = b.x + 13;
-            const sleepY = b.y - 10 + Math.sin(game.time * 2.5) * 2;
+            const sleepY = b.y - 10 + Math.sin(renderClockSec * 2.5) * 2;
             DC.font = '12px sans-serif';
             DC.textAlign = 'center';
             DC.textBaseline = 'middle';
@@ -8801,8 +9445,6 @@ function drawBuilding(b, showRange) {
         }
 
         // ── 名字 ──
-        const name = CARDS[b.cardId]?.name || '';
-
         drawNameBar(b, { barY: b.y - 18 });
 
         // ── 出兵进度条（通用蓄力条：血条正上方；仅范围内有敌人正在出兵时显示，
@@ -8819,7 +9461,7 @@ function drawBuilding(b, showRange) {
         const bodyColor = isPlayer ? '#7d8a99' : '#8a6a5a';
         const darkColor = isPlayer ? '#4a5560' : '#5a3f30';
         const accentColor = isPlayer ? '#3d7ea6' : '#a63d3d';
-        const drillSpin = game.time * 20;              // 钻头旋转角速度
+        const drillSpin = renderClockSec * 20;              // 钻头旋转角速度
 
         // ── 阴影 ──
         DC.fillStyle = 'rgba(0,0,0,0.3)';
@@ -8832,13 +9474,13 @@ function drawBuilding(b, showRange) {
         // ── 中部驾驶窗 + 哥布林眼睛（随钻机高频震动） ──
         DC.fillStyle = darkColor;
         DC.fillRect(b.x - 8, b.y - 4, 16, 10);
-        const eyeShake = Math.sin(game.time * 30) * 0.8;   // 震动幅度
+        const eyeShake = Math.sin(renderClockSec * 30) * 0.8;   // 震动幅度
         DC.fillStyle = '#fff';
         DC.fillRect(b.x - 5 + eyeShake, b.y - 1, 3.5, 3.5);
         DC.fillRect(b.x + 2 + eyeShake, b.y - 1, 3.5, 3.5);
         DC.fillStyle = '#222';
-        DC.fillRect(b.x - 4 + eyeShake + Math.cos(game.time * 5) * 0.5, b.y - 0.5, 1.5, 1.5);
-        DC.fillRect(b.x + 3 + eyeShake + Math.cos(game.time * 5) * 0.5, b.y - 0.5, 1.5, 1.5);
+        DC.fillRect(b.x - 4 + eyeShake + Math.cos(renderClockSec * 5) * 0.5, b.y - 0.5, 1.5, 1.5);
+        DC.fillRect(b.x + 3 + eyeShake + Math.cos(renderClockSec * 5) * 0.5, b.y - 0.5, 1.5, 1.5);
 
         // ── 铆钉（机身四角） ──
         DC.fillStyle = 'rgba(255,255,255,0.5)';
@@ -8875,8 +9517,6 @@ function drawBuilding(b, showRange) {
         DC.fill();
 
         // ── 名字 ──
-        const name = CARDS[b.cardId]?.name || '';
-
         drawNameBar(b, { barY: b.y - 18 });
 
         // ── 出兵进度条（无条件持续出兵，常显；紧贴血条正上方） ──
@@ -8916,15 +9556,13 @@ function drawBuilding(b, showRange) {
         DC.stroke();
 
         // ── 上方篝火（🔥 emoji，贴近基底顶、轻微浮动）──
-        const fireY = b.y - 9 + Math.sin(game.time * 3) * 1.5;
+        const fireY = b.y - 9 + Math.sin(renderClockSec * 3) * 1.5;
         DC.font = '13px sans-serif';
         DC.textAlign = 'center';
         DC.textBaseline = 'middle';
         DC.fillText('🔥', b.x, fireY);
 
         // ── 名字 ──
-        const name = CARDS[b.cardId]?.name || '';
-
         drawNameBar(b, { barY: b.y - 19 });
 
         return; // ← 临时营地绘制完毕
@@ -9005,7 +9643,7 @@ function drawBuilding(b, showRange) {
         const curCostT = stT.blessCost != null ? stT.blessCost : baseCostT;
         const glowK = Math.max(0, Math.min(1, (baseCostT - curCostT) / Math.max(1, baseCostT - 1)));
         if (glowK > 0.01) {
-const breathe = 0.75 + 0.25 * Math.sin(game.tick / 6);   // 呼吸脉动（盔甲铺同款节奏；🔗 联机确定性：tick 相位）
+const breathe = 0.75 + 0.25 * Math.sin(renderClockSec * 5);   // 呼吸脉动（盔甲铺同款节奏；渲染时钟相位）
             const steleCy = steleTop + steleH / 2;                      // 碑体中心
             // 碑体金色染色（随减费加深、随呼吸明暗）
             DC.fillStyle = `rgba(255, 215, 0, ${(0.15 + 0.25 * breathe) * glowK})`;
@@ -9052,8 +9690,8 @@ const breathe = 0.75 + 0.25 * Math.sin(game.tick / 6);   // 呼吸脉动（盔�
         DC.lineWidth = 1.5;
         DC.stroke();
 
-        // ── 缓缓旋转的六芒星（正三角 + 倒三角叠加，随 game.time 缓慢旋转；半透明暗淡=地面阴影）──
-        const rot = game.time * 0.25;
+        // ── 缓缓旋转的六芒星（正三角 + 倒三角叠加，随 renderClockSec 缓慢旋转；半透明暗淡=地面阴影）──
+        const rot = renderClockSec * 0.25;
         DC.save();
         DC.translate(b.x, b.y);
         DC.rotate(rot);
@@ -9073,7 +9711,7 @@ const breathe = 0.75 + 0.25 * Math.sin(game.tick / 6);   // 呼吸脉动（盔�
         DC.restore();
 
         // ── 上方悬浮菱形宝石（空中本体，只上下浮动，不自转）──
-        const gemY = b.y - R - 5 + Math.sin(game.time * 2.5) * 2;
+        const gemY = b.y - R - 5 + Math.sin(renderClockSec * 2.5) * 2;
         DC.save();
         DC.translate(b.x, gemY);
         DC.beginPath();
@@ -9095,10 +9733,8 @@ const breathe = 0.75 + 0.25 * Math.sin(game.tick / 6);   // 呼吸脉动（盔�
         DC.restore();
 
         // ── 名字 ──
-        const name = CARDS[b.cardId]?.name || '';
-
         // 浮动血条（菱形宝石上下浮动，血条跟随同幅浮动）
-        const floatOffset = Math.sin(game.time * 2.5) * 2; b._floatY = floatOffset; // 上下浮动
+        const floatOffset = Math.sin(renderClockSec * 2.5) * 2; b._floatY = floatOffset; // 上下浮动
         drawNameBarFloat(b, { barY: b.y - 28 });
 
         return; // ← 法术屏障绘制完毕
@@ -9129,7 +9765,7 @@ const breathe = 0.75 + 0.25 * Math.sin(game.tick / 6);   // 呼吸脉动（盔�
         // ── 蓄满：蓝色脉动光圈 ──
         const charge = b._chargeTimer || 0;
         if (charge >= (b._chargeMax || 6)) {
-            const pulse = 0.7 + 0.3 * Math.sin(game.tick / 6);   // 🔗 联机确定性：tick 相位（周期 200ms→6 tick）
+            const pulse = 0.7 + 0.3 * Math.sin(renderClockSec * 5);   // 渲染时钟相位（周期 200ms）
             const glowR = 17 + 4 * pulse;
             const grad = DC.createRadialGradient(b.x, b.y, 2, b.x, b.y, glowR);
             grad.addColorStop(0, `rgba(120,200,255,${0.5 * pulse})`);
@@ -9141,8 +9777,6 @@ const breathe = 0.75 + 0.25 * Math.sin(game.tick / 6);   // 呼吸脉动（盔�
         }
 
         // ── 名字 ──
-        const name = CARDS[b.cardId]?.name || '';
-
         // ── 血条（通用模板）──
         drawNameBar(b, { barY: b.y - 19 });
 
@@ -9214,7 +9848,7 @@ const breathe = 0.75 + 0.25 * Math.sin(game.tick / 6);   // 呼吸脉动（盔�
         // 小烟囱与缓慢上升的烟（确定性动画）
         DC.fillStyle = '#402b25';
         DC.fillRect(b.x + 9, b.y - 23, 6, 9);
-        const smoke = Math.sin(game.tick / 10) * 1.5;
+        const smoke = Math.sin(renderClockSec * 3) * 1.5;
         DC.fillStyle = 'rgba(220,220,220,0.42)';
         DC.beginPath();
         DC.arc(b.x + 12 + smoke, b.y - 28, 3, 0, Math.PI * 2);
@@ -9247,7 +9881,6 @@ const breathe = 0.75 + 0.25 * Math.sin(game.tick / 6);   // 呼吸脉动（盔�
 
         DC.restore();
 
-        const name = CARDS[b.cardId]?.name || '';
         drawNameBar(b, { barY: b.y - 27 });
         drawChargeBar(b, (b.spawnTimer || 0) / (CARDS[b.cardId]?.spawnInterval || 15), '#a569bd');
         return;
@@ -9304,17 +9937,7 @@ const breathe = 0.75 + 0.25 * Math.sin(game.tick / 6);   // 呼吸脉动（盔�
     }
 
     // 攻击范围虚线
-    if (showRange && b.range) {
-        DC.beginPath();
-        DC.arc(b.x, b.y, b.range, 0, 2 * Math.PI);
-        DC.setLineDash([5, 5]);
-        DC.strokeStyle = 'rgba(255,255,255,0.6)';
-        DC.lineWidth = 1.5;
-        DC.stroke();
-        DC.setLineDash([]);
-    }
-
-    const name = CARDS[b.cardId]?.name || '';
+    drawRangeCircle(b, showRange);
 
     drawNameBar(b, { barY: b.y - 18 });
 
@@ -9386,6 +10009,256 @@ function drawDeployZoneFrame(left, right, fade) {
     DC.restore();
 }
 
+/** 🌊 河道地图半场制部署预览：白框沿「己方半场全高 + 扩展半场矩形」的组合外轮廓走一圈
+ *  isPlayer：蓝方（己方在左，扩展块向右凸 innerX→extX）；红方（己方在右，扩展块向左凸 innerX→extX，extX<innerX）
+ *  innerX：己方半场靠河一侧 x（蓝=河左界650 / 红=河右界750）
+ *  extX：扩展区远界 x（蓝=敌方堡垒线1000 / 红=玩家堡垒线400）
+ *  openTop/openBottom：上半/下半扩展区是否开放（都开=纯矩形、都不开=纯己方半场矩形）
+ *  视觉与 drawDeployZoneFrame 同款：2% 白填充 + 白光晕 + 3px 水平渐隐描边（己方侧亮→敌方远界淡） */
+function drawDeployZoneFrameHalf(isPlayer, innerX, extX, openTop, openBottom) {
+    // 蓝：己方 [0,innerX] 全高 + 扩展 [innerX,extX] 半场（extX>innerX 向右凸）
+    // 红：己方 [innerX,W] 全高 + 扩展 [extX,innerX] 半场（extX<innerX 向左凸，贴玩家堡垒线）
+    let pts;
+    if (openTop && openBottom) {
+        pts = isPlayer ? [[0, 0], [extX, 0], [extX, H], [0, H]]
+                       : [[extX, 0], [W, 0], [W, H], [extX, H]];
+    } else if (openTop) {
+        pts = isPlayer ? [[0, 0], [extX, 0], [extX, H / 2], [innerX, H / 2], [innerX, H], [0, H]]
+                       : [[extX, 0], [W, 0], [W, H], [innerX, H], [innerX, H / 2], [extX, H / 2]];
+    } else if (openBottom) {
+        pts = isPlayer ? [[0, 0], [innerX, 0], [innerX, H / 2], [extX, H / 2], [extX, H], [0, H]]
+                       : [[innerX, 0], [W, 0], [W, H], [extX, H], [extX, H / 2], [innerX, H / 2]];
+    } else {
+        pts = isPlayer ? [[0, 0], [innerX, 0], [innerX, H], [0, H]]
+                       : [[innerX, 0], [W, 0], [W, H], [innerX, H]];
+    }
+    DC.save();
+    DC.beginPath();
+    for (let i = 0; i < pts.length; i++) {
+        if (i === 0) DC.moveTo(pts[i][0], pts[i][1]);
+        else DC.lineTo(pts[i][0], pts[i][1]);
+    }
+    DC.closePath();
+    DC.fillStyle = 'rgba(255,255,255,0.02)';
+    DC.fill();
+    DC.shadowColor = 'rgba(255,255,255,0.7)';
+    DC.shadowBlur = 20;
+    DC.lineWidth = 3;
+    DC.setLineDash([]);
+    // 水平渐隐描边：蓝方亮端在己方主塔侧(0)；红方亮端在推进线侧(extX)——与各自原全高框方向一致
+    const gL = isPlayer ? 0 : extX;
+    const gR = isPlayer ? extX : W;
+    const grad = DC.createLinearGradient(gL, 0, gR, 0);
+    grad.addColorStop(0, 'rgba(255,255,255,0.65)');
+    grad.addColorStop(0.5, 'rgba(255,255,255,0.45)');
+    grad.addColorStop(1, 'rgba(255,255,255,0.34)');
+    DC.strokeStyle = grad;
+    DC.stroke();
+    DC.restore();
+}
+
+/** ⛺ 圈样式原语·索敌圈：淡橙填充 + 橙虚线(10/6)；非法时红化（主塔/营地悬停与部署预览共用） */
+function drawDetectRing(x, y, r, canPlace, invStroke, invFill) {
+    DC.beginPath();
+    DC.arc(x, y, r, 0, 2 * Math.PI);
+    DC.fillStyle = canPlace ? 'rgba(255,140,0,0.04)' : invFill;
+    DC.fill();
+    DC.setLineDash([10, 6]);
+    DC.strokeStyle = canPlace ? 'rgba(255,140,0,0.6)' : invStroke;
+    DC.lineWidth = 1.5;
+    DC.stroke();
+    DC.setLineDash([]);
+}
+
+/** ⛺ 圈样式原语·巡逻轨道圈：淡蓝填充 + 蓝虚线(5/5)；inner=true 为内圈（3/6 细虚线无填充）；非法时红化 */
+function drawPatrolRing(x, y, r, inner, canPlace, invStroke, invFill) {
+    DC.beginPath();
+    DC.arc(x, y, r, 0, 2 * Math.PI);
+    if (!inner) {
+        DC.fillStyle = canPlace ? 'rgba(64,156,255,0.07)' : invFill;
+        DC.fill();
+    }
+    DC.setLineDash(inner ? [3, 6] : [5, 5]);
+    DC.strokeStyle = canPlace ? (inner ? 'rgba(64,156,255,0.45)' : 'rgba(64,156,255,0.75)') : invStroke;
+    DC.lineWidth = inner ? 1 : 1.5;
+    DC.stroke();
+    DC.setLineDash([]);
+}
+
+/** 🎨 部署预览统一实现（2026-09 审计收敛：原蓝红两份 ~120 行手抄分支合并，差异走 team 参数与函数内配色表 pal；
+ *  涵盖：屏障庇护范围同步、烟引两段预览、镜像跟随、可部署区白框（全屏/半场制组合轮廓/动态边界）、
+ *  营地三圈+拆除模式、屏障圈、滚木矩形（蓝→右滚/红←左滚）、范围圈/治疗圈/最小射程内圈、十字准心） */
+function drawDeployPreviewBody(team, riverL, riverR) {
+    const isPlayer = team === 'player';
+    const selKey = isPlayer ? 'selectedCardId' : 'selectedCardId2';
+    const selectedId = game.uiState[selKey];
+    const card = CARDS[selectedId];
+    const pal = isPlayer ? {
+        // 蓝方配色：黄圈 / 红失效
+        barrierOkFill: 'rgba(138,123,255,0.12)', barrierOkStroke: 'rgba(138,123,255,0.8)',
+        barrierBadFill: 'rgba(255,80,80,0.12)', barrierBadStroke: 'rgba(255,80,80,0.8)',
+        logOkFill: 'rgba(180,130,70,0.15)', logOkStroke: 'rgba(180,130,70,0.8)',
+        logBadFill: 'rgba(255,80,80,0.15)', logBadStroke: 'rgba(255,80,80,0.8)',
+        logArrowFillOk: 'rgba(180,130,70,0.9)', logArrowFillBad: 'rgba(255,80,80,0.9)',
+        logArrow: '→',
+        ringOkFill: 'rgba(255,255,0,0.2)', ringBadFill: 'rgba(255,0,0,0.15)',
+        ringOkStroke: '#facc15', ringBadStroke: '#ef4444',
+        healOkFill: 'rgba(46,204,113,0.18)', healBadFill: 'rgba(255,0,0,0.15)',
+        healOkStroke: '#2ecc71', healBadStroke: '#ef4444',
+        minRangeBadStroke: 'rgba(255,80,80,0.8)',
+        crossOk: '#facc15', crossBad: '#ef4444',
+    } : {
+        // 红方配色：白圈 / 粉红失效
+        barrierOkFill: 'rgba(224,106,176,0.12)', barrierOkStroke: 'rgba(224,106,176,0.8)',
+        barrierBadFill: 'rgba(255,107,157,0.2)', barrierBadStroke: '#ff6b9d',
+        logOkFill: 'rgba(224,106,176,0.12)', logOkStroke: 'rgba(224,106,176,0.8)',
+        logBadFill: 'rgba(255,107,157,0.2)', logBadStroke: '#ff6b9d',
+        logArrowFillOk: 'rgba(224,106,176,0.9)', logArrowFillBad: '#ff6b9d',
+        logArrow: '←',
+        ringOkFill: 'rgba(255,255,255,0.2)', ringBadFill: 'rgba(255,150,200,0.2)',
+        ringOkStroke: '#ffffff', ringBadStroke: '#ff6b9d',
+        healOkFill: 'rgba(46,204,113,0.2)', healBadFill: 'rgba(255,150,200,0.2)',
+        healOkStroke: '#2ecc71', healBadStroke: '#ff6b9d',
+        minRangeBadStroke: 'rgba(255,150,200,0.8)',
+        crossOk: '#ffffff', crossBad: '#ff6b9d',
+    };
+
+    // 🌊 河道地图（shrink220）半场制部署：爆掉哪半堡垒开哪半扩展区；"哪半被爆"由存活堡垒 y 实时推断（只读，不写状态）
+    const halfMode = game.shrink220;
+    const topBastionAlive = t => game.entities.some(e => e.type === 'bastion' && e.team === t && e.hp > 0 && e.y < H / 2);
+    const aiTopLost = halfMode ? !topBastionAlive('ai') : false;         // 敌方(AI)上半堡垒已被爆
+    const playerTopLost = halfMode ? !topBastionAlive('player') : false; // 己方(玩家)上半堡垒已被爆
+    const pExtOpenTop = halfMode && (game.bastionsLost.ai >= 2 || (game.bastionsLost.ai >= 1 && aiTopLost));
+    const pExtOpenBottom = halfMode && (game.bastionsLost.ai >= 2 || (game.bastionsLost.ai >= 1 && !aiTopLost));
+    const aExtOpenTop = halfMode && (game.bastionsLost.player >= 2 || (game.bastionsLost.player >= 1 && playerTopLost));
+    const aExtOpenBottom = halfMode && (game.bastionsLost.player >= 2 || (game.bastionsLost.player >= 1 && !playerTopLost));
+    let playerRightBoundary = riverL;
+    if (game.bastionsLost.ai >= 2) playerRightBoundary = game.shrink220 ? MODE_TEST_AI_BASTION_TOP.x : AI_BASTION_TOP.x; // 🧪测试双人：堡垒线随整图缩窄
+    else if (game.bastionsLost.ai >= 1) playerRightBoundary = riverR;
+    let aiLeftBoundary = riverR;
+    if (game.bastionsLost.player >= 2) aiLeftBoundary = PLAYER_BASTION_TOP.x;
+    else if (game.bastionsLost.player >= 1) aiLeftBoundary = riverL;
+
+    // 🔮 法术屏障范围：只要处于部署预览就常显【敌我双方】屏障的庇护范围（紫色圈；
+    //    原先只在法术预览时显示敌方、屏障卡预览时显示我方，现在任何卡牌预览都全显）
+    drawBarrierRanges(team);
+    drawOwnBarrierRanges(team);
+    // 🧭 烟引：阶段1（pending 放烟中）→ 虚线箭头+友军🧭闪烁虚影；阶段0 → 极速同款大圈(85)
+    //    镜像烟引 pending 中选中镜像卡 → 同样走「下烟」虚线预览（镜像卡=下烟载体）
+    const smokeIsMirror = selectedId === 'mirror';
+    const smokePending = getSmokePending(team, smokeIsMirror);
+    if (selectedId === 'smoke_guide' || (smokeIsMirror && smokePending)) {
+        if (smokePending) drawSmokeReleasePreview(team, smokeIsMirror);
+        else drawSmokeGuideRangePreview(team);
+        return;
+    }
+    // ★ 镜像法术：预览跟随被镜像的卡牌（镜像矿工→全屏白框、镜像迫击炮→射程圈+盲区内圈、镜像法术→淡红环等）
+    let previewCard = card;
+    let previewCardId = selectedId;
+    if (previewCardId === 'mirror' && getMirrorCopiedCard(team) && CARDS[getMirrorCopiedCard(team)]) {
+        previewCard = CARDS[getMirrorCopiedCard(team)];
+        previewCardId = getMirrorCopiedCard(team);
+    }
+    // 整片可部署区域白色浅光框（法术/任意部署卡全屏，非法术动态边界渐隐；halfOnly 法术如滚木按军队规则限己方半场）
+    if ((previewCard.type === 'spell' && !previewCard.halfOnly) || previewCard.anywhere) {
+        drawDeployZoneFrame(0, W, false);
+    } else if (halfMode) {
+        // 🌊 河道地图半场制：白框沿「己方半场全高 + 扩展半场矩形」组合外轮廓走一圈（红方由镜像生成，同走一圈）
+        drawDeployZoneFrameHalf(isPlayer, isPlayer ? riverL : riverR, isPlayer ? MODE_TEST_AI_BASTION_TOP.x : PLAYER_BASTION_TOP.x,
+            isPlayer ? pExtOpenTop : aExtOpenTop, isPlayer ? pExtOpenBottom : aExtOpenBottom);
+    } else {
+        drawDeployZoneFrame(isPlayer ? 0 : aiLeftBoundary, isPlayer ? playerRightBoundary : W, true);
+    }
+    // 鼠标位置部署指示器（范围圈/十字准心 + 颜色区分；治疗范围预览用绿色；塔类显示射程圈+最小射程内圈；小屋显示出兵范围）
+    const hasRadius = previewCard.type === 'spell' || previewCard.deploySpell || previewCard.healRadius
+        || (previewCard.type === 'tower' && previewCard.range)
+        || (previewCardId === 'goblin_hut' && previewCard.spawnRange);
+    const isSpellLike = previewCard.type === 'spell';
+    const canPlace = (isSpellLike && !previewCard.halfOnly)
+        ? !isSpellBlockedByBarrier(team, game.uiState.mouseX, game.uiState.mouseY) // 🔮 法术预览：鼠标在敌方屏障庇护区内→不可部署（预览变红）
+        : canDeployHere(previewCardId, team, game.uiState.mouseX, game.uiState.mouseY, game.entities, game.bastionsLost.ai, game.bastionsLost.player, riverL, riverR,
+            halfMode ? MODE_TEST_AI_BASTION_TOP.x : AI_BASTION_TOP.x, halfMode, aiTopLost, playerTopLost) // 🌊 半场制尾参+缩窄堡垒线（预览与实际部署判定同参）
+          && !(isSpellLike && isSpellBlockedByBarrier(team, game.uiState.mouseX, game.uiState.mouseY)); // 半场法术（滚木）仍受屏障庇护限制
+    // ⛺ 营地：显示索敌圈+巡逻轨道范围预览（与悬停一致，替代十字准心）
+    if (previewCardId === 'camp') {
+        // 🪏 拆除模式：鼠标移到己方已部署营地上 → 部署预览变为拆除图标
+        const ownCamp = game.entities.find(e => e.cardId === 'camp' && e.team === team && e.hp > 0
+            && Math.abs(e.x - game.uiState.mouseX) <= 15 && Math.abs(e.y - game.uiState.mouseY) <= 15);
+        if (ownCamp) {
+            drawDemolishPreview(game.uiState.mouseX, game.uiState.mouseY, ownCamp);
+        } else {
+            drawCampDeployPreview(game.uiState.mouseX, game.uiState.mouseY, previewCard, canPlace, !isPlayer);
+        }
+    } else if (previewCardId === 'spell_barrier') {
+        // 🔮 法术屏障：显示庇护范围圈预览（与悬停一致，替代十字准心）
+        const barrierR = previewCard.barrierRange || 200;
+        DC.beginPath();
+        DC.arc(game.uiState.mouseX, game.uiState.mouseY, barrierR, 0, 2 * Math.PI);
+        DC.fillStyle = canPlace ? pal.barrierOkFill : pal.barrierBadFill;
+        DC.fill();
+        DC.setLineDash([8, 6]);
+        DC.strokeStyle = canPlace ? pal.barrierOkStroke : pal.barrierBadStroke;
+        DC.lineWidth = 1.5;
+        DC.stroke();
+        DC.setLineDash([]);
+    } else if (previewCardId === 'log') {
+        // 🪵 滚木：部署预览 = 大致法术影响范围（长=滚动距离560px × 宽=剑仙攻击范围直径65px），起始处画小木头示意（蓝→右滚 / 红←左滚）
+        const rollDist = previewCard.rollDistance || 560;
+        const halfW = previewCard.radius || 32.5;
+        const x0 = game.uiState.mouseX;
+        DC.fillStyle = canPlace ? pal.logOkFill : pal.logBadFill;
+        DC.fillRect(isPlayer ? x0 : x0 - rollDist, game.uiState.mouseY - halfW, rollDist, halfW * 2);
+        DC.setLineDash([6, 4]);
+        DC.strokeStyle = canPlace ? pal.logOkStroke : pal.logBadStroke;
+        DC.lineWidth = 2;
+        DC.strokeRect(isPlayer ? x0 : x0 - rollDist, game.uiState.mouseY - halfW, rollDist, halfW * 2);
+        DC.setLineDash([]);
+        // 滚动方向箭头
+        DC.fillStyle = canPlace ? pal.logArrowFillOk : pal.logArrowFillBad;
+        DC.font = '16px sans-serif';
+        DC.textAlign = 'center';
+        DC.textBaseline = 'middle';
+        DC.fillText(pal.logArrow, isPlayer ? x0 + rollDist / 2 : x0 - rollDist / 2, game.uiState.mouseY);
+        // 起始位置小木头示意（竖直长65厚7）
+        const ll = previewCard.logLength || 65;
+        const lw = (previewCard.logWidth || 7) / 2;
+        DC.fillStyle = '#7a4a21';
+        DC.strokeStyle = '#4a2c10';
+        DC.lineWidth = 1.5;
+        DC.fillRect(x0 - lw, game.uiState.mouseY - ll / 2, lw * 2, ll);
+        DC.strokeRect(x0 - lw, game.uiState.mouseY - ll / 2, lw * 2, ll);
+        DC.textAlign = 'left';
+        DC.textBaseline = 'alphabetic';
+    } else if (hasRadius) {
+        const radius = previewCard.type === 'spell' ? previewCard.radius
+            : previewCard.deploySpell ? previewCard.deploySpell.radius
+            : (previewCard.healRadius || (previewCardId === 'goblin_hut' ? previewCard.spawnRange : previewCard.range));
+        const isHeal = !!previewCard.healRadius && !previewCard.deploySpell; // 战斗天使登场治疗范围
+        DC.beginPath();
+        DC.arc(game.uiState.mouseX, game.uiState.mouseY, radius, 0, 2 * Math.PI);
+        DC.fillStyle = isHeal
+            ? (canPlace ? pal.healOkFill : pal.healBadFill)
+            : (canPlace ? pal.ringOkFill : pal.ringBadFill);
+        DC.fill();
+        DC.strokeStyle = isHeal ? (canPlace ? pal.healOkStroke : pal.healBadStroke) : (canPlace ? pal.ringOkStroke : pal.ringBadStroke);
+        DC.lineWidth = 2;
+        DC.setLineDash([]);
+        DC.stroke();
+        // 塔类最小射程内圈（如迫击炮75px近身盲区）
+        if (previewCard.type === 'tower' && previewCard.minRange) {
+            DC.beginPath();
+            DC.arc(game.uiState.mouseX, game.uiState.mouseY, previewCard.minRange, 0, 2 * Math.PI);
+            DC.setLineDash([2, 4]);
+            DC.strokeStyle = canPlace ? 'rgba(255,120,80,0.8)' : pal.minRangeBadStroke;
+            DC.lineWidth = 1.5;
+            DC.stroke();
+            DC.setLineDash([]);
+        }
+    } else {
+        drawCrosshair(game.uiState.mouseX, game.uiState.mouseY, canPlace ? pal.crossOk : pal.crossBad);
+    }
+}
+
 /** ⛺ 营地部署预览：索敌圈（橙）+ 巡逻轨道圈（蓝外圈60/淡内圈40），与悬停预览一致；不可部署时整体红化 */
 function drawCampDeployPreview(mx, my, card, canPlace, isRedSide) {
     const detectR = card.campDetectR || 200;
@@ -9395,32 +10268,10 @@ function drawCampDeployPreview(mx, my, card, canPlace, isRedSide) {
     // 非法：整体红/粉红化（与通用部署预览的不可部署状态一致）；合法：保留原橙/蓝样式
     const invStroke = isRedSide ? '#ff6b9d' : '#ef4444';
     const invFill = isRedSide ? 'rgba(255,150,200,0.2)' : 'rgba(255,0,0,0.15)';
-    // 索敌圈（淡橙填充 + 橙虚线 / 非法红化）
-    DC.beginPath();
-    DC.arc(mx, my, detectR, 0, 2 * Math.PI);
-    DC.fillStyle = canPlace ? 'rgba(255,140,0,0.04)' : invFill;
-    DC.fill();
-    DC.setLineDash([10, 6]);
-    DC.strokeStyle = canPlace ? 'rgba(255,140,0,0.6)' : invStroke;
-    DC.lineWidth = 1.5;
-    DC.stroke();
-    // 外圈60（淡蓝填充 + 蓝虚线 / 非法红化）
-    DC.beginPath();
-    DC.arc(mx, my, outerR, 0, 2 * Math.PI);
-    DC.fillStyle = canPlace ? 'rgba(64,156,255,0.07)' : invFill;
-    DC.fill();
-    DC.setLineDash([5, 5]);
-    DC.strokeStyle = canPlace ? 'rgba(64,156,255,0.75)' : invStroke;
-    DC.lineWidth = 1.5;
-    DC.stroke();
-    // 内圈40（淡蓝细虚线 / 非法红化）
-    DC.beginPath();
-    DC.arc(mx, my, innerR, 0, 2 * Math.PI);
-    DC.setLineDash([3, 6]);
-    DC.strokeStyle = canPlace ? 'rgba(64,156,255,0.45)' : invStroke;
-    DC.lineWidth = 1;
-    DC.stroke();
-    DC.setLineDash([]);
+    // 索敌圈 + 巡逻轨道双圈（原语统一，非法红化）
+    drawDetectRing(mx, my, detectR, canPlace, invStroke, invFill);
+    drawPatrolRing(mx, my, outerR, false, canPlace, invStroke, invFill);
+    drawPatrolRing(mx, my, innerR, true, canPlace, invStroke, invFill);
 }
 
 /** 🪏 营地拆除模式预览：选中临时营地卡且鼠标位于己方已部署营地上时，替代营地三圈预览 */
@@ -9647,29 +10498,13 @@ function drawHoverUI() {
     }
 
     // 🛡️ 主塔：守卫巡逻圈（蓝）+ 索敌圈（橙）悬停预览
-    // 巡逻圈半径=70，索敌范围=250（固定值，与 update.js 行为一致）
+    // 巡逻圈/索敌范围与 update.js 共用 config 常量（GUARD_PATROL_R/GUARD_DETECT_R）
     if (e.type === 'main_tower') {
-        const patrolR = 70;    // 巡逻半径（固定70）
-        const detectR = 250;   // 索敌范围（固定250）
-        // 索敌圈（淡橙填充 + 橙虚线）
-        DC.beginPath();
-        DC.arc(e.x, e.y, detectR, 0, 2 * Math.PI);
-        DC.fillStyle = 'rgba(255,140,0,0.04)';
-        DC.fill();
-        DC.setLineDash([10, 6]);
-        DC.strokeStyle = 'rgba(255,140,0,0.6)';
-        DC.lineWidth = 1.5;
-        DC.stroke();
-        // 巡逻圈（淡蓝填充 + 蓝虚线）
-        DC.beginPath();
-        DC.arc(e.x, e.y, patrolR, 0, 2 * Math.PI);
-        DC.fillStyle = 'rgba(64,156,255,0.07)';
-        DC.fill();
-        DC.setLineDash([5, 5]);
-        DC.strokeStyle = 'rgba(64,156,255,0.75)';
-        DC.lineWidth = 1.5;
-        DC.stroke();
-        DC.setLineDash([]);
+        const patrolR = GUARD_PATROL_R;    // 巡逻半径
+        const detectR = GUARD_DETECT_R;    // 索敌范围
+        // 索敌圈 + 巡逻圈（原语统一）
+        drawDetectRing(e.x, e.y, detectR, true, null, null);
+        drawPatrolRing(e.x, e.y, patrolR, false, true, null, null);
         // 标注：主塔下方小标签
         const label = `❌ 巡逻 ${patrolR} · 索敌 ${detectR}`;
         DC.font = '11px sans-serif';
@@ -9691,32 +10526,10 @@ function drawHoverUI() {
         const innerR = tracks[0] !== undefined ? tracks[0] : 40; // 内圈40
         const cap = CARDS.camp.campCapacity || 2;
         const used = (game.entities || []).filter(en => en._campFlag && en._campId === e.id && en.hp > 0).length;
-        // 索敌圈（淡橙填充 + 橙虚线）
-        DC.beginPath();
-        DC.arc(e.x, e.y, detectR, 0, 2 * Math.PI);
-        DC.fillStyle = 'rgba(255,140,0,0.04)';
-        DC.fill();
-        DC.setLineDash([10, 6]);
-        DC.strokeStyle = 'rgba(255,140,0,0.6)';
-        DC.lineWidth = 1.5;
-        DC.stroke();
-        // 外圈60（原50样式：淡蓝填充 + 蓝虚线）
-        DC.beginPath();
-        DC.arc(e.x, e.y, outerR, 0, 2 * Math.PI);
-        DC.fillStyle = 'rgba(64,156,255,0.07)';
-        DC.fill();
-        DC.setLineDash([5, 5]);
-        DC.strokeStyle = 'rgba(64,156,255,0.75)';
-        DC.lineWidth = 1.5;
-        DC.stroke();
-        // 内圈40（淡蓝细虚线，继续沿用淡色）
-        DC.beginPath();
-        DC.arc(e.x, e.y, innerR, 0, 2 * Math.PI);
-        DC.setLineDash([3, 6]);
-        DC.strokeStyle = 'rgba(64,156,255,0.45)';
-        DC.lineWidth = 1;
-        DC.stroke();
-        DC.setLineDash([]);
+        // 索敌圈 + 巡逻轨道双圈（原语统一）
+        drawDetectRing(e.x, e.y, detectR, true, null, null);
+        drawPatrolRing(e.x, e.y, outerR, false, true, null, null);
+        drawPatrolRing(e.x, e.y, innerR, true, true, null, null);
         // 标注：营地下方小标签（名额 x/2）
         const label = `⛺ 名额 ${used}/${cap} · 轨道 ${tracks.join('/')} · 索敌 ${detectR}`;
         DC.font = '11px sans-serif';

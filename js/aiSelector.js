@@ -29,6 +29,7 @@ const AI_BUILTIN_FILES = { test: 'ai测试组.js', goblin: 'ai哥布林组.js', 
 const AI_BUILTIN_GLOBALS = { test: 'AIGroupTest', goblin: 'AIGroupGoblin', GEMINI: 'AIGroupGEMINI' };
 
 const AI_CUSTOM_GROUPS_KEY = 'towerwar_ai_custom_groups';
+const AI_SELECTED_GROUP_KEY = 'towerwar_ai_group';      // 当前选中行为组 id（原 2 处字面量收敛）
 
 /** 注册一个行为组（自定义组文件加载后调用；id 冲突会覆盖，创建时已做查重） */
 function registerAIGroup(id, module) {
@@ -49,7 +50,11 @@ function getCustomGroupRecords() {
 function addCustomGroupRecord(rec) {
     const list = getCustomGroupRecords();
     if (!list.some(r => r.id === rec.id)) list.push(rec);
-    localStorage.setItem(AI_CUSTOM_GROUPS_KEY, JSON.stringify(list));
+    try {
+        localStorage.setItem(AI_CUSTOM_GROUPS_KEY, JSON.stringify(list));
+    } catch (e) {
+        console.warn('[aiSelector] 自定义组记录写入失败（隐私模式/存储已满）:', e);
+    }
 }
 
 /** 启动时动态加载所有已记录的自定义组文件（js/aixx.js）；加载后由文件内 registerAIGroup 自注册 */
@@ -73,7 +78,7 @@ function buildAiGroupTemplate(name, id, file) {
         ' * 指导文件：' + file,
         ' *',
         ' * ⚠️ 提示：请自己编写本文件的行为逻辑！',
-        ' * 完整范例参考：js/ai配置/ai测试组.js（gatherIntel 侦察 / chooseCard 选牌 / deploy 部署）。',
+        ' * 完整范例参考：js/ai配置/ai测试组.js（gatherIntel 侦察 / chooseCard 选牌 / dispatchCommand 部署）。',
         ' * 使用步骤：编写 → 保存到 js/ai配置/ 目录 → 刷新页面 → 在「人机选择」中选用。',
         ' * 只要语法没问题即可直接运行，无需修改任何其它文件（也不要手动加 script 标签）。',
         ' */',
@@ -94,12 +99,16 @@ function buildAiGroupTemplate(name, id, file) {
 
 /** 当前选中的行为组 id（默认 1测试组） */
 function getSelectedAIGroup() {
-    return localStorage.getItem('towerwar_ai_group') || 'test';
+    return localStorage.getItem(AI_SELECTED_GROUP_KEY) || 'test';
 }
 
 /** 设置当前选中的行为组 id（持久化） */
 function setSelectedAIGroup(gid) {
-    localStorage.setItem('towerwar_ai_group', gid);
+    try {
+        localStorage.setItem(AI_SELECTED_GROUP_KEY, gid);
+    } catch (e) {
+        console.warn('[aiSelector] 选中行为组写入失败（隐私模式/存储已满）:', e);
+    }
 }
 
 /** 经典人机决策入口（update.js 每2秒调用）→ 转发到当前选中的行为组（找不到就回退第一个可用组） */

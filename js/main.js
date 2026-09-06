@@ -98,7 +98,7 @@ document.getElementById('localMultiBtn').addEventListener('click', () => {
 });
 
 // ---- 页面切换：主页 → 🧪 测试双人（本机）——gameMode 复用 'local_multi'（自动继承跳过AI/双面板/圣水冷却刷新等全部行为），
-//      唯一差异：detect220=true → 发现锁敌收窄到220（config MODE_TEST_DETECT_R），圈外无敌原地待机 ----
+//      唯一差异：detect220=true → 发现锁敌收窄到330（config MODE_TEST_DETECT_R），圈外无敌原地待机 ----
 document.getElementById('testLocalMultiBtn').addEventListener('click', () => {
     game.gameMode = 'local_multi';
     homePage.style.display = 'none';
@@ -120,7 +120,7 @@ document.getElementById('testLocalMultiBtn').addEventListener('click', () => {
 });
 
 // ---- 页面切换：主页 → 🧪 测试模板1——照抄经典双人（本机）全套（标准图1600/标准河道/无桥无行军），仅两点差异：
-//      ① detect220=true → 发现锁敌收窄 220/440（findTarget/火豆/出圈弃锁三处索敌 gate；圈内无敌原地待机，无行军兜底）
+//      ① detect220=true → 发现锁敌收窄 330/440（findTarget/火豆/出圈弃锁三处索敌 gate；圈内无敌原地待机，无行军兜底）
 //      ② noBastion=true → 开局不创建四个堡垒（堡垒虚线同步不画；丢堡推进线因丢堡数恒0天然失效）----
 document.getElementById('testTemplate1Btn').addEventListener('click', () => {
     game.gameMode = 'local_multi';
@@ -167,6 +167,7 @@ const listRoomsBtn = document.getElementById('listRoomsBtn');
 
 // 昵称记忆（localStorage）
 const ONLINE_NAME_KEY = 'towerwar_online_name';
+const FPS_LIMIT_KEY = 'towerwar_fps_limit';  // 帧率上限持久化键（原 4 处字面量收敛）
 function getSavedOnlineName() {
     try { return localStorage.getItem(ONLINE_NAME_KEY) || ''; } catch (e) { return ''; }
 }
@@ -460,14 +461,7 @@ const aboutSteps = [
     { img: '整活/jk抱膝.png',     text: '（期待未續……）', right: true },
 ];
 let aboutStepIndex = 0;
-function showAboutStep(i) {
-    aboutStepIndex = i;
-    const step = aboutSteps[i];
-    aboutCharImg.classList.toggle('char-right', !!step.right);
-    showOverlayStep(step.img, step.text);
-    aboutDialogNext.style.display = 'block';
-    aboutOptions.style.display = 'none';
-}
+// （注：此处曾有一份被下方同名定义遮蔽的死代码 showAboutStep，已删除——JS 后声明的同名函数覆盖前者）
 
 function showAboutStep(i) {
     aboutStepIndex = i;
@@ -855,6 +849,7 @@ function startGameWithPreset(preset) {
     document.querySelector('.top-bar span:last-child').textContent = '🤖 AI对战 (LLM)';
     renderCardPanel('deck'); // 只显示卡组中的牌
     resetGame();
+    syncCanvasSize(); // 🖼️ 与其它开局入口对齐：从"测试双人"(W=1400)切入时画布必须跟随 resetGame 后的 W 重设，否则坐标映射/渲染错位
 }
 
 // ---- 编辑/添加弹窗 ----
@@ -971,7 +966,7 @@ document.getElementById('backToHomeBtn').addEventListener('click', goBackHome);
 // ---- 帧率限制设置（0=不限制，60/30，localStorage 记忆）----
 let fpsLimit = 0;
 try {
-    fpsLimit = parseInt(localStorage.getItem('towerwar_fps_limit') || '0', 10) || 0;
+    fpsLimit = parseInt(localStorage.getItem(FPS_LIMIT_KEY) || '0', 10) || 0;
     if (!fpsLimit && typeof TOWERWAR_USERDATA !== 'undefined' && TOWERWAR_USERDATA.settings) {
         // 本地无设置：回退读取「個人データ.js」（私人数据文件，可删除）中的设置
         fpsLimit = parseInt(TOWERWAR_USERDATA.settings.fpsLimit || '0', 10) || 0;
@@ -985,9 +980,12 @@ let tickAccumulator = 0;    // 累计未消费的逻辑时间（秒）
 
 function gameLoop(ts) {
     requestAnimationFrame(gameLoop);   // 先注册下一帧，跳帧时才不会断循环
+    renderClockSec = ts / 1000;        // 更新渲染时钟（视觉动画相位用，60fps 平滑；不影响逻辑）
     // 帧率上限：rAF 时间节流（未到间隔就跳过本帧；0=不限制）——只管渲染帧率，与逻辑 tick 解耦
     if (fpsLimit > 0) {
-        if (ts - lastFrameTs < 1000 / fpsLimit) return;
+        // -1.5ms 容差：rAF 时间戳有 ±1ms 级抖动，「恰好 N 倍间隔」的判定卡在阈值边缘时会
+        // 偶发多跳一帧（如 60Hz 屏选 30FPS 打出 50ms/16ms 交替抖动）；容差让步进锁定在稳定节奏
+        if (ts - lastFrameTs < 1000 / fpsLimit - 1.5) return;
         lastFrameTs = ts;
     }
     if (gamePage.style.display === 'flex') {
@@ -1033,7 +1031,7 @@ requestAnimationFrame(gameLoop);
     sel.value = String(fpsLimit);
     sel.addEventListener('change', () => {
         fpsLimit = parseInt(sel.value, 10) || 0;
-        try { localStorage.setItem('towerwar_fps_limit', String(fpsLimit)); } catch (e) { /* ignore */ }
+        try { localStorage.setItem(FPS_LIMIT_KEY, String(fpsLimit)); } catch (e) { /* ignore */ }
     });
 })();
 
@@ -1054,11 +1052,11 @@ function doExportUserDataFile() {
     const safeGet = (fn, fallback) => { try { return fn(); } catch (e) { return fallback; } };
     const data = {
         presets: safeGet(() => (typeof getPresets === 'function' ? getPresets() : []), []),
-        activePresetId: safeGet(() => localStorage.getItem('towerwar_active_preset_id'), null),
+        activePresetId: safeGet(() => localStorage.getItem(PRESET_ACTIVE_KEY), null),
         decks: safeGet(() => (typeof getDecks === 'function' ? getDecks() : []), []),
-        activeDeckId: safeGet(() => localStorage.getItem('towerwar_active_deck_id'), null),
+        activeDeckId: safeGet(() => localStorage.getItem(DECK_ACTIVE_KEY), null),
         settings: {
-            fpsLimit: safeGet(() => parseInt(localStorage.getItem('towerwar_fps_limit') || '0', 10) || 0, 0)
+            fpsLimit: safeGet(() => parseInt(localStorage.getItem(FPS_LIMIT_KEY) || '0', 10) || 0, 0)
         }
     };
     const content = `/* ============================================================
@@ -1142,17 +1140,17 @@ function importUserDataFile() {
                     nPreset = obj.presets.length;
                 }
                 if (obj.activePresetId !== undefined && obj.activePresetId !== null) {
-                    try { localStorage.setItem('towerwar_active_preset_id', String(obj.activePresetId)); } catch (e) {}
+                    try { localStorage.setItem(PRESET_ACTIVE_KEY, String(obj.activePresetId)); } catch (e) {}
                 }
                 if (Array.isArray(obj.decks)) {
                     if (typeof setDecks === 'function') setDecks(obj.decks);
                     nDeck = obj.decks.length;
                 }
                 if (obj.activeDeckId !== undefined && obj.activeDeckId !== null) {
-                    try { localStorage.setItem('towerwar_active_deck_id', String(obj.activeDeckId)); } catch (e) {}
+                    try { localStorage.setItem(DECK_ACTIVE_KEY, String(obj.activeDeckId)); } catch (e) {}
                 }
                 if (obj.settings && obj.settings.fpsLimit !== undefined) {
-                    try { localStorage.setItem('towerwar_fps_limit', String(obj.settings.fpsLimit)); } catch (e) {}
+                    try { localStorage.setItem(FPS_LIMIT_KEY, String(obj.settings.fpsLimit)); } catch (e) {}
                 }
                 alert('✅ 导入成功！\n\n预设 ' + nPreset + ' 个 / 卡组 ' + nDeck + ' 套 / 设置已恢复\n\n请刷新页面（F5）让数据生效。');
             } catch (e) {

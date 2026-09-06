@@ -1,5 +1,12 @@
 /* ===== entities.js — 实体创建与基础操作 ===== */
 
+/** 🌊 河道地图（shrink220）半场制部署：某队上半堡垒（y<H/2=350，堡垒 y 固定上185/下515）是否仍存活——
+ *  "哪半被爆"由存活实体实时推断，无需持久状态（只读 game.entities，entities.js 有权读） */
+function riverHalfBastionTopAlive(team) {
+    return game.entities.some(e => e.type === 'bastion' && e.team === team && e.hp > 0 && e.y < H / 2);
+}
+
+
 /** 创建实体（分配唯一 id，合并基础属性） */
 function createEntity(base) {
     // 通用护盾字段兜底：任何实体创建统一带上 shield/maxShield（无盾则0）
@@ -119,7 +126,7 @@ function finishChargeBlocked(attacker, target, context) {
 /** 🔮 法术屏障：检查 (x,y) 是否落在【敌方】法术屏障的庇护范围内（敌方不能在该区域释放法术） */
 function isSpellBlockedByBarrier(casterTeam, x, y) {
     const enemyTeam = casterTeam === 'player' ? 'ai' : 'player';
-    const barrierRange = (CARDS.spell_barrier && CARDS.spell_barrier.barrierRange) || 200;
+    const barrierRange = (CARDS.spell_barrier && CARDS.spell_barrier.barrierRange) || 185; // 兜底对齐 config 的 185（旧值 200 已失效）
     for (const e of game.entities) {
         if (e.cardId === 'spell_barrier' && e.team === enemyTeam && e.hp > 0) {
             if (Math.hypot(e.x - x, e.y - y) <= barrierRange) return true;
@@ -146,12 +153,55 @@ function applyTempleBlessDiscount(team) {
     t.blessCost = Math.max(1, (t.blessCost != null ? t.blessCost : 11) - 1);
 }
 
-/** 🔮 法术屏障费用递增：场上每多1座己方屏障，费用+2（部署时动态计算） */
+/** 🔮 法术屏障费用递增：场上每多1座己方屏障，费用+2（部署时动态计算）。
+ *  计数含 game.deploying 中同队在途屏障（屏障 deployDelay 2.5s 期间不在 entities，
+ *  不计在途则可被低费连放绕过递增；镜像复制路径走同一函数自动受益） */
 function getCardCost(team, cardId) {
     const base = (CARDS[cardId] && CARDS[cardId].cost) || 0;
     if (cardId !== 'spell_barrier') return base;
-    const count = game.entities.filter(e => e.cardId === 'spell_barrier' && e.team === team && e.hp > 0).length;
-    return base + count * 2;
+    const onField = game.entities.filter(e => e.cardId === 'spell_barrier' && e.team === team && e.hp > 0).length;
+    const inFlight = game.deploying.filter(d => d.cardId === 'spell_barrier' && d.team === team).length;
+    return base + (onField + inFlight) * 2;
+}
+
+/** 🪞 镜像费用统一公式：被复制卡费用+1（屏障按动态费用）。
+ *  deploy() 扣费 / 联机预检 / ui.js 费用预览三处共用，防止公式多处手抄走样 */
+function getMirrorCost(team, lastId) {
+    const orig = CARDS[lastId];
+    if (!orig) return 0;
+    return (lastId === 'spell_barrier' ? getCardCost(team, lastId) : orig.cost) + 1;
+}
+
+/** 圣水扣费统一入口：阵营圣水只在 game.elixir 字典上动账（deploy/castActiveSkill 内 7 处样板收敛） */
+function spendElixir(team, amount) {
+    if (team === 'player') game.elixir.player -= amount;
+    else game.elixir.ai -= amount;
+}
+
+/** 🗺️ deploy 用的 canDeployHere 尾参（测试双人 shrink220 地图 gate 全套）——镜像/普通两路共用，防两处漂移 */
+function deployBoundsArgs() {
+    return [
+        game.shrink220 ? MODE_TEST_RIVER_LEFT : RIVER_LEFT,
+        game.shrink220 ? MODE_TEST_RIVER_RIGHT : RIVER_RIGHT,
+        game.shrink220 ? MODE_TEST_AI_BASTION_TOP.x : AI_BASTION_TOP.x,
+        game.shrink220,                                            // 🌊 halfMode：河道地图丢堡扩展改半场制（其他模式 false=全高老逻辑）
+        game.shrink220 && !riverHalfBastionTopAlive('ai'),         // 🌊 AI 上半堡垒已被爆
+        game.shrink220 && !riverHalfBastionTopAlive('player'),     // 🧪测试双人：河道减半+整图缩窄（shrink220 地图类 gate；模板1 标准图走标准值）
+    ];
+}
+
+/** ★ 卡组限制统一判定：deck 模式只约束玩家、api 模式双方都约束、联机卡组局双方都约束；
+ *  卡牌不在对应卡组内 → true。deploy() 的镜像分支与普通分支（原四处重复检查）收敛至此 */
+function isCardLockedByDeck(team, cardId) {
+    if (game.gameMode === 'deck' && team !== 'player') return false;        // deck 模式只限玩家
+    if (game.gameMode === 'deck' || game.gameMode === 'api') return !getActiveDeckCards().includes(cardId);
+    // 🔗 联机卡组局：按执行阵营取开局上报的卡组（NET_MY_DECK/NET_OPP_DECK），
+    //    不能读本地 getActiveDeckCards()——对端指令在本机执行时，本机 localStorage 卡组与对端无关
+    if (game.gameMode === 'online' && isOnlineDeckMode()) {
+        const deck = (team === myOnlineTeam()) ? NET_MY_DECK : NET_OPP_DECK;
+        return !Array.isArray(deck) || !deck.includes(cardId);
+    }
+    return false;  // 其余模式不设卡组限制
 }
 
 function deploy(cardId, team, x, y) {
@@ -164,32 +214,22 @@ function deploy(cardId, team, x, y) {
     // ★ 镜像法术：复制上一次部署的卡牌（费用+1）
     if (cardId === 'mirror') {
         const lastId = getMirrorCopiedCard(team);
-        if (!lastId || lastId === 'mirror' || !CARDS[lastId]) {
+        if (!lastId || !CARDS[lastId]) {
             game.uiState.deployFailReason = 'invalid';
             return false;
         }
         const origCard = CARDS[lastId];
-        // 🔮 镜像复制屏障：费用跟随屏障动态费用+1（屏障6→镜像7，屏障8→镜像9）
-        const mirrorCost = (lastId === 'spell_barrier' ? getCardCost(team, lastId) : origCard.cost) + 1;
+        // 🔮 镜像复制屏障：费用跟随屏障动态费用+1（屏障6→镜像7，屏障8→镜像9）——公式统一在 getMirrorCost
+        const mirrorCost = getMirrorCost(team, lastId);
         const elixir = team === 'player' ? game.elixir.player : game.elixir.ai;
         if (elixir < mirrorCost) {
             game.uiState.deployFailReason = 'elixir';
             return false;
         }
         // ★ 卡组模式：镜像法术同样受卡组限制（需卡组包含镜像法术，避免绕过卡组检查）
-        if (game.gameMode === 'deck' && team === 'player') {
-            const deckCards = getActiveDeckCards();
-            if (!deckCards.includes('mirror')) {
-                game.uiState.deployFailReason = 'invalid';
-                return false;
-            }
-        }
-        if (game.gameMode === 'api') {
-            const deckCards = getActiveDeckCards();
-            if (!deckCards.includes('mirror')) {
-                game.uiState.deployFailReason = 'invalid';
-                return false;
-            }
+        if (isCardLockedByDeck(team, 'mirror')) {
+            game.uiState.deployFailReason = 'invalid';
+            return false;
         }
         // 检查镜像自身的冷却
         const cd = getMirrorCooldown(team);
@@ -210,10 +250,9 @@ function deploy(cardId, team, x, y) {
         // ★ ⛺ 镜像营地拆除：镜像上次部署的营地，点击己方已部署营地 → 消耗镜像标价（原价+1）直接拆除
         if (lastId === 'camp') {
             const ownCamp = game.entities.find(e => e.cardId === 'camp' && e.team === team && e.hp > 0
-                && Math.abs(e.x - x) <= 15 && Math.abs(e.y - y) <= 15);
+                && Math.abs(e.x - x) <= 30 && Math.abs(e.y - y) <= 30);
             if (ownCamp) {
-                if (team === 'player') game.elixir.player -= mirrorCost;
-                else game.elixir.ai -= mirrorCost;
+                spendElixir(team, mirrorCost);
                 ownCamp.hp = 0; // 标记死亡 → update.js 统一清理；被收编成员下一帧因营地消失自动解除🚩
                 // ★ 镜像拆除营地同样进入冷却（继承营地冷却），不能无限拆
                 setMirrorCooldown(team, origCard.cooldown || 0);
@@ -222,8 +261,7 @@ function deploy(cardId, team, x, y) {
         }
         // 检查部署位置（使用原始卡牌的规则）
         if (!canDeployHere(lastId, team, x, y, game.entities, game.bastionsLost.ai, game.bastionsLost.player,
-            game.shrink220 ? MODE_TEST_RIVER_LEFT : RIVER_LEFT, game.shrink220 ? MODE_TEST_RIVER_RIGHT : RIVER_RIGHT,
-            game.shrink220 ? MODE_TEST_AI_BASTION_TOP.x : AI_BASTION_TOP.x)) { // 🧪测试双人：河道减半+整图缩窄（shrink220 地图类 gate；模板1 标准图走标准值）
+            ...deployBoundsArgs())) {
             game.uiState.deployFailReason = 'position';
             return false;
         }
@@ -250,8 +288,7 @@ function deploy(cardId, team, x, y) {
                 return false;
             }
             // 扣镜像费（烟引1费+1=2费）
-            if (team === 'player') game.elixir.player -= mirrorCost;
-            else game.elixir.ai -= mirrorCost;
+            spendElixir(team, mirrorCost);
             // 镜像冷却继承烟引（15s），但 pending 期间不读秒——放烟/超时才真正开始
             clearMirrorCooldown(team);   // 先清除，pending 结束时再设
             // 加入部署延迟队列（用烟引的0.2s延迟）
@@ -267,8 +304,7 @@ function deploy(cardId, team, x, y) {
         }
 
         // 扣除圣水（按镜像费用）
-        if (team === 'player') game.elixir.player -= mirrorCost;
-        else game.elixir.ai -= mirrorCost;
+        spendElixir(team, mirrorCost);
         // 🛕 哥布林神庙·神赐：镜像复制哥布林卡也计入「使用哥布林卡」→ 在场神庙神赐费用-1
         if (origCard.goblin) applyTempleBlessDiscount(team);
 
@@ -308,21 +344,10 @@ function deploy(cardId, team, x, y) {
         return true;
     }
 
-    // ★ 卡组对战：玩家只能部署卡组中的卡牌
-    if (game.gameMode === 'deck' && team === 'player') {
-        const deckCards = getActiveDeckCards();
-        if (!deckCards.includes(cardId)) {
-            game.uiState.deployFailReason = 'invalid';
-            return false;
-        }
-    }
-    // ★ AI对战：双方都只能部署卡组中的卡牌
-    if (game.gameMode === 'api') {
-        const deckCards = getActiveDeckCards();
-        if (!deckCards.includes(cardId)) {
-            game.uiState.deployFailReason = 'invalid';
-            return false;
-        }
+    // ★ 卡组对战：deck 模式限玩家、api 模式双方，只能部署卡组中的卡牌（统一走 isCardLockedByDeck）
+    if (isCardLockedByDeck(team, cardId)) {
+        game.uiState.deployFailReason = 'invalid';
+        return false;
     }
 
     // ★ 🧭 烟引法术·第一段（选范围→套buff进pending）：
@@ -350,8 +375,7 @@ function deploy(cardId, team, x, y) {
             return false;
         }
         // 扣费（此时不进冷却，不注册 lastDeployedCardId）
-        if (team === 'player') game.elixir.player -= card.cost;
-        else game.elixir.ai -= card.cost;
+        spendElixir(team, card.cost);
         // 加入部署延迟队列（0.2s后由 finishDeployItem 套buff进pending）
         game.deploying.push({
             cardId: 'smoke_guide', team, x, y,
@@ -386,6 +410,12 @@ function deploy(cardId, team, x, y) {
             game.uiState.deployFailReason = 'elite_used';
             return false;
         }
+        // 🕊️ 死亡冷却期间同样不可部署（此前只挡 mode，死亡恢复时 mode 本就是 deploy，
+        //    点黑卡可绕过冷却直接再部署——全部精英卡通修）
+        if (st && st.mode === 'deploy' && st.cdLeft > 0) {
+            game.uiState.deployFailReason = 'cooldown';
+            return false;
+        }
     }
 
     // 🛕 哥布林神庙：每方最多同时存在1座（含🪞镜像复制、部署延迟在途），场上/在途已有神庙则拒绝部署
@@ -401,18 +431,16 @@ function deploy(cardId, team, x, y) {
     // ★ ⛺ 临时营地拆除：选中营地卡点击己方已部署的营地 → 消耗圣水（与部署同费）直接拆除该营地
     if (cardId === 'camp') {
         const ownCamp = game.entities.find(e => e.cardId === 'camp' && e.team === team && e.hp > 0
-            && Math.abs(e.x - x) <= 15 && Math.abs(e.y - y) <= 15);
+            && Math.abs(e.x - x) <= 30 && Math.abs(e.y - y) <= 30);
         if (ownCamp) {
-            if (team === 'player') game.elixir.player -= card.cost;
-            else game.elixir.ai -= card.cost;
+            spendElixir(team, card.cost);
             ownCamp.hp = 0; // 标记死亡 → update.js 统一清理；被收编成员下一帧因营地消失自动解除🚩
             return true;
         }
     }
 
     if (!canDeployHere(cardId, team, x, y, game.entities, game.bastionsLost.ai, game.bastionsLost.player,
-        game.shrink220 ? MODE_TEST_RIVER_LEFT : RIVER_LEFT, game.shrink220 ? MODE_TEST_RIVER_RIGHT : RIVER_RIGHT,
-        game.shrink220 ? MODE_TEST_AI_BASTION_TOP.x : AI_BASTION_TOP.x)) { // 🧪测试双人：河道减半+整图缩窄（shrink220 地图类 gate；模板1 标准图走标准值）
+        ...deployBoundsArgs())) {
         game.uiState.deployFailReason = 'position';
         return false;
     }
@@ -424,8 +452,7 @@ function deploy(cardId, team, x, y) {
     }
 
     // 扣除圣水
-    if (team === 'player') game.elixir.player -= deployCost;
-    else game.elixir.ai -= deployCost;
+    spendElixir(team, deployCost);
     // 🛕 哥布林神庙·神赐：使用哥布林卡牌 → 在场神庙神赐费用-1（最低1费）
     if (card.goblin) applyTempleBlessDiscount(team);
 
@@ -581,7 +608,12 @@ function finishDeployItem(item) {
         const duplicateDeploy = game.deploying.some(d => d !== item && d.isMirrored
             && d.cardId === item.cardId && d.team === item.team);
         // 技能槽令牌必须匹配当前部署项；已有实体或其他在途项存在时，当前项取消且不触碰合法项状态
-        if (!tokenMatches || duplicateEntity || duplicateDeploy) return;
+        if (!tokenMatches || duplicateEntity || duplicateDeploy) {
+            // 🪞 校验失败：deploy() 已扣镜像费，这里退还圣水（不静默吞费）
+            game.elixir[item.team] = Math.min(game.maxElixir,
+                (game.elixir[item.team] || 0) + getMirrorCost(item.team, item.cardId));
+            return;
+        }
         item._mirrorValidated = true;
     }
 
@@ -605,6 +637,11 @@ function finishDeployItem(item) {
                 cardId: item.cardId, team: item.team, x: item.x, y: item.y,
                 timer: tunnelTime, totalDelay: tunnelTime,
                 isPlayer: item.isPlayer, _tunnelDone: true,
+                // 🪞 重入队必须透传镜像/神庙标记：丢失会导致镜像矿工/钻机生成实体后 isMirrored 恒 undefined，
+                //   镜像死亡结算、场上镜像标记、神庙神赐虚影全部落空
+                isMirrored: item.isMirrored,
+                mirrorDeployToken: item.mirrorDeployToken,
+                templeBlessed: item.templeBlessed,
             });
             return;
         }
@@ -621,6 +658,10 @@ function finishDeployItem(item) {
                 cardId: item.cardId, team: item.team, x: item.x, y: item.y,
                 timer: digTime, totalDelay: digTime,
                 isPlayer: item.isPlayer, _tunnelDone: true, _dugSpawn: true,
+                // 🪞 同上：透传镜像/神庙标记（见第一段重入队注释）
+                isMirrored: item.isMirrored,
+                mirrorDeployToken: item.mirrorDeployToken,
+                templeBlessed: item.templeBlessed,
             });
             return;
         }
@@ -687,9 +728,14 @@ function finishDeployItem(item) {
                 shield: unit.shield || 0,
                 canHitAir: unit.canHitAir || false,
             });
-            // 暗夜女巫/女巫：附带召唤计时器
-            if (item.cardId === 'night_witch' || item.cardId === 'witch') {
+            // 暗夜女巫/女巫/火熔炉：附带召唤计时器（tickSpawner 需要 spawnTimer 从 0 起算）
+            if (item.cardId === 'night_witch' || item.cardId === 'witch' || item.cardId === 'fire_furnace') {
                 entity.spawnTimer = 0;
+            }
+            // 附魔巨人：附魔名单与检查计时器（落地即触发首次附魔）
+            if (item.cardId === 'enchant_giant') {
+                entity._enchantIds = [];
+                entity._enchantCheckTimer = 0;
             }
             // 冥王：灵魂计数器与等级
             if (item.cardId === 'hades') {
@@ -699,6 +745,12 @@ function finishDeployItem(item) {
                 entity._maxLevel = 10;
                 entity._baseHp = entity.hp;
                 entity._baseAtk = entity.atk;
+            }
+            // 📖 读书人：自带20%暴击率（極期间升到40%）+ 蓄力条（每4次攻击释放一次随机书灵技能）+ 閃第二条命
+            if (item.cardId === 'scholar') {
+                entity._scholarCritRate = 0.2;
+                entity._scholarCharge = 0;
+                entity._scholarSecondLife = true; // 受致命攻击时保留1血并再次触发閃（一条命仅一次）
             }
             // 地狱飞龙：光束灼烧字段初始化（攻击模式复用地狱塔）
             if (item.cardId === 'inferno_dragon') {
@@ -718,6 +770,10 @@ function finishDeployItem(item) {
             // 火豆：标记为火豆
             if (item.cardId === 'fire_bean') {
                 entity._fireBean = true;
+            }
+            // 疗豆：标记为疗豆（行为照抄火豆，自爆结算不同：单体伤害+友军治疗buff）
+            if (item.cardId === 'heal_bean') {
+                entity._healBean = true;
             }
             // 幽灵：初始隐身 + 计时器
             if (item.cardId === 'ghost') {
@@ -941,7 +997,7 @@ function finishDeployItem(item) {
             atk: card.atk, atkSpeed: card.atkSpeed, atkCooldown: 0,
             range: card.range, splash: card.splash || 0,
             minRange: card.minRange || 0,
-            onlyGround: card.onlyGround || false,
+            groundOnly: card.groundOnly || false,  // 🎯 只对地标记统一为 groundOnly（2026-09 审计：原塔路径写 onlyGround 且无消费方，对地判定靠 update.js 硬编码名单）
             flying: card.flying || false,   // 🕊️ 空中塔（如法术屏障）：实体带 flying 标记，地面/滚木/地震等只对地伤害全部免疫
             hitRadius: 15,  // 受击半径（匹配30×30视觉半宽，贴边即可攻击）
         });
@@ -1131,7 +1187,7 @@ function createWoodStake(x, y, team) {
         x: x, y: y, hp: card.hp, maxHp: card.hp,
         atk: 0, atkSpeed: 0, atkCooldown: 0,
         range: 0, splash: 0, minRange: 0,
-        onlyGround: false, flying: false,
+        groundOnly: false, flying: false,
         hitRadius: 15,       // 建筑受击半径（与临时营地同款）
         targetId: null,
         _isSpawned: true,    // 召唤物标记（非卡牌部署）
@@ -1216,6 +1272,21 @@ function applySpellDamage(cardId, casterTeam, x, y) {
         });
         // 释放瞬间特效：落点处淡淡滚木虚影（提示起始位置）
         game.spellEffects.push({ x, y, char: '🪵', size: 16, timer: 0.5, maxTimer: 0.5, color: 'rgba(150,105,60,0.55)' });
+        return;
+    }
+
+    // ---- 🪦 骷髅召唤：在施放点布下墓土圈，持续9.1s每0.7s随机破土召唤一只骷髅（共13只，无伤害；实际召唤在 update.js tickMultiStrikeQueue）----
+    if (cardId === 'skeleton_summon') {
+        game.skeletonSummonZones.push({
+            x, y,
+            radius: card.radius || 85,
+            team: casterTeam,
+            strikesLeft: card.strikes || 13,
+            interval: card.strikeInterval || 0.7,
+            timer: card.firstStrikeDelay || 0.7, // 首只0.7s后出土，第13只正好在9.1s
+        });
+        // 施放特效：墓土圈闪现（淡紫提示环，复用范围环体系）
+        game.deployEffects.push({ x, y, radius: card.radius || 85, timer: 0.5, maxTimer: 0.5, color: '186,104,200', static: true });
         return;
     }
 
@@ -1309,6 +1380,7 @@ function applySpellDamage(cardId, casterTeam, x, y) {
             if (e.hp <= 0 || e.team !== casterTeam) continue;
             if (e.type !== 'troop' && e.type !== 'healer') continue;
             if (e.isCopy) continue;   // 🔷 复制体不会被复制法术复制
+            if (e._spiritClone) continue; // 📖 靈紫色克隆体同样不被复制法术复制
             if (dist(e, { x, y }) > radius) continue;
             targets.push(e);
         }
@@ -1629,7 +1701,7 @@ function applySpellDamage(cardId, casterTeam, x, y) {
         return;
     }
 
-    // ---- 地震法术：持续3秒三段伤害，对建筑5倍 ----
+    // ---- 地震法术：持续3秒三段伤害，对建筑10倍（config: towerDmgMul=10；主塔/堡垒除外）----
     if (cardId === 'earthquake') {
         // 落点起震特效
         game.spellEffects.push({ x, y, char: '💥', size: 36, timer: 0.5, maxTimer: 0.5 });
@@ -1684,6 +1756,49 @@ function applySpellDamage(cardId, casterTeam, x, y) {
         return;
     }
 
+    // ---- 🌿 藤蔓：缠绕范围内生命值最高的3名敌方单位，70伤害 + 眩晕💫2.5秒 + 飞行单位暂时拽落地面2.5秒 ----
+    if (cardId === 'vine') {
+        const radius = card.radius || 48;
+        // 收集范围内敌方单位（不锁定隐身/界域隐身/未露头单位，同大雷电锁定规则）
+        const candidates = game.entities.filter(e =>
+            e.team !== casterTeam && e.hp > 0 && !e._headHidden && !e._stealthed && !e._realmHidden
+            && dist(e, { x, y }) <= radius
+        );
+        // 按生命值降序取前3名（同大雷电）
+        const targets = candidates.sort((a, b) => b.hp - a.hp).slice(0, card.topHpTargets || 3);
+        // 释放特效：绿色脉冲 + 叶片粒子（空场也播放，标记落点）
+        game.spellEffects.push({ x, y, char: '🌿', size: 44, timer: 0.8, maxTimer: 0.8, isPulse: true });
+        for (let i = 0; i < 8; i++) {
+            game.spellEffects.push({
+                x: x + (rand() - 0.5) * radius * 2,
+                y: y + (rand() - 0.5) * radius * 2,
+                char: '🌿', size: 12 + rand() * 8,
+                timer: 0.4 + rand() * 0.4,
+                maxTimer: 0.8,
+            });
+        }
+        // 范围内无单位 → 不缠绕（同大雷电"范围内无单位则不劈"）
+        if (targets.length === 0) return;
+        for (let e of targets) {
+            // 伤害：防御工事按 towerDmgMul 减半，统一走 calcActualDmg（框架第13条），无攻击者狂暴
+            const dmg = calcActualDmg(e.fortification ? card.damage * (card.towerDmgMul || 0.5) : card.damage, null, e);
+            e.hp -= dmg;
+            spawnDmgNum(e.x, e.y - 20, dmg);
+            game.spellEffects.push({ x: e.x, y: e.y, char: '🌿', size: 22, timer: 0.6, maxTimer: 0.6 });
+            if (e.hp <= 0) continue; // 已被缠死，不再施加控制（死亡清理统一走 update.js）
+            // 💫 眩晕2.5秒（统一硬控入口，塔类眩晕同样暂停攻击）
+            applyHardControl(e, 'stun', card.stunDuration || 2.5);
+            // 🌿 暂时变为地面单位：眩晕打断回调执行后记录原飞行状态并落地，到期由 update.js 帧循环恢复
+            //（仅兵种生效；若期间御剑等机制改写 flying，到期恢复回缠绕瞬间的状态）
+            if (e.type === 'troop') {
+                e._vineFlyingOrig = !!e.flying;
+                e.flying = false;
+                e._vineGroundTimer = card.groundDuration || 2.5;
+            }
+        }
+        return;
+    }
+
     // ---- ⚡ 小电：立即结算（范围同火球术38px），45伤害 + 眩晕0.5秒，雷电落地特效 ----
     if (cardId === 'small_lightning') {
         const radius = card.radius || 38;
@@ -1728,6 +1843,34 @@ function applySpellDamage(cardId, casterTeam, x, y) {
         if (ring && ring.static) { ring.timer = flightTime; ring.maxTimer = flightTime; }
         // 释放瞬间特效：落点处淡淡火球虚影（提示落地位置，轻微不夸张）
         game.spellEffects.push({ x, y, char: '🔥', size: 16, timer: 0.5, maxTimer: 0.5, color: 'rgba(255,120,30,0.5)' });
+        return;
+    }
+
+    // ---- ❄️ 雪球：从主塔抛物线飞向落点（复用火球弹道 fireballFlights+snow标记，落地结算伤害+击退+减速80%3秒）----
+    if (cardId === 'snowball') {
+        const flightTime = card.flightTime || 1.4;
+        // 起点：己方主塔（找不到主塔时兜底从落点正上方高空坠下）
+        const mainTower = game.entities.find(e => e.type === 'main_tower' && e.team === casterTeam && e.hp > 0);
+        const x0 = mainTower ? mainTower.x : x;
+        const y0 = mainTower ? mainTower.y : Math.max(30, y - 150);
+        game.fireballFlights.push({
+            x0, y0, x1: x, y1: y,
+            x, y,
+            team: casterTeam,
+            snow: true,               // ❄️ 雪球标记：弹道/落地特效走冰系分支，落地附加减速
+            radius: card.radius,
+            damage: card.damage,
+            mul: card.towerDmgMul || 0.5,
+            knockback: card.knockback || 20,
+            slowFactor: card.slowFactor || 0.2,
+            slowDuration: card.slowDuration || 3,
+            timer: flightTime, maxTimer: flightTime,
+        });
+        // ✨ 小白圈持续到法术结算完：静态环 timer 延长至雪球落地（同火球）
+        const ring = game.deployEffects[game.deployEffects.length - 1];
+        if (ring && ring.static) { ring.timer = flightTime; ring.maxTimer = flightTime; }
+        // 释放瞬间特效：落点处淡淡雪球虚影（提示落地位置，轻微不夸张）
+        game.spellEffects.push({ x, y, char: '❄️', size: 16, timer: 0.5, maxTimer: 0.5, color: 'rgba(170,220,255,0.6)' });
         return;
     }
 
@@ -1797,13 +1940,12 @@ function castActiveSkill(cardId, team) {
     if (elixir < skillCost) return false;
 
     // 场上必须有存活的目标精英：本体槽找本体（!isMirrored），镜像槽找镜像精英（isMirrored）
-    const unit = game.entities.find(e => e.cardId === realCardId && e.team === team && e.hp > 0 && !e.isCopy && (isMirrorSlot ? e.isMirrored : !e.isMirrored));
+    const unit = game.entities.find(e => e.cardId === realCardId && e.team === team && e.hp > 0 && !e.isCopy && !e._spiritClone && (isMirrorSlot ? e.isMirrored : !e.isMirrored));
     if (!unit) return false;
 
     // 扣费 + 技能状态：🖤 单次技能（singleUse）→ 用完即黑（mode='used'，等精英死亡恢复 deploy + 死亡冷却）
     //                否则进入技能冷却（卡牌保持技能态，冷却结束可再次释放）
-    if (team === 'player') game.elixir.player -= skillCost;
-    else game.elixir.ai -= skillCost;
+    spendElixir(team, skillCost);
     if (card.activeSkill.singleUse) {
         st.mode = 'used';
         st.skillCdLeft = 0;
@@ -1820,6 +1962,21 @@ function castActiveSkill(cardId, team) {
 
 /** 精英主动技能效果施加（按技能 id 分发；新增精英技能在此扩展） */
 function applyActiveSkill(unit, skill) {
+    if (skill.id === 'wind_spread') {
+        // 💨 扩散：站桩0.6秒后以自身为中心展开135范围跟随风场（4秒；update.js 帧循环展开+结算）
+        unit._holdMove = 0.6;              // 复用护驾暂停移动机制：施法期间站桩
+        unit._windSpreadPending = 0.6;
+        game.spellEffects.push({ x: unit.x, y: unit.y - 30, char: '💨', size: 26, color: '#cfe8ff', timer: 0.8, maxTimer: 0.8 });
+        return;
+    }
+    if (skill.id === 'scholar_extreme') {
+        // 📖 極：粉色「極」字浮现；攻速2s→1s、暴击率20%→40%，持续28秒（update.js 帧循环衰减后还原）
+        unit._extremeTimer = skill.duration || 12;
+        unit.atkSpeed = 1.0;
+        unit._scholarCritRate = 0.4;
+        scholarRuneFx(unit, '極', '#ff8ad8');
+        return;
+    }
     if (skill.id === 'sword_ride') {
         // 🕊️ 御剑：剑飞到脚下、脚下新增阴影、变为空中单位；持续 duration 秒（9）后自动落回地面
         unit._rideSword = true;
@@ -1967,4 +2124,121 @@ function applyActiveSkill(unit, skill) {
             timer: 0.8, maxTimer: 0.8,
         });
     }
+}
+
+/* ═══════════ 📖 读书人·书灵随机技能（蓄力条满触发；鎮/靈/聚 三选一）═══════════
+ *  rand() 为 Lockstep 种子随机（两端一致）；0.5s 延迟段（靈）由 update.js 帧循环结算 */
+
+/** 🎯 最近敌人选取（书灵技能共用，可复用）：确定性 tie-break（距离同取 id 小者，Lockstep 两端一致）。
+ *  troopOnly=true 只找可移动单位（troop/healer，建筑排除） */
+function findNearestEnemy(x, y, team, troopOnly) {
+    let best = null, bestD = Infinity;
+    for (const cand of game.entities) {
+        if (cand.team === team || cand.hp <= 0 || cand._headHidden) continue;
+        if (troopOnly && cand.moveSpeed === undefined) continue;
+        const d = Math.hypot(cand.x - x, cand.y - y);
+        if (d < bestD - 0.001 || (d < bestD + 0.001 && best && cand.id < best.id)) {
+            bestD = d;
+            best = cand;
+        }
+    }
+    return best;
+}
+
+/** 📖 读书人汉字特效统一入口（头顶悬浮 1s 淡出；殺/閃尺寸时机不同不走这里） */
+function scholarRuneFx(unit, char, color) {
+    game.spellEffects.push({ x: unit.x, y: unit.y - 36, char, size: 26, color, timer: 1.0, maxTimer: 1.0 });
+}
+
+/** 蓄力条满 → 三选一释放随机书灵技能。
+ *  ★ 触发时机在攻击结算内：若这一击恰好击杀了目标（hp<=0），回退到读书人当前锁定目标/最近的敌人，
+ *    保证雷云/小飓风/靈必能生成（否则蓄力被清空却什么都不出现） */
+function castScholarRandomSkill(unit, target) {
+    if (!target || target.hp <= 0 || target.team === unit.team) {
+        target = game.entities.find(en => en.id === unit.targetId && en.hp > 0 && en.team !== unit.team)
+            || findNearestEnemy(unit.x, unit.y, unit.team, false);
+    }
+    const roll = rand();
+    if (roll < 1 / 3) scholarSkillZhen(unit, target);       // 鎮 ☁️雷云
+    else if (roll < 2 / 3) scholarSkillLing(unit, target);  // 靈 紫色克隆体
+    else scholarSkillJu(unit, target);                      // 聚 小飓风
+}
+
+/** 鎮（亮蓝）：☁️雷云悬停在地面影子正上方105px处，影子锁定目标（兵种/建筑均可，召唤时云直接在目标头顶）；
+ *  每1.2s从云中劈下雷电42伤害（堡垒/主塔减半）+💫眩晕1s（仅可移动单位，update.js 结算）；
+ *  目标死亡影子以16速带云同步移向下一个敌人、重合才劈雷；10s后消散 */
+function scholarSkillZhen(unit, target) {
+    scholarRuneFx(unit, '鎮', '#4fc3f7');
+    if (!target || target.hp <= 0 || target.team === unit.team) return;
+    game.scholarClouds.push({
+        sx: target.x, sy: target.y,   // 地面影子坐标（云恒在影子正上方105px；召唤时影子与目标重合=云在目标头顶）
+        team: unit.team, ownerId: unit.id,
+        targetId: target.id,
+        timer: 10, maxTimer: 10, tickTimer: 0,
+    });
+}
+
+/** 靈（深绿）：0.5s后在被锁定的敌方兵种身边生成紫色克隆体（生命复刻、反戈为读书人一方作战，最多40s）。
+ *  可灵化 troop/healer（同复制法术范围，建筑不复制）；目标不符时改锁最近的敌方可移动单位，没有则只出「靈」字 */
+function scholarSkillLing(unit, target) {
+    scholarRuneFx(unit, '靈', '#2e7d32');
+    if (!target || target.hp <= 0 || target.team === unit.team
+        || (target.type !== 'troop' && target.type !== 'healer')) {
+        target = findNearestEnemy(unit.x, unit.y, unit.team, true);
+    }
+    if (!target) return; // 没有可灵化的敌方单位
+    unit._spiritPending = { timer: 0.5, targetId: target.id }; // 0.5s延迟生成（update.js 结算；读书人阵亡则作废）
+}
+
+/** 靈的0.5s延迟兑现：生成紫色克隆体（浅拷贝本体全部属性，重置战斗状态，防引用共享——与克隆法术同款处理） */
+function spawnScholarSpiritClone(team, enemy) {
+    const copy = { ...enemy };
+    for (const k of Object.keys(copy)) {
+        const v = copy[k];
+        if (v instanceof Set) copy[k] = new Set(v);
+        else if (Array.isArray(v)) copy[k] = v.slice();
+    }
+    copy.id = entityIdCounter++;
+    copy.hp = enemy.hp;        // 📖 生命复刻（区别于克隆法术的1血复制体）
+    copy.maxHp = enemy.maxHp;
+    copy.team = team;          // 反戈：为读书人一方而战
+    // ★ 关键：清空继承的攻击目标——被克隆的敌方单位原本锁定的多半是读书人一方的建筑/单位，
+    //   队伍反转后不清空，克隆体会带着过期目标Id开局攻击自家塔（bug 修复）
+    copy.targetId = null;
+    copy._beamTargetId = null; copy._gulpTargetId = null; copy._yomiHitTargetId = null;
+    copy._pullToX = undefined; copy._pullToY = undefined; copy._pullTimer = 0;
+    copy._wormMarkTimer = 0;   // 🐛死亡标记带阵营（敌方巫师上的标记会让克隆体死后替敌方召虫），一并清除
+    copy.isCopy = false;       // 不用 isCopy（会被全局1血锁压掉）；独立紫色标记
+    copy.isMirrored = undefined;
+    copy._spiritClone = true;  // 渲染紫色克隆体 + 40s寿命（update.js 递减归零直接死亡）
+    copy._spiritLifeTimer = 40;
+    // 清掉不应继承的归属/技能状态（同克隆法术防污染清单）
+    copy._campFlag = false; copy._campId = undefined;
+    copy._patrolX = undefined; copy._patrolY = undefined; copy._patrolDir = undefined; copy._patrolR = undefined;
+    copy._swords = undefined; copy._swordTimer = undefined;
+    copy._scholarCharge = 0; copy._scholarShieldBroke = false; copy._scholarBlinkTimer = 0;
+    copy._scholarSecondLife = false; // 靈克隆体没有第二条命（避免与克隆体死亡结算交互）
+    copy.slowFactor = 1.0; copy.slowTimer = 0; // 📖 战斗状态归零：不继承本体身上的减速（同复制法术"等同刚部署"）
+    copy._spiritPending = null;
+    // 生成在被锁定敌人身边（随机偏移26px）
+    const ang = rand() * Math.PI * 2;
+    copy.x = Math.min(W - 30, Math.max(30, enemy.x + Math.cos(ang) * 26));
+    copy.y = Math.min(H - 30, Math.max(30, enemy.y + Math.sin(ang) * 26));
+    game.entities.push(copy);
+    game.spellEffects.push({ x: copy.x, y: copy.y, char: '🔷', size: 30, timer: 0.5, maxTimer: 0.5, isPulse: true });
+}
+
+/** 聚（灰色）：在锁定敌人位置生成55范围小飓风，持续8秒、每0.4s造成8点伤害（堡垒/主塔减半，走通用 tickZoneDamage）；
+ *  风眼常显🌪️、随机游走、每2秒变一次方向（update.js 结算） */
+function scholarSkillJu(unit, target) {
+    scholarRuneFx(unit, '聚', '#9e9e9e');
+    const ok = target && target.hp > 0 && target.team !== unit.team;
+    game.scholarHurricanes.push({
+        x: ok ? target.x : unit.x + (unit.team === 'player' ? 105 : -105),
+        y: ok ? target.y : unit.y,
+        radius: 55, team: unit.team,
+        dps: 8, towerDmgMul: 0.5,          // 📖 伤害走通用 tickZoneDamage（堡垒/主塔减半惯例收口）
+        timer: 8, maxTimer: 8, tickTimer: 0,
+        dirAng: rand() * Math.PI * 2, dirTimer: 2,
+    });
 }

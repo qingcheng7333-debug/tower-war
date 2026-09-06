@@ -18,14 +18,19 @@ const TICK_RATE = 30;              // 逻辑帧率（次/秒）
 const FIXED_DELTA = 1 / TICK_RATE; // 固定逻辑步长（秒）≈ 0.0333
 const TICK_INTERVAL_MS = 1000 / TICK_RATE; // 逻辑帧间隔（毫秒，联机同步锚点参考）
 const MAX_STEPS_PER_FRAME = 5;     // 单渲染帧最多推进的逻辑步数（防螺旋死亡）
+let renderClockSec = 0;            // 渲染时钟（秒，rAF 时间戳）：仅供视觉动画相位（波动/旋转/呼吸等），与逻辑完全解耦，main.js gameLoop 每帧更新
 // ---- 联机 INPUT 帧窗口（协议常量统一放在 config.js）----
 const NET_INPUT_PAST_TICKS = 2;     // 允许少量网络乱序/处理延迟
 const NET_INPUT_FUTURE_TICKS = 600; // 拒绝异常远期帧，避免缓存膨胀
 const NET_INPUT_KEEP_TICKS = 120;   // 已确认帧的保留窗口
 
 // ---- 模式专属常量 ----
-const MODE_TEST_DETECT_R = 220;    // 🧪 测试双人（本机220）模式：发现锁敌半径——覆盖全图索敌，圈外敌人视而不见（无目标=原地待机，移动保持纯锁敌驱动）
-const MODE_TEST_DETECT_R_FLY = 440;  // 🧪 飞行单位（flying 搜索者）索敌半径：空中视野翻倍；地面单位仍用 MODE_TEST_DETECT_R（三处 gate 经 update.js detectR220Of() 统一取值）
+const MODE_TEST_DETECT_R = 330;    // 🧪 测试双人（本机）模式：地面单位发现锁敌半径（v11.72 由 220 调大）——覆盖全图索敌，圈外敌人视而不见（无目标=原地待机，移动保持纯锁敌驱动）；detect220 为模式历史名，标识符不改
+const MODE_TEST_DETECT_R_FLY = 440;  // 🧪 飞行单位（flying 搜索者）索敌半径（保持 440 不随地面调整）；地面单位仍用 MODE_TEST_DETECT_R（三处 gate 经 update.js detectR220Of() 统一取值）
+
+// ---- 🛡️ 主塔守卫巡逻参数（update.js 巡逻轨道/索敌 与 render.js 悬停预警圈共用，防双写漂移）----
+const GUARD_PATROL_R = 70;   // 守卫巡逻轨道半径
+const GUARD_DETECT_R = 250;  // 守卫索敌范围
 
 // ---- 🧪 测试双人（本机）：行军路线（waypoint 折线，detect220 下索敌圈内无敌时沿路走向敌方主塔）----
 // 蓝方(player)视角，红方(ai)反向复用同一条路；路径离堡垒/主塔中心 ≥70px（建筑碰撞半宽28+单位半径15=43），不会被卡住
@@ -41,6 +46,13 @@ const MODE_TEST_BRIDGE_HALF = 40;   // 桥走廊半宽（比行军走廊 ±30 �
 const MODE_TEST_RIVER_GUARD = 22;   // 岸边排斥框厚度：河道两侧各 [岸线-22, 岸线+22]，地面单位进框被推回；穿过整条框带=落水
 const MODE_TEST_RIVER_PUSH = 150;   // 排斥推力 px/s（向岸；约为普通移速 2.5~5 倍，正常走位推不穿——落水只来自钩拉/击退/挤压等位移）
 const MODE_TEST_SPLASH_T = 0.55;    // 水花特效时长（秒）
+
+// ---- 全局寻路（update.js moveToward 导航层）：网格 A* + 视线剪枝，地面单位自动绕障/上桥 ----
+const NAV_GRID_CELL = 25;      // 寻路网格边长 px（测试图 1400x700=56x28 格；障碍按外扩 NAV_GRID_PAD 标格）
+const NAV_GRID_PAD = 25;       // 网格障碍外扩 px（=最大地面单位碰撞半径15+NAV_CLEARANCE10；全单位共用一张网格，小单位路径更宽松）
+const NAV_CLEARANCE = 10;      // 视线/绕行余量 px（按单位真实碰撞半径+此值做可视检测）
+const NAV_WAYPOINT_REACH = 14; // 路径点到达半径 px（接近即切换下一点）
+const NAV_REPATH_DIST = 24;    // 目的地偏移超过此值 px → 重算路径（追击目标小幅移动不抖）
 
 // 地图布局：左界(0~100) + 主塔x=100 + 堡垒x=400 + 河道(650~950) + 堡垒x=1200 + 主塔x=1500 + 右界(1500~1600)
 // 🧪 测试双人布局：左界不变 + 主塔x=100 + 堡垒x=400 + 河(650~750) + 堡垒x=1000 + 主塔x=1300 + 右界(1300~1400)，总宽1400
@@ -106,7 +118,7 @@ const BARREL_GUARD_TEMPLATE = {
 };
 const BARBARIAN_TEMPLATE = {
     type: 'troop', flying: false, hp: 340, atk: 32, atkSpeed: 1.4,
-    moveSpeed: 28, range: 25, targetMode: 'all', name: '蛮人', icon: '🪓',
+    moveSpeed: 28, range: 25, targetMode: 'all', name: '蛮人', icon: '👥',
     _isSpawned: true
 };
 const CRAFTED_WATER_CARRIER_TEMPLATE = {
@@ -157,12 +169,19 @@ const CARDS = {
         atkSpeed: 1.2, moveSpeed: 28, range: 25, targetMode: 'all', icon: '⚔️',
         deployDelay: 1.5, cooldown: 6
     },
+    valkyrie: {
+        // 🪓 瓦基里：4费群体近战，抡斧原地转一圈对范围内所有敌人各结算一次伤害（剑士范围+5=30）
+        type: 'troop', name: '瓦基里', cost: 4, hp: 920, atk: 52,
+        atkSpeed: 1.5, moveSpeed: 28, range: 35, targetMode: 'all', icon: '🪓',
+        deployDelay: 1.5, cooldown: 7.5,
+        desc: '🪓 4费群体近战：生命920、攻击52、攻速1.5秒、移速28、攻击范围35；攻击时抡起斧头原地旋转一圈，对范围内所有敌人各造成一次伤害（不对空）'
+    },
     strong_barbarian: {
         //  强壮蛮人：6费近战肉盾，一次部署2只、竖着排（纵向一列间距50）
         type: 'troop', name: '强壮蛮人', cost: 6, hp: 620, atk: 82,
         atkSpeed: 1.4, moveSpeed: 28, range: 25, targetMode: 'all', icon: '🪓',
         count: 2, deployDelay: 1.5, cooldown: 10,
-        desc: '🪓 6费双蛮人：一次部署2只、竖着排（纵向一列间距50）。近战肉盾：生命580、攻击80、攻速1.4s、移速28'
+        desc: '🪓 6费双蛮人：一次部署2只、竖着排（纵向一列间距50）。近战肉盾：生命620、攻击82、攻速1.4s、移速28'
     },
     archer: {
         type: 'troop', name: '弓箭手', cost: 2, hp: 70, atk: 24,
@@ -180,7 +199,7 @@ const CARDS = {
         atkSpeed: 1.2, moveSpeed: 34, range: 22, targetMode: 'all', icon: '🪰',
         count: 6, deployDelay: 1.0, cooldown: 10,
         flying: true, canHitAir: true, // 空中单位、近战可对空（canTargetFlying 豁免近战限制）
-        desc: '🪰 5费群蝇：一次部署6只、部署点周围随机散开。空中单位、近战单体、可对空；生命60、攻击22、攻速1.2s、移速34'
+        desc: '🪰 5费群蝇：一次部署6只、部署点周围随机散开。空中单位、近战单体、可对空；生命85、攻击40、攻速1.2s、移速34'
     },
     large_fly: {
         type: 'troop', name: '大苍蝇', cost: 3, hp: 400, atk: 75,
@@ -189,17 +208,17 @@ const CARDS = {
         desc: '🪰 大苍蝇：单体飞行近战单位，可攻击空中目标。生命400、攻击75、攻速1.5秒、移速28。'
     },
     skeleton_guard: {
-        type: 'troop', name: '守卫骷髅', cost: 3, hp: 25, atk: 60,
+        type: 'troop', name: '守卫骷髅', cost: 3, hp: 25, atk: 58,
         atkSpeed: 1.1, moveSpeed: 40, range: 22, targetMode: 'all', icon: '☠️',
         count: 3, deployDelay: 0.5, cooldown: 7.5,
-        shield: 120,
-        desc: '☠️ 3个骷髅守卫（骷髅+黑色小盔甲）。🛡️蓝色护盾条120：护盾未破前伤害全被吸收（哪怕只剩1点护盾也能完整挡下一次攻击），护盾扣完才扣生命。攻击30，部署快(0.5s)'
+        shield: 110,
+        desc: '☠️ 3个骷髅守卫（骷髅+黑色小盔甲）。🛡️蓝色护盾条110：护盾未破前伤害全被吸收（哪怕只剩1点护盾也能完整挡下一次攻击），护盾扣完才扣生命。攻击58，部署快(0.5s)'
     },
     balloon: {
         type: 'troop', name: '气球兵', cost: 5, hp: 760, atk: 260,
         atkSpeed: 2.0, moveSpeed: 28, range: 22, targetMode: 'buildings', icon: '🎈',
         flying: true, deployDelay: 1.5, cooldown: 8,
-        desc: '🎈 空中单位：只攻击建筑（锁建筑），近战贴脸轰炸。生命760、攻击111、攻速2s、移速28，可被对空单位攻击；死亡时留下💣，2秒后爆炸（范围同法师塔群攻45px）对周围所有敌方单位造成111伤害'
+        desc: '🎈 空中单位：只攻击建筑（锁建筑），近战贴脸轰炸。生命760、攻击260、攻速2s、移速28，可被对空单位攻击；死亡时留下💣，2秒后爆炸（范围同法师塔群攻45px）对周围所有敌方单位造成222伤害'
     },
     firework_gunner: {
         type: 'troop', name: '烟花炮手', cost: 3, hp: 130, atk: 65,
@@ -225,8 +244,8 @@ const CARDS = {
     },
     barbarian: {
         type: 'troop', name: '蛮人', cost: 5, spawnUnit: 'barbarian',
-        count: 5, icon: '🪓', deployDelay: 1.5, cooldown: 10,
-        desc: '🪓 5费召唤5只蛮人：生命350、攻击32、攻速1.4s、移速28。部署点周围随机分散。'
+        count: 5, icon: '👥', deployDelay: 1.5, cooldown: 10,
+        desc: '👥 5费召唤5只蛮人：生命350、攻击32、攻速1.4s、移速28。部署点周围随机分散。'
     },
     goblin_crew: {
         type: 'troop', name: '哥布林团伙', cost: 3, goblin: true,
@@ -294,7 +313,7 @@ const CARDS = {
         atkSpeed: 1.8, moveSpeed: 16, range: 25, targetMode: 'buildings', icon: '🦔',
         deployDelay: 2.0, cooldown: 12,
         thornsRadius: 75, thornsDamage: 35, thornsStun: 0.5,
-        desc: '🦔 反甲巨人：生命2000、伤害85、攻速1.8秒、移速22，只攻击建筑。75px反甲范围内，攻击它的单位受到35伤害并眩晕0.5秒。'
+        desc: '🦔 反甲巨人：生命2000、伤害65、攻速1.8秒、移速16，只攻击建筑。75px反甲范围内，攻击它的单位受到35伤害并眩晕0.5秒。'
     },
     dragon: {
         type: 'troop', name: '飞龙', cost: 4, hp: 580, atk: 36,
@@ -357,11 +376,18 @@ const CARDS = {
         desc: '❄️ 蓝灰寒冰法师：部署落地时对40px范围造成20伤害并产生冰雪冲击；发射带寒气的冰锥直线弹道，碰到敌人后爆裂；主目标18伤害，25px范围内其他目标受到60%溅射伤害，可对空；命中后减速与降低攻击力60%，持续2.5秒'
     },
     fire_mage: {
-        type: 'troop', name: '火法师', cost: 5, hp: 375, atk: 60,
+        type: 'troop', name: '火法师', cost: 5, hp: 375, atk: 40,
         atkSpeed: 1.4, moveSpeed: 28, range: 135, moveTargetRange: 105, targetMode: 'all', icon: '🔥',
         canHitAir: true, splash: 35,
         deployDelay: 1.5, cooldown: 7.5,
-        desc: '🔥 红灰火法师：攻击索敌135、移动索敌105（飞斧胖虎同款索敌分离，边走边打）；发射火球直线弹道，命中爆裂或飞到135终点爆裂；35px范围内所有目标受到全额60伤害（无衰减、不分主次），可对空'
+        desc: '🔥 红灰火法师：攻击索敌135、移动索敌105（飞斧胖虎同款索敌分离，边走边打）；发射火球直线弹道，命中爆裂或飞到135终点爆裂；35px范围内所有目标受到全额40伤害并被点燃🔥（每秒20灼烧伤害、持续1秒，参考火豆；重复命中灼烧时长累加、强度取最强），可对空'
+    },
+    // ☃️ 雪人：索定建筑的冰雪辅助——追踪雪球挂❄️减速、周期恐惧脉冲、自流血、留下雪地轨迹
+    snowman: {
+        type: 'troop', name: '雪人', cost: 3, hp: 1224, atk: 6,
+        atkSpeed: 1.5, moveSpeed: 22, range: 75, targetMode: 'buildings', icon: '☃️',
+        deployDelay: 1.5, cooldown: 7.5,
+        desc: '☃️ 3费攻城辅助：生命1224、攻击6、攻速1.5s、射程75、移速22，索定建筑。发射追踪雪球（法术雪球等比缩小），命中造成伤害并附加❄️减速1.5秒（-30%移速）。每3.5秒对周围75px内敌人施加4秒😱恐惧（攻击力/攻速-25%）。每秒自流血34。每1.6秒在脚下留下25px淡白轨迹持续7秒：踩上的敌人每秒受6伤害并获得❄️减速30%（持续1秒，踩着即持续刷新）'
     },
     lightning_wizard: {
         type: 'troop', name: '雷电法师', cost: 4, hp: 320, atk: 55,
@@ -369,6 +395,15 @@ const CARDS = {
         deployDelay: 0.5, cooldown: 7.5,
         chainRange: 90, chainCount: 2, chainDmgMul: 0.8,
         deploySpell: { radius: 38, damage: 50, length: 150, stunDuration: 1.0 }
+    },
+    fire_furnace: {
+        // 🌋 火熔炉：4费行走的熔炉，单体远程追踪弹道（🔴必中，可对空），每5秒蹦出一只火豆
+        type: 'troop', name: '火熔炉', cost: 4, hp: 350, atk: 34,
+        atkSpeed: 1.7, moveSpeed: 28, range: 105, targetMode: 'all', icon: '🌋',
+        canHitAir: true,
+        deployDelay: 1.5, cooldown: 7.5,
+        spawnInterval: 5.0, spawnCount: 1, spawnUnit: 'fire_bean',
+        desc: '🌋 4费单体远程：生命350、攻击34、攻速1.7秒、射程105、移速28；发射🔴熔岩弹丸（追踪弹道必中，可对空）；每5秒从炉口蹦出一只火豆（跳跃自爆单位）'
     },
     immunity_disciple: {
         type: 'troop', name: '免伤法徒', cost: 4, hp: 400, atk: 15,
@@ -419,10 +454,16 @@ const CARDS = {
         desc: '放置后不能移动，被攻击后会让攻击者减速80%持续1.5秒。被触碰或死亡时自爆，45px范围造成25伤害并减速敌人80%持续1.5秒'
     },
     fire_bean: {
-        type: 'troop', name: '火豆', cost: 1, hp: 50, atk: 0,
-        atkSpeed: 0, moveSpeed: 34, range: 35, targetMode: 'all', icon: '🔥',
+        type: 'troop', name: '火豆', cost: 1, hp: 80, atk: 0,
+        atkSpeed: 0, moveSpeed: 40, range: 35, targetMode: 'all', icon: '🔥',
         deployDelay: 0.5, cooldown: 6,
-        desc: '🔥跳跃自爆单位。敌人进入90px范围时抛物线跳过去（真实弧线飞行）以敌人为中心自爆，35px范围造成10伤害+🔥灼烧3秒(20/秒)，总伤害70。HP50移速34'
+        desc: '🔥跳跃自爆单位。敌人进入90px范围时抛物线跳过去（真实弧线飞行）以敌人为中心自爆，35px范围造成10伤害+🔥灼烧3秒(20/秒)，总伤害70。HP80移速40'
+    },
+    heal_bean: {
+        type: 'troop', name: '疗豆', cost: 1, hp: 80, atk: 0,
+        atkSpeed: 0, moveSpeed: 40, range: 35, targetMode: 'all', icon: '💚',
+        deployDelay: 0.5, cooldown: 6,
+        desc: '💚跳跃自爆治疗单位（建模/行为照抄火豆）。敌人进入90px范围时抛物线跳过去（真实弧线飞行）以敌人为中心自爆，单体造成25伤害（落点35px内最近1名敌人）；同时对75px内友军施加❤️‍🩹恢复buff：持续4秒每秒治疗40（共160，不叠加只刷新，防御工事不可被治疗）。HP80移速40'
     },
     ghost: {
         type: 'troop', name: '幽灵', cost: 3, hp: 580, atk: 40,
@@ -450,11 +491,11 @@ const CARDS = {
     },
     ronin: {
         type: 'troop', name: '浪人', cost: 5, hp: 820, atk: 60,
-        atkSpeed: 1.4, moveSpeed: 28, range: 25, targetMode: 'all', icon: '🚫',
+        atkSpeed: 1.4, moveSpeed: 28, range: 25, targetMode: 'all', icon: '❌',
         deployDelay: 1.5, cooldown: 8,
-        reflectCooldown: 3.5,   // 反弹冷却（秒）
+        reflectCooldown: 3.2,   // 反弹冷却（秒）
         reflectMultiplier: 2,   // 反弹倍率 200%
-        desc: '🚫流浪武士，单体近战；被近战攻击完全格挡并200%反弹伤害（3.5秒冷却，远程弹道不触发）'
+        desc: '❌流浪武士，单体近战；被近战攻击完全格挡并200%反弹伤害（3.2秒冷却，远程弹道不触发），反弹成功时刀光交叉闪过'
     },
     super_knight: {
         type: 'troop', name: '超级骑士', cost: 7, hp: 2000, atk: 50,
@@ -524,9 +565,10 @@ const CARDS = {
     princess: {
         type: 'troop', name: '公主', cost: 3, hp: 110, atk: 60,
         atkSpeed: 3, moveSpeed: 16, range: 165, cooldown: 10,
+        deployDelay: 1.0, // 对齐同类远程兵部署延迟档（原缺省走 0.5 兜底）
         splash: 45, // 群箭落地范围伤害45px（公主自身档位）
         icon: '👸',
-        desc: '👸 3费远程群攻：生命70、攻击30、攻速3s、移速16、射程165、冷却10s。巡敌迫击炮模式：锁定目标当前位置发射5支群箭（不追踪），落地范围伤害45px（可波及空中），落地效果同剑雨'
+        desc: '👸 3费远程群攻：生命110、攻击60、攻速3s、移速16、射程165、冷却10s。巡敌迫击炮模式：锁定目标当前位置发射5支群箭（不追踪），落地范围伤害45px（可波及空中），落地效果同剑雨'
     },
 
     fat_tiger: {
@@ -535,7 +577,22 @@ const CARDS = {
         deployDelay: 1.5, cooldown: 10,
         desc: '🪓 5费远程单体：生命640、攻击35、攻速2.4s、移速28、攻击索敌135、移动索敌105（可对空）。黑蓝配色胖虎，抡起飞斧远程砍人'
     },
+    rock_thrower: {
+        // 🪨 投石人：5费紫色巨人，手抱巨石向前直线滚出（沿途伤害+击退，参考滚木；不可对空）
+        type: 'troop', name: '投石人', cost: 5, hp: 1000, atk: 58,
+        atkSpeed: 2.5, moveSpeed: 16, range: 75, targetMode: 'all', icon: '🪨',
+        groundOnly: true, // 只对地（巨石贴地滚，索敌不含飞行单位；canTargetFlying 走此标记拦截）
+        deployDelay: 1.5, cooldown: 10,
+        desc: '🪨 5费紫色巨人：生命1000、攻击58、攻速2.5秒、射程75、移速16；手抱巨石向前直线滚出，造成58伤害并击退20px（伤害每敌仅一次；最多追撞两次，位置合适可被推出40px），巨石滚动105px后碎裂消失；不可对空'
+    },
 
+    enchant_giant: {
+        // 🪓 附魔巨人：4费攻城锤，部署后为最多2名非建筑友军附魔🥊（暴击buff，死亡才掉）
+        type: 'troop', name: '附魔巨人', cost: 4, hp: 1400, atk: 50,
+        atkSpeed: 1.5, moveSpeed: 22, range: 25, targetMode: 'buildings', icon: '🪬',
+        deployDelay: 1.5, cooldown: 10,
+        desc: '🪬 4费单体近战：生命1400、攻击50、攻速1.5秒、只攻击建筑、移速22。部署后附魔最近的非建筑友军（距离不限，最多2人，友军死亡自动补位）：🥊获得20%暴击率，暴击造成双倍伤害（暴击伤害金色显示）'
+    },
     unicorn: {
         type: 'troop', name: '独角兽', cost: 5, hp: 1600, atk: 44,
         atkSpeed: 1.0, moveSpeed: 34, range: 105, targetMode: 'all', icon: '🦄',
@@ -596,9 +653,9 @@ const CARDS = {
         // 👑 精英主动技能：部署后卡牌变为「护驾」（3费·单次技能）；释放后卡牌变黑（singleUse → used），小王子死亡后卡牌才恢复可部署并开始死亡冷却
         activeSkill: {
             id: 'prince_guard', name: '护驾', icon: '🛡️', cost: 3, singleUse: true,
-            desc: '护驾：单次技能，释放1秒后在小王子前方召唤王子增援，增援快速冲锋105距离，对沿途敌人造成50伤害并击退；释放后卡牌变黑，小王子阵亡后卡牌恢复可部署并开始15秒死亡冷却'
+            desc: '护驾：单次技能，释放1秒后在小王子前方召唤王子增援，增援快速冲锋105距离，对沿途敌人造成50伤害并击退；释放后卡牌变黑，小王子阵亡后卡牌恢复可部署并开始28秒死亡冷却'
         },
-        desc: '👑 3费精锐远程单体：生命340、攻击20、攻速1.2s、移速22、射程135、单体攻击。🛡️主动技能·护驾（3费·单次）：部署后卡牌变为「护驾」，释放1秒后在小王子前方召唤王子增援，增援快速冲锋105距离，沿途敌人受50伤害并击退；释放后卡牌变黑（单次技能），小王子死亡后卡牌恢复可部署并开始15秒死亡冷却'
+        desc: '👑 3费精锐远程单体：生命340、攻击22、攻速1.2s、移速22、射程135、单体攻击。🛡️主动技能·护驾（3费·单次）：部署后卡牌变为「护驾」，释放1秒后在小王子前方召唤王子增援，增援快速冲锋105距离，沿途敌人受50伤害并击退；释放后卡牌变黑（单次技能），小王子死亡后卡牌恢复可部署并开始28秒死亡冷却'
     },
     berserker: {
         type: 'troop', category: 'elite', name: '狂战士', cost: 2, hp: 380, atk: 25,
@@ -621,6 +678,20 @@ const CARDS = {
             desc: '后撤：杰西立即向后方冲刺105px，并延迟0.3s在原地部署一根木桩（建筑·220血，每秒自流血10）阻挡敌人；后撤后4秒内电磁弹变为亮金色：飞行距离提升至500、命中附带眩晕1秒💫'
         },
         desc: '🔫 4费精锐远程单体：生命300、攻击36、攻速1.4s、移速22、射程135（可对空）。电磁枪发射连锁电磁团：命中后拐向下一个敌人（可回弹），伤害逐次-4（36→32→28→24→20→16→12→8→4），保底4，总射程250。↩️主动技能·后撤（2费）：立即后撤105px并延迟0.3s在原地部署木桩（建筑·220血，每秒自流血10）阻挡敌人，冷却30秒；后撤后4秒内电磁弹变亮金色（飞行距离500、命中眩晕1秒💫）'
+    },
+    // 📖 读书人：精英·远程法师（无弹道即时结算，攻击浮现暗红「殺」字）；自带20%暴击（双倍伤害金色数字，无需buff图标）；
+    //   护盾破碎 → 头顶黄色「閃」字，0.6s后瞬移到前方105px（方向参考杰西后撤，取正向）；
+    //   每次攻击积累1/4蓄力条，蓄满清空并释放一次随机书灵技能：鎮（☁️雷云）/靈（紫色克隆体）/聚（小飓风）
+    scholar: {
+        type: 'troop', category: 'elite', name: '读书人', cost: 7, hp: 80, shield: 640, atk: 30,
+        atkSpeed: 2, moveSpeed: 22, range: 165, targetMode: 'all', icon: '📖',
+        deployDelay: 1.5, cooldown: 30,
+        // 🌸 精英主动技能：部署后卡牌变为「極」（1费，释放后进入25秒冷却，冷却结束可再次释放）
+        activeSkill: {
+            id: 'scholar_extreme', name: '極', icon: '🌸', cost: 1, cooldown: 16, duration: 12,
+            desc: '極（1费·16s冷却）：读书人头上浮现粉色「極」字，攻速变为1秒、暴击率+20%（达40%），持续12秒；期间书卷泛粉色光晕'
+        },
+        desc: '📖 7费精锐远程单体：生命80+护盾640、攻击30、攻速2秒、自带20%暴击率（暴击双倍伤害金色数字）、射程165（单体即时结算无弹道，攻击浮现暗红色「殺」字）、移速22。护盾破碎时头顶冒出黄色「閃」字并进入无敌，0.6秒后往攻击方向后面瞬移105px（同杰西后撤方向），落地后才恢复受击；受到致命攻击时保留1点生命并再次触发閃（每条命限一次）。🌸主动技能·極（1费·16s冷却）：攻速1秒、暴击率40%，持续12秒，期间书卷泛粉色光晕。每次攻击积累1/4蓄力条，蓄满后清空并释放一次随机书灵技能——鎮（亮蓝：☁️雷云悬于地面影子正上方105px、召唤时直接在锁定的目标头顶（兵种/建筑均可，堡垒主塔伤害减半、建筑不眩晕），每1.2s劈下42伤害雷电+💫眩晕1s；目标死亡影子以22速带云同步移向下一个敌人、重合才劈雷，10s后消散）／靈（深绿：0.5s后被锁定敌人身边生成紫色克隆体，生命复刻、为读书人一方作战，最多存在40s）／聚（灰色：55范围小飓风持续8秒并持续向风眼牵引，每0.4s造成8点伤害（堡垒主塔减半），风眼常显🌪️、以移速8随机游走每2秒变向）'
     },
     monk: {
         type: 'troop', category: 'elite', name: '武僧', cost: 5, hp: 1100, atk: 30,
@@ -645,6 +716,19 @@ const CARDS = {
         desc: '🏹 5费精英远程单体：生命500、攻击50、攻速1.2s、移速28、射程135。🌫️主动技能·隐身（1费）：释放后0.5秒进入隐身（不可被锁定），攻击力提升200%，持续3.6秒；40秒冷却'
     },
 
+    // 💨 风人：精英·空中单位，💨直线风爆弹 + 拟风（圈内buff传染）+ 主动技能「扩散」（135跟随风场）
+    wind_man: {
+        type: 'troop', category: 'elite', name: '风人', cost: 4, hp: 320, atk: 4,
+        atkSpeed: 1.3, moveSpeed: 28, range: 135, moveTargetRange: 125, targetMode: 'all', icon: '💨',
+        flying: true, canHitAir: true,
+        deployDelay: 1.5, cooldown: 30,
+        // 🌀 精英主动技能：部署后卡牌变为「扩散」（1费，释放后进入35秒冷却，冷却结束可再次释放）
+        activeSkill: {
+            id: 'wind_spread', name: '扩散', icon: '🌀', cost: 1, cooldown: 35, duration: 4,
+            desc: '扩散（1费·35s冷却）：站桩0.6秒后以自身为中心展开135范围风场（跟随风人移动，持续4秒）：展开瞬间立刻进行一次buff大结算，之后0.4s一跳造成4范围伤害，每3跳进行一次buff大结算（4秒内共4次大结算）'
+        },
+        desc: '💨 4费精英空中单位：生命320、攻击4、攻速1.3s、射程135、移动索敌125（索敌分离，边走边打）、移速28，可对空。发射💨直线风爆弹（不追踪）：碰到敌人即在其位置生成55px风爆区（读书人小飓风同款特效，无牵引），0.4s一跳造成4范围伤害，持续1.2s共3跳12伤害；未命中飞到135终点也生成风爆区（同火法师终点爆裂）。🌪️拟风：风爆区第二跳伤害时，圈内若有敌人带🔥灼烧/❄️减速/🤢中毒，则将这些buff复制给圈内每个敌人：每种buff由其携带人数决定传播量，圈内全部敌人各获得0.7秒×携带人数的该buff（时长累加、强度取最强采样，重复获得不叠强度），同时对圈内每个敌人造成4×buff实例数伤害（每个人每个buff单独计数，判定仅限🌪️圈内）。🌀主动技能·扩散（1费·35s冷却）：站桩0.6秒后展开135范围跟随风场4秒——展开瞬间立刻进行一次buff大结算，之后0.4s一跳4范围伤害，每3跳一次buff大结算（共4次大结算）'
+    },
     // 🛕 哥布林神庙：精英·建筑（石底木碑+叶耳造型），1费低费圣所；
     //   主动技能「神赐」（11费）：神庙在场时每用1张哥布林卡费用-1（最低1费），释放后恢复11费；
     //   释放哥布林卡时部署位置浮现👺虚影0.5秒提示「已被神庙接收」（与部署延迟时间环同时出现）
@@ -662,18 +746,18 @@ const CARDS = {
     // ==================== 建筑 ====================
     cannon_tower: {
         type: 'tower', name: '炮塔', cost: 4, hp: 450, atk: 100,
-        atkSpeed: 2.6, range: 155, splash: 0, onlyGround: true, icon: '🏰',
+        atkSpeed: 2.6, range: 155, splash: 0, groundOnly: true, icon: '🏰',
         deployDelay: 2.5, cooldown: 9
     },
     mortar: {
         type: 'tower', name: '迫击炮', cost: 5, hp: 580, atk: 66,
-        atkSpeed: 5, range: 185, minRange: 75, splash: 35, onlyGround: true, icon: '🪨', // 范围伤害中档35
+        atkSpeed: 5, range: 185, minRange: 75, splash: 35, groundOnly: true, icon: '🪨', // 范围伤害中档35
         deployDelay: 2.5, cooldown: 20,
         desc: '🪨 抛物线投石锁定落点轰炸：66范围伤害+击退18px；75px内近身打不到'
     },
     crossbow: {
         type: 'tower', name: '十字弩', cost: 7, hp: 1200, atk: 10,
-        atkSpeed: 0.3, range: 185, splash: 0, onlyGround: true, icon: '►',
+        atkSpeed: 0.3, range: 185, splash: 0, groundOnly: true, icon: '►',
         deployDelay: 3.5, cooldown: 9,
         desc: '► 重型连弩塔：攻速极快(0.3s/箭)、射程远、只对地；每秒自流血24'
     },
@@ -783,6 +867,14 @@ const CARDS = {
         radius: 38, towerDmgMul: 0.5, icon: '🔥', deployDelay: 0.8, cooldown: 12,
         flightTime: 1.4,              // 火球从主塔飞往落点耗时（秒），落地即结算
     },
+    snowball: {
+        type: 'spell', name: '雪球', cost: 2, damage: 35,
+        radius: 38, towerDmgMul: 0.5, icon: '❄️', deployDelay: 0.5, cooldown: 8,
+        flightTime: 1.4,                  // 雪球从主塔飞往落点耗时（秒），同火球
+        knockback: 20,                    // 击退20px（位移式滑动，仅兵种生效）
+        slowFactor: 0.2, slowDuration: 3, // 命中减速80%持续3秒（参考冰豆减速buff）
+        desc: '❄️ 2费法术：从己方主塔抛出雪球，1.4秒后落地砸中38px范围（同火球术）内敌人：35伤害+击退20px+减速80%持续3秒（对主塔/堡垒伤害减半；建筑不被击退/减速）'
+    },
     rocket: {
         type: 'spell', name: '火箭', cost: 6, damage: 740,
         radius: 38, towerDmgMul: 1 / 3, icon: '🚀', deployDelay: 0.5, cooldown: 30,
@@ -798,8 +890,15 @@ const CARDS = {
     },
     earthquake: {
         type: 'spell', name: '地震法术', cost: 3, damage: 15,
-        radius: 48, towerDmgMul: 10, icon: '🌍', deployDelay: 0.8, cooldown: 32,
+        radius: 55, towerDmgMul: 10, icon: '🌍', deployDelay: 0.8, cooldown: 32,
         strikes: 3, strikeInterval: 1.5  // 持续3秒，每1.5秒一段共3段；基础伤害减半，对普通建筑10倍（主塔/堡垒除外）
+    },
+    skeleton_summon: {
+        // 🪦 骷髅召唤：5费召唤法术，淡紫墓土范围内每0.7秒随机破土一只骷髅（共13只，持续9.1秒）
+        type: 'spell', name: '骷髅召唤', cost: 5,
+        radius: 85, icon: '🪦', deployDelay: 0.8, cooldown: 24,
+        strikes: 13, strikeInterval: 0.7, firstStrikeDelay: 0.7,  // 首只0.7s后出土，13只正好持续9.1s
+        desc: '🪦 5费召唤法术：范围同箭雨(85px)，持续9.1秒，每0.7秒在范围内随机位置破土召唤一只骷髅（共13只，同女巫骷髅）'
     },
     thunder_spell: {
         type: 'spell', name: '大雷电', cost: 6, damage: 380,
@@ -832,10 +931,16 @@ const CARDS = {
     },
     goblin_curse: {
         type: 'spell', name: '哥布林魔咒', cost: 2, goblin: true,
-        radius: 48, icon: '🧪',
+        radius: 55, icon: '🧪',
         deployDelay: 0.8, cooldown: 15,
         duration: 6, dps: 10, towerDmgMul: 0.5,   // 持续6秒，每秒1次对圈内敌人造成10伤害（总计60）；对主塔/堡垒伤害减半
-        desc: '🧪 2费诅咒法术：48px范围形成暗绿魔咒领域6秒，每秒对圈内所有敌人造成10点伤害（可对空、无视目标类型，对主塔/堡垒伤害减半）'
+        desc: '🧪 2费诅咒法术：55px范围形成暗绿魔咒领域6秒，每秒对圈内所有敌人造成10点伤害（可对空、无视目标类型，对主塔/堡垒伤害减半）'
+    },
+    vine: {
+        type: 'spell', name: '藤蔓', cost: 3,
+        radius: 55, damage: 70, towerDmgMul: 0.5, icon: '🌿', deployDelay: 0.5, cooldown: 12,
+        topHpTargets: 3, stunDuration: 2.5, groundDuration: 2.5,
+        desc: '🌿 3费法术：0.5秒后藤蔓缠住55px范围（同哥布林魔咒）内生命值最高的3名敌方单位（不锁定隐身单位），造成70伤害（对主塔/堡垒减半）并眩晕💫2.5秒；被缠绕的飞行单位被拽落地面变为地面单位2.5秒（对空单位可趁机攻击，若在河面被拽落会落水）；范围内无单位则不缠绕'
     },
     hurricane: {
         type: 'spell', name: '飓风法术', cost: 3, damage: 8,
@@ -847,8 +952,8 @@ const CARDS = {
         type: 'spell', name: '毒药', cost: 4,
         radius: 85, icon: '🤢',
         deployDelay: 0.8, cooldown: 15,
-        duration: 8, dps: 18, slowFactor: 0.85, slowDuration: 1.0, towerDmgMul: 0.5,
-        desc: '🤢 4费法术：85px范围（同极速法术）形成橙红毒雾领域8秒，每0.4秒对圈内所有敌人造成18点伤害并减速15%（对主塔/堡垒伤害减半）'
+        duration: 8, dps: 45, slowFactor: 0.85, slowDuration: 1.0, towerDmgMul: 0.5, // dps=每秒毒伤（原0.4s×18折算）
+        desc: '🤢 4费法术：85px范围（同极速法术）形成橙红毒雾领域8秒，每秒施加一次🤢中毒（持续1秒、每秒45毒伤，走出领域后残余1秒）并减速15%（❄️，持续1秒；对主塔/堡垒伤害减半）'
     },
     speed_spell: {
         type: 'spell', name: '极速法术', cost: 2,
@@ -858,10 +963,10 @@ const CARDS = {
     },
     rage_spell: {
         type: 'spell', name: '狂暴法术', cost: 2, damage: 30,
-        radius: 48, zoneDuration: 4.5, rageBoost: 0.3, boostDuration: 1.5, rageTick: 0.5,
+        radius: 55, zoneDuration: 4.5, rageBoost: 0.3, boostDuration: 1.5, rageTick: 0.5,
         towerDmgMul: 0.5, // 对主塔/堡垒伤害减半
         icon: '😡', deployDelay: 0.5, cooldown: 35,
-        desc: '部署1s后：对范围内敌军造成30伤害(对主塔/堡垒减半)，并留下4.5秒狂暴区域(半径48px，同复制法术)，区域内每0.5秒对友方施加持续1.5秒的狂暴(攻速/移速/蓄力/出兵/伤害+30%)'
+        desc: '部署0.5s后：对范围内敌军造成30伤害(对主塔/堡垒减半)，并留下4.5秒狂暴区域(半径55px，同复制法术)，区域内每0.5秒对友方施加持续1.5秒的狂暴(攻速/移速/蓄力/出兵/伤害+30%)'
     },
     freeze_spell: {
         type: 'spell', name: '冰冻法术', cost: 4, damage: 30,
@@ -871,7 +976,7 @@ const CARDS = {
     },
     copy_spell: {
         type: 'spell', name: '复制法术', cost: 3,
-        radius: 48, icon: '🔷',
+        radius: 55, icon: '🔷',
         deployDelay: 0.8, cooldown: 15,
         desc: '🔷 复制范围内所有友军兵种各1个（建筑/堡垒/主塔不复制）：复制体生命值为1，其余特性与本体完全一样，建模为半透明亮蓝色（外形与本体完全相同，不显示名字与血条）；复制体的衍生单位（分裂/召唤/孵化/变形子代）也均为1滴血'
     },
